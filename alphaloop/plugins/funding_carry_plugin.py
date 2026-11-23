@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any
 
 from alphaloop.core.models import (
@@ -13,7 +14,20 @@ from alphaloop.core.models import (
     StrategyConfig,
 )
 from alphaloop.data.store import MarketDataStore
-from alphaloop.harness.backtester import BacktestResult, FundingCarryBacktester
+from alphaloop.harness.backtester import (
+    HOUR_MS,
+    KNOWN_FUNDING_CARRY_PARAM_KEYS,
+    BacktestResult,
+    FundingCarryBacktester,
+    _basis_pnl_usd,
+    _param_int,
+    compute_carry_slot_sizing,
+    compute_causal_symbol_leverage,
+    compute_rolling_funding_apr,
+    evaluate_carry_entry_signal,
+    evaluate_carry_margin_guard,
+    validate_funding_carry_params,
+)
 from alphaloop.harness.telemetry import TelemetryMonitor
 from alphaloop.plugins.base import BaseStrategyPlugin
 
@@ -50,6 +64,14 @@ class FundingCarryPlugin(BaseStrategyPlugin):
         self._telemetry = TelemetryMonitor()
 
     def default_config(self, symbols: list[str] | None = None, **overrides: Any) -> StrategyConfig:
+        valid_fields = set(StrategyConfig.__dataclass_fields__.keys())
+        unknown_overrides = sorted(k for k in overrides.keys() if k not in valid_fields)
+        if unknown_overrides:
+            raise ValueError(
+                f"Unknown StrategyConfig override keys for funding_carry: {unknown_overrides}"
+            )
+        if "params" in overrides:
+            validate_funding_carry_params(overrides["params"])
         base = StrategyConfig(
             strategy_id="funding_carry_default",
             version="v2.2",
@@ -81,7 +103,9 @@ class FundingCarryPlugin(BaseStrategyPlugin):
         if overrides:
             d = base.to_dict()
             d.update(overrides)
-            return StrategyConfig.from_dict(d)
+            cfg = StrategyConfig.from_dict(d)
+            validate_funding_carry_params(cfg.params)
+            return cfg
         return base
 
     def mutable_param_bounds(self) -> dict[str, tuple[float, float]]:
@@ -93,8 +117,6 @@ class FundingCarryPlugin(BaseStrategyPlugin):
         next_version: str,
         changes: dict[str, Any],
     ) -> StrategyConfig:
-        import math
-
         d = cfg.to_dict()
         d["version"] = next_version
         d["status"] = "BACKTESTED"
@@ -135,6 +157,9 @@ class FundingCarryPlugin(BaseStrategyPlugin):
                 params["protective_exit_slip_bps"] = 5.0
             else:
                 params["protective_exit_slip_bps"] = max(5.0, float(raw_s))
+        # Strip any unknown keys defensively before strict schema check
+        params = {k: v for k, v in params.items() if k in KNOWN_FUNDING_CARRY_PARAM_KEYS}
+        validate_funding_carry_params(params)
         d["params"] = params
         # Invariant 1: Prevent >100% capital over-allocation when max_positions increases (Red-Team #5.3)
         d["per_position_weight"] = round(min(float(d["per_position_weight"]), 1.0 / max(1, int(d["max_positions"]))), 4)
@@ -151,7 +176,9 @@ class FundingCarryPlugin(BaseStrategyPlugin):
         end_ms: int | None = None,
         extra_slippage_bps_per_leg: float = 0.0,
         execution_mode_override: str | None = None,
+        warmup_start_ms: int | None = None,
     ) -> BacktestResult:
+        validate_funding_carry_params(cfg.params)
         run_cfg = cfg
         if execution_mode_override:
             run_cfg = dataclasses.replace(cfg, execution_mode=execution_mode_override)
@@ -161,6 +188,7 @@ class FundingCarryPlugin(BaseStrategyPlugin):
             start_ms=start_ms,
             end_ms=end_ms,
             extra_slippage_bps_per_leg=extra_slippage_bps_per_leg,
+            warmup_start_ms=warmup_start_ms,
         )
 
     def plateau_variants(self, cfg: StrategyConfig) -> list[tuple[str, StrategyConfig]]:
@@ -262,89 +290,234 @@ class FundingCarryPlugin(BaseStrategyPlugin):
         state: dict[str, Any],
         cfg: StrategyConfig,
     ) -> list[OrderIntent]:
-        """Pure event step for MicroRunSession: tracks live BBO basis stops & funding spreads."""
+        """Single-kernel streaming step matching FundingCarryBacktester.run() math identically.
+
+        Enforces:
+        - Strict param validation (no dead/unconsumed keys or invalid types).
+        - Causal rolling funding APR over `cfg.lookback_hours` (`compute_rolling_funding_apr`).
+        - Causal volatility-tiered leverage (`compute_causal_symbol_leverage`) + exact slot sizing.
+        - Isolated margin guard (`evaluate_carry_margin_guard`: liquidation >=90% > protective exit > 65% rebalance).
+        - 24h post-stop cooldown, hysteresis exit confirmation, and paired-venue `defer_decision` barrier.
+        """
+        validate_funding_carry_params(cfg.params)
         intents: list[OrderIntent] = []
         sym = event.symbol
         if sym not in cfg.symbols:
             return intents
 
+        ts_ms = int(event.ts_ms)
+        decision_ts = ts_ms
+        is_spot_perp = cfg.mode == "spot_perp"
+        venue_b_px = f"{cfg.venue_a}_spot" if is_spot_perp else cfg.venue_b
+        lb_h = max(1, int(cfg.lookback_hours))
+        vol_lb_h = max(24, min(336, _param_int(cfg.params, "vol_lookback_hours", 168)))
+        _, default_slot_margin_per_leg, _ = compute_carry_slot_sizing(cfg, cfg.leverage)
+
         latest_mids: dict[tuple[str, str], float] = state.setdefault("latest_mids", {})
-        latest_apr: dict[tuple[str, str], float] = state.setdefault("latest_apr", {})
+        latest_hi_lo: dict[tuple[str, str], tuple[float, float]] = state.setdefault("latest_hi_lo", {})
+        funding_hist: dict[tuple[str, str], dict[int, float]] = state.setdefault("funding_hist", {})
+        first_funding_ts: dict[str, int] = state.setdefault("first_funding_ts", {})
+        hourly_log_rets: dict[str, dict[int, float]] = state.setdefault("hourly_log_rets", {})
+        cooldown_until: dict[str, int] = state.setdefault("cooldown_until", {})
         open_pos: dict[str, dict[str, Any]] = state.setdefault("open_pos", {})
+
+        defer_decision = bool(event.payload.get("defer_decision", False))
 
         if event.kind == "BBO":
             bid = float(event.payload.get("bid", 0.0))
             ask = float(event.payload.get("ask", 0.0))
-            if bid > 0 and ask >= bid:
-                latest_mids[(event.venue, sym)] = (bid + ask) * 0.5
+            if bid > 0.0 and ask >= bid and math.isfinite(bid) and math.isfinite(ask):
+                mid = (bid + ask) * 0.5
+                latest_mids[(event.venue, sym)] = mid
+                latest_hi_lo[(event.venue, sym)] = (ask, bid)
+        elif event.kind == "CANDLE":
+            op = float(event.payload.get("open", 0.0))
+            hi = float(event.payload.get("high", 0.0))
+            lo = float(event.payload.get("low", 0.0))
+            cl = float(event.payload.get("close", 0.0))
+            decision_ts = int(event.payload.get("end_ts_ms", ts_ms))
+            if cl > 0.0 and hi >= lo > 0.0 and math.isfinite(cl):
+                latest_mids[(event.venue, sym)] = cl
+                latest_hi_lo[(event.venue, sym)] = (hi, lo)
+                if op > 0.0 and math.isfinite(op):
+                    rmap = hourly_log_rets.setdefault(sym, {})
+                    # Match backtester.py: store under bar-open ts_ms; prefer venue_a, fallback venue_b per bar
+                    if event.venue == cfg.venue_a or ts_ms not in rmap:
+                        rmap[ts_ms] = math.log(cl / op)
+                    cutoff_r = decision_ts - (vol_lb_h + 48) * HOUR_MS
+                    if len(rmap) > vol_lb_h + 72:
+                        for old_t in [t for t in rmap if int(t) < cutoff_r]:
+                            rmap.pop(old_t, None)
         elif event.kind == "FUNDING":
-            latest_apr[(event.venue, sym)] = float(event.payload.get("apr_pct", 0.0))
+            if "funding_rate" in event.payload:
+                rate = float(event.payload["funding_rate"])
+            else:
+                apr_in = float(event.payload.get("apr_pct", 0.0))
+                rate = apr_in / (24.0 * 365.0 * 100.0)
+            if math.isfinite(rate):
+                fmap = funding_hist.setdefault((event.venue, sym), {})
+                fmap[ts_ms] = rate
+                prev_first = first_funding_ts.get(sym)
+                if prev_first is None or ts_ms < prev_first:
+                    first_funding_ts[sym] = ts_ms
+                cutoff_f = ts_ms - (lb_h + 24) * HOUR_MS
+                if len(fmap) > lb_h + 48:
+                    for old_t in [t for t in fmap if int(t) < cutoff_f]:
+                        fmap.pop(old_t, None)
+
+                # Track ATB buggy low-settlement streak parity on venue_a funding strictly after entry
+                if cfg.use_atb_buggy_rules and event.venue == cfg.venue_a and sym in open_pos:
+                    pos_bug = open_pos[sym]
+                    if ts_ms > int(pos_bug.get("entry_ts_ms", ts_ms)) and ts_ms > int(pos_bug.get("last_atb_ts", -1)):
+                        pos_bug["last_atb_ts"] = ts_ms
+                        apr_inst = (
+                            (rate * 24.0 * 365.0 * 100.0)
+                            if cfg.venue_a in ("hyperliquid", "lighter")
+                            else (rate * 3.0 * 365.0 * 100.0)
+                        )
+                        if abs(apr_inst) < 54.75:
+                            pos_bug["low_streak_settlements"] = int(pos_bug.get("low_streak_settlements", 0)) + 1
+                        else:
+                            pos_bug["low_streak_settlements"] = 0
+        else:
+            return intents
+
+        if defer_decision:
+            return intents
 
         px_a = latest_mids.get((cfg.venue_a, sym))
-        px_b = latest_mids.get((cfg.venue_b, sym))
-        if sym in open_pos and px_a and px_b:
+        px_b = latest_mids.get((venue_b_px, sym))
+
+        # 1) Margin guard (liquidation >=0.90 > protective exit > 0.65 rebalance) + Basis Stop
+        if sym in open_pos and decision_ts > int(open_pos[sym].get("entry_ts_ms", 0)):
             pos = open_pos[sym]
-            ea, eb = pos["entry_px_a"], pos["entry_px_b"]
-            if ea > 0 and eb > 0:
-                ret_a = (px_a / ea) - 1.0
-                ret_b = (px_b / eb) - 1.0
-                rel = (ret_b - ret_a) if pos["direction"] == "SHORT_A_LONG_B" else (ret_a - ret_b)
-                if rel * 10000.0 <= -cfg.stop_loss_basis_bps:
-                    intents.append(OrderIntent(cfg.strategy_id, sym, "CLOSE", pos["notional_usd"], rel * 10000.0, "BASIS_STOP", event.ts_ms))
+            pos_slot_margin = float(pos.get("slot_margin_per_leg", default_slot_margin_per_leg))
+            anc_a = pos.get("anc_a", pos.get("entry_px_a"))
+            anc_b = pos.get("anc_b", pos.get("entry_px_b"))
+            hl_a = latest_hi_lo.get((cfg.venue_a, sym))
+            hl_b = latest_hi_lo.get((venue_b_px, sym)) if not is_spot_perp else None
+            eff_hl_a = hl_a or hl_b
+            eff_anc_a = anc_a if (hl_a and anc_a) else anc_b
+            eff_hl_b = hl_b or hl_a
+            eff_anc_b = anc_b if (hl_b and anc_b) else anc_a
+
+            guard_event, margin_used = evaluate_carry_margin_guard(
+                cfg,
+                direction=pos["direction"],
+                notional_usd=float(pos["notional_usd"]),
+                slot_margin_per_leg=pos_slot_margin,
+                anc_a=eff_anc_a,
+                anc_b=eff_anc_b,
+                hi_a=eff_hl_a[0] if eff_hl_a else None,
+                lo_a=eff_hl_a[1] if eff_hl_a else None,
+                hi_b=eff_hl_b[0] if eff_hl_b else None,
+                lo_b=eff_hl_b[1] if eff_hl_b else None,
+            )
+            if guard_event in ("MARGIN_LIQUIDATION", "MARGIN_PROTECT_EXIT"):
+                intents.append(
+                    OrderIntent(
+                        cfg.strategy_id,
+                        sym,
+                        "CLOSE",
+                        float(pos["notional_usd"]),
+                        round(margin_used * 100.0, 2),
+                        guard_event,
+                        decision_ts,
+                    )
+                )
+                open_pos.pop(sym, None)
+                cooldown_until[sym] = decision_ts + 24 * HOUR_MS
+                return intents
+            elif guard_event == "FORCED_REBALANCE":
+                pos["anc_a"] = px_a or anc_a
+                pos["anc_b"] = px_b or anc_b
+
+            if px_a and px_b:
+                _, basis_bps = _basis_pnl_usd(
+                    pos["direction"], float(pos["notional_usd"]), pos.get("entry_px_a"), pos.get("entry_px_b"), px_a, px_b
+                )
+                if basis_bps <= -float(cfg.stop_loss_basis_bps):
+                    intents.append(
+                        OrderIntent(cfg.strategy_id, sym, "CLOSE", float(pos["notional_usd"]), basis_bps, "BASIS_STOP", decision_ts)
+                    )
                     open_pos.pop(sym, None)
+                    cooldown_until[sym] = decision_ts + 24 * HOUR_MS
                     return intents
 
-        apr_a = latest_apr.get((cfg.venue_a, sym))
-        apr_b = latest_apr.get((cfg.venue_b, sym))
-        if event.kind == "FUNDING" and sym in open_pos and apr_a is not None and apr_b is not None:
+        # 2) Causal rolling funding APR (shared kernel formula)
+        apr_a = compute_rolling_funding_apr(funding_hist.get((cfg.venue_a, sym), {}), decision_ts, lb_h)
+        apr_b = 0.0 if is_spot_perp else compute_rolling_funding_apr(funding_hist.get((cfg.venue_b, sym), {}), decision_ts, lb_h)
+
+        # 3) Hysteresis / ATB buggy exit check on FUNDING events strictly after entry & non-regressing ts
+        if event.kind == "FUNDING" and sym in open_pos and decision_ts > int(open_pos[sym].get("entry_ts_ms", decision_ts)):
             pos = open_pos[sym]
-            held_h = (event.ts_ms - int(pos.get("entry_ts_ms", event.ts_ms))) / 3_600_000.0
-            signed_spread = (apr_a - apr_b) if pos["direction"] == "SHORT_A_LONG_B" else (apr_b - apr_a)
-            if held_h >= float(cfg.min_hold_hours):
-                if signed_spread < float(cfg.exit_spread_apr_pct):
-                    low_since = pos.get("low_since_ms")
-                    if low_since is None:
-                        pos["low_since_ms"] = int(event.ts_ms)
-                        low_since = int(event.ts_ms)
-                    low_h = (int(event.ts_ms) - int(low_since)) / 3_600_000.0
-                    if low_h >= float(cfg.exit_confirm_hours):
+            if cfg.use_atb_buggy_rules:
+                if int(pos.get("low_streak_settlements", 0)) >= 3:
+                    intents.append(
+                        OrderIntent(cfg.strategy_id, sym, "CLOSE", float(pos["notional_usd"]), 0.0, "ATB_BUGGY_LOW_STREAK", decision_ts)
+                    )
+                    open_pos.pop(sym, None)
+                    return intents
+            elif apr_a is not None and apr_b is not None:
+                last_hyst_ts = int(pos.get("last_hyst_ts", -1))
+                if decision_ts >= last_hyst_ts:
+                    held_h = (decision_ts - int(pos.get("entry_ts_ms", decision_ts))) / float(HOUR_MS)
+                    signed_spread = (
+                        (apr_a - apr_b)
+                        if pos["direction"] in ("SHORT_A_LONG_B", "SHORT_A_LONG_SPOT")
+                        else (apr_b - apr_a)
+                    )
+                    if decision_ts > last_hyst_ts:
+                        pos["low_streak_prev"] = int(pos.get("low_streak_hours", 0))
+                        pos["last_hyst_ts"] = decision_ts
+                    if signed_spread < float(cfg.exit_spread_apr_pct):
+                        pos["low_streak_hours"] = int(pos.get("low_streak_prev", 0)) + 1
+                    else:
+                        pos["low_streak_hours"] = 0
+
+                    if held_h >= float(cfg.min_hold_hours) and int(pos["low_streak_hours"]) >= int(cfg.exit_confirm_hours):
                         intents.append(
-                            OrderIntent(cfg.strategy_id, sym, "CLOSE", pos["notional_usd"], signed_spread, "HYSTERESIS_EXIT", event.ts_ms)
+                            OrderIntent(cfg.strategy_id, sym, "CLOSE", float(pos["notional_usd"]), signed_spread, "HYSTERESIS_EXIT", decision_ts)
                         )
                         open_pos.pop(sym, None)
                         return intents
-                else:
-                    pos["low_since_ms"] = None
 
-        # Red-Team BLOCKER #3: NEVER open a carry position before BOTH venues have valid live BBO prices!
+        # 4) Entry check: requires BOTH valid prices, warmup readiness, cooldown clear, and slot availability
+        first_ts = first_funding_ts.get(sym)
+        warmup_ready = (lb_h <= 1) or (first_ts is not None and (decision_ts - first_ts) >= lb_h * HOUR_MS)
         if (
-            px_a is not None
-            and px_b is not None
+            warmup_ready
+            and decision_ts >= int(cooldown_until.get(sym, 0))
+            and px_a is not None
             and px_a > 0.0
-            and px_b > 0.0
-            and apr_a is not None
-            and apr_b is not None
+            and (is_spot_perp or (px_b is not None and px_b > 0.0))
             and sym not in open_pos
-            and len(open_pos) < cfg.max_positions
+            and len(open_pos) < int(cfg.max_positions)
         ):
-            spread = apr_a - apr_b
-            if abs(spread) >= cfg.entry_spread_apr_pct:
-                direction = "SHORT_A_LONG_B" if spread > 0 else "LONG_A_SHORT_B"
-                action = "OPEN_SHORT_A_LONG_B" if spread > 0 else "OPEN_LONG_A_SHORT_B"
-                notional = cfg.capital_usd * cfg.per_position_weight * (cfg.leverage / 2.0)
-                raw_basis = ((px_a - px_b) / px_b) * 10000.0
-                adverse = -raw_basis if spread > 0 else raw_basis
-                if adverse > cfg.max_basis_entry_bps:
-                    return intents
+            sig = evaluate_carry_entry_signal(cfg, apr_a, apr_b, px_a, px_b)
+            if sig is not None:
+                direction, action, spread_abs = sig
+                eff_lev = compute_causal_symbol_leverage(cfg, hourly_log_rets.get(sym, {}), decision_ts)
+                _, pos_slot_margin, pos_notional = compute_carry_slot_sizing(cfg, eff_lev)
                 open_pos[sym] = {
                     "direction": direction,
-                    "notional_usd": notional,
+                    "notional_usd": pos_notional,
+                    "slot_margin_per_leg": pos_slot_margin,
+                    "eff_leverage": eff_lev,
                     "entry_px_a": px_a,
                     "entry_px_b": px_b,
-                    "entry_ts_ms": event.ts_ms,
-                    "low_streak": 0,
+                    "anc_a": px_a,
+                    "anc_b": px_b,
+                    "entry_ts_ms": decision_ts,
+                    "low_streak_hours": 0,
+                    "low_streak_prev": 0,
+                    "low_streak_settlements": 0,
+                    "last_hyst_ts": decision_ts,
+                    "last_atb_ts": decision_ts,
                 }
-                intents.append(OrderIntent(cfg.strategy_id, sym, action, notional, abs(spread), "FUNDING_SPREAD_ENTRY", event.ts_ms))
+                intents.append(
+                    OrderIntent(cfg.strategy_id, sym, action, pos_notional, spread_abs, "FUNDING_SPREAD_ENTRY", decision_ts)
+                )
         return intents
 
     def min_economic_kill_horizon_hours(self, cfg: StrategyConfig) -> float:

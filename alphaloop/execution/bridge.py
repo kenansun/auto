@@ -27,7 +27,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Final
 
-from alphaloop.core.config import validate_strategy_id
+from alphaloop.core.config import validate_strategy_config_params, validate_strategy_id
 from alphaloop.core.db import LockedConnection, connect_wal, transaction
 from alphaloop.core.models import BBOTick, OrderIntent, StrategyConfig
 from alphaloop.core.provenance import sha256_obj, utc_now_ms
@@ -37,6 +37,12 @@ logger = logging.getLogger(__name__)
 LIVE_EXECUTION_ENABLED: Final[bool] = False
 GENESIS_PREV_HASH: Final[str] = "0" * 64
 ALLOWED_SHADOW_STATUSES: Final[frozenset[str]] = frozenset({"SHADOW_LIVE", "PAPER_LIVE"})
+EMERGENCY_CLOSE_REASONS: Final[frozenset[str]] = frozenset({
+    "CHANDELIER_STOP",
+    "MARGIN_PROTECT_EXIT",
+    "MARGIN_LIQUIDATION",
+    "BASIS_STOP",
+})
 HUMAN_RESET_RE = re.compile(r"^HUMAN_RESET:[A-Za-z0-9._-]{4,64}$")
 MAX_CONFIG_BYTES: Final[int] = 1024 * 1024  # 1MB hard cap
 
@@ -398,6 +404,10 @@ def _validate_cfg_risk_fields(cfg: StrategyConfig) -> str:
         return f"INVALID_CFG_MAX_POSITIONS({cfg.max_positions})"
     if not _is_finite_num(cfg.slippage_per_leg_bps) or float(cfg.slippage_per_leg_bps) < 0.0:
         return f"INVALID_CFG_SLIPPAGE({cfg.slippage_per_leg_bps})"
+    try:
+        validate_strategy_config_params(cfg)
+    except ValueError as exc:
+        return f"INVALID_CFG_PARAMS({exc})"
     return ""
 
 
@@ -681,6 +691,13 @@ class ExecutionBridge:
                 if max_spread_bps is not None
                 else max(25.0, 4.0 * max(1.0, float(cfg.slippage_per_leg_bps)))
             )
+            if (
+                max_spread_bps is None
+                and str(intent.action) in ("CLOSE", "CLOSE_PAIR")
+                and str(intent.reason or "") in EMERGENCY_CLOSE_REASONS
+            ):
+                # Never deadlock risk-reducing emergency stops/liquidations during volatility spread spikes
+                spread_ceiling = max(500.0, spread_ceiling)
             if not math.isfinite(notional_limit) or float(intent.notional_usd) > notional_limit + 1e-6:
                 block_reason = f"NOTIONAL_CAP_EXCEEDED({float(intent.notional_usd):.2f}>{notional_limit:.2f})"
             else:

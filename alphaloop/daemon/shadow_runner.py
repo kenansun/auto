@@ -44,7 +44,19 @@ from alphaloop.execution.bridge import (
     ExecutionBridge,
     KillTrigger,
 )
+from alphaloop.harness.backtester import (
+    HOUR_MS,
+    TAKER_FEE_BPS,
+    _param_int,
+    compute_carry_slot_sizing,
+)
 from alphaloop.plugins import PluginRegistry, default_registry
+from alphaloop.plugins.trend_cta_plugin import (
+    compute_causal_atr_and_ema,
+    compute_cta_entry_notional,
+    compute_true_range,
+    parse_cta_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +77,68 @@ def _assumed_total_slip_bps(cfg: StrategyConfig) -> float:
     return max(0.1, mult * float(cfg.slippage_per_leg_bps))
 
 
-def _effective_leg_fee_bps(cfg: StrategyConfig, leg_fee_bps: float) -> float:
+def _effective_leg_fee_bps(
+    cfg: StrategyConfig,
+    leg_fee_bps: float,
+    venue: str = "",
+    *,
+    is_leg_b: bool = False,
+    is_exit: bool = False,
+) -> float:
+    """Venue- and execution-mode-aware leg fee matching backtester.py & trend_cta_plugin.py."""
     mode = str(cfg.execution_mode or "MAKER_MAKER").upper()
+    taker = float(TAKER_FEE_BPS.get(venue, TAKER_FEE_BPS_DEFAULT))
     if mode == "TAKER_TAKER":
-        return max(float(leg_fee_bps), TAKER_FEE_BPS_DEFAULT)
+        return max(float(leg_fee_bps), taker)
+    if mode == "MAKER_THEN_TAKER_HEDGE":
+        dual = _is_dual_venue(cfg)
+        if (dual and is_leg_b) or ((not dual) and is_exit):
+            return max(float(leg_fee_bps), taker)
     return float(leg_fee_bps)
+
+
+def _normalize_int_ts_dict(raw: Any) -> dict[int, float]:
+    """Normalize any plain JSON numeric-string timestamp keys to int (preferring native int on collision)."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[int, float] = {}
+    for k, v in raw.items():
+        if isinstance(k, bool):
+            continue
+        try:
+            tk = int(k)
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(fv):
+            continue
+        if tk not in out or isinstance(k, int):
+            out[tk] = fv
+    return out
+
+
+def _normalize_plugin_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Normalize hydrated plugin state dicts so int timestamp keys and OHLC tuples never drift after JSON load."""
+    if not isinstance(state, dict):
+        return {}
+    fhist = state.get("funding_hist")
+    if isinstance(fhist, dict):
+        for fk, fmap in list(fhist.items()):
+            fhist[fk] = _normalize_int_ts_dict(fmap)
+    hrets = state.get("hourly_log_rets")
+    if isinstance(hrets, dict):
+        for sym, rmap in list(hrets.items()):
+            hrets[sym] = _normalize_int_ts_dict(rmap)
+    ohist = state.get("ohlc_hist")
+    if isinstance(ohist, dict):
+        for sym, bars in list(ohist.items()):
+            if isinstance(bars, list):
+                ohist[sym] = [
+                    (float(x[0]), float(x[1]), float(x[2]))
+                    for x in bars
+                    if isinstance(x, (list, tuple)) and len(x) == 3
+                ]
+    return state
 
 
 def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
@@ -206,6 +275,13 @@ class ShadowParityAuditor:
                         for k, v in obj.items()
                     ]
                 }
+            if obj and all(isinstance(k, int) and not isinstance(k, bool) for k in obj):
+                return {
+                    "__int_map__": [
+                        [int(k), ShadowParityAuditor._encode_state(v)]
+                        for k, v in obj.items()
+                    ]
+                }
             return {str(k): ShadowParityAuditor._encode_state(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [ShadowParityAuditor._encode_state(x) for x in obj]
@@ -222,6 +298,8 @@ class ShadowParityAuditor:
                     key = tuple(k) if isinstance(k, list) else k
                     out[key] = ShadowParityAuditor._decode_state(v)
                 return out
+            if "__int_map__" in obj and len(obj) == 1:
+                return {int(k): ShadowParityAuditor._decode_state(v) for k, v in obj["__int_map__"]}
             if "__tuple__" in obj and len(obj) == 1:
                 return tuple(ShadowParityAuditor._decode_state(x) for x in obj["__tuple__"])
             return {k: ShadowParityAuditor._decode_state(v) for k, v in obj.items()}
@@ -281,13 +359,14 @@ class ShadowParityAuditor:
         )
         out: dict[str, dict[str, Any]] = {}
         for r in rows:
+            decoded = self._decode_state(json.loads(str(r["plugin_state_json"] or "{}")))
             out[str(r["strategy_id"])] = {
                 "started_ts_ms": int(r["started_ts_ms"]),
                 "realized_pnl_usd": float(r["realized_pnl_usd"]),
                 "plans_created": int(r["plans_created"]),
                 "plans_blocked": int(r["plans_blocked"]),
                 "open_positions": json.loads(str(r["open_positions_json"])),
-                "plugin_state": self._decode_state(json.loads(str(r["plugin_state_json"] or "{}"))),
+                "plugin_state": _normalize_plugin_state(decoded) if isinstance(decoded, dict) else {},
                 "last_funding_ts": json.loads(str(r["last_funding_ts_json"] or "{}")),
             }
         return out
@@ -341,6 +420,52 @@ class ShadowParityAuditor:
                 ),
             )
 
+    def _compute_prewindow_warmup(
+        self,
+        cfg: StrategyConfig,
+        window_start_ms: int,
+    ) -> tuple[int | None, bool, str]:
+        """Return (warmup_start_ms, has_sufficient_history, reason) for apples-to-apples parity backtest."""
+        pid = str(cfg.plugin_id or "funding_carry").strip().lower()
+        params = cfg.params or {}
+        if pid == "funding_carry":
+            lb_h = max(1, int(cfg.lookback_hours))
+            vol_lb = _param_int(params, "vol_lookback_hours", 168) if params.get("vol_target_leverage_enabled") else 0
+            warm_h = max(lb_h, vol_lb) + 24
+            warmup_start = max(0, int(window_start_ms) - warm_h * HOUR_MS)
+            if lb_h <= 1:
+                return warmup_start, True, ""
+            # Require pre-window funding history spanning at least lookback_hours before window_start_ms
+            req_oldest = int(window_start_ms) - lb_h * HOUR_MS
+            for sym in cfg.symbols:
+                bars = self.market_store.load_funding(cfg.venue_a, sym, start_ms=warmup_start, end_ms=window_start_ms)
+                if bars and bars[0].ts_ms <= req_oldest:
+                    return warmup_start, True, ""
+            return warmup_start, False, "INSUFFICIENT_PREWINDOW_WARMUP"
+
+        if pid == "trend_cta":
+            cp = parse_cta_params(cfg)
+            tf_h = cp["tf_h"]
+            tf_ms = cp["tf_ms"]
+            need_bars = max(cp["warmup_bars"], cp["ema_n"] * 3 if cp["ema_n"] > 0 else 0) + 10
+            warmup_start = max(0, int(window_start_ms) - need_bars * tf_ms)
+            eval_start_bucket = (int(window_start_ms) // tf_ms) * tf_ms
+            for sym in cfg.symbols:
+                c1h = self.market_store.load_candles(cfg.venue_a, sym, start_ms=warmup_start, end_ms=eval_start_bucket)
+                if not c1h:
+                    continue
+                bcounts: dict[int, int] = {}
+                for c in c1h:
+                    b = (int(c.ts_ms) // tf_ms) * tf_ms
+                    if b < eval_start_bucket:
+                        bcounts[b] = bcounts.get(b, 0) + 1
+                completed_n = sum(1 for cnt in bcounts.values() if cnt >= tf_h)
+                if completed_n >= cp["warmup_bars"]:
+                    return warmup_start, True, ""
+            return warmup_start, False, "INSUFFICIENT_PREWINDOW_WARMUP"
+
+        return None, True, ""
+
     def evaluate_strategy(
         self,
         cfg: StrategyConfig,
@@ -359,7 +484,7 @@ class ShadowParityAuditor:
         max_drift_bps: float = 150.0,
         drift_check_min_hours: float = 24.0,
     ) -> ShadowParityRecord:
-        """Compare live Shadow equity & realized spread against same-window plugin backtest."""
+        """Compare live Shadow equity & realized spread against causally pre-warmed same-window backtest."""
         cap = float(cfg.capital_usd)
         if not (_is_finite(cap) and cap > 0 and _is_finite(shadow_equity_usd)):
             raise ValueError("Invalid capital or non-finite shadow equity")
@@ -379,17 +504,26 @@ class ShadowParityAuditor:
         if elapsed_hours >= 1.0:
             try:
                 plugin = self.registry.resolve_for_config(cfg)
-                bt = plugin.evaluate(
-                    self.market_store,
-                    cfg,
-                    start_ms=int(window_start_ms),
-                    end_ms=int(window_end_ms),
-                )
-                if bt.metrics and bt.metrics.days > 0 and _is_finite(bt.metrics.total_return_pct):
-                    backtest_ret_pct = float(bt.metrics.total_return_pct)
-                    backtest_comparable = True
+                warmup_start_ms, warm_ok, warm_reason = self._compute_prewindow_warmup(cfg, int(window_start_ms))
+                if not warm_ok:
+                    detail_parts.append(warm_reason)
                 else:
-                    detail_parts.append("INSUFFICIENT_HISTORY_IN_LIVE_WINDOW")
+                    eval_kwargs: dict[str, Any] = {
+                        "start_ms": int(window_start_ms),
+                        "end_ms": int(window_end_ms),
+                    }
+                    if warmup_start_ms is not None:
+                        eval_kwargs["warmup_start_ms"] = int(warmup_start_ms)
+                    try:
+                        bt = plugin.evaluate(self.market_store, cfg, **eval_kwargs)
+                    except TypeError:
+                        eval_kwargs.pop("warmup_start_ms", None)
+                        bt = plugin.evaluate(self.market_store, cfg, **eval_kwargs)
+                    if bt.metrics and bt.metrics.days > 0 and _is_finite(bt.metrics.total_return_pct):
+                        backtest_ret_pct = float(bt.metrics.total_return_pct)
+                        backtest_comparable = True
+                    else:
+                        detail_parts.append("INSUFFICIENT_HISTORY_IN_LIVE_WINDOW")
             except Exception as exc:
                 logger.warning("Same-window parity backtest skipped for %s: %s", cfg.strategy_id, exc)
                 detail_parts.append(f"BACKTEST_UNAVAILABLE:{type(exc).__name__}")
@@ -515,7 +649,9 @@ class ShadowPortfolioDaemon:
         self._latest_bbo_cache: dict[tuple[str, str], BBOTick] = {}
         self._last_delivered_bbo_ts: dict[tuple[str, str, str], int] = {}
         self._last_delivered_funding_ts: dict[tuple[str, str, str], int] = {}
-        self._warmed_strategies: set[str] = set()
+        self._warmed_strategies: set[tuple[str, str]] = set()
+        self._unwarmed_funding_keys: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        self._last_vol_refresh_hour: dict[tuple[str, str], int] = {}
 
         # Hydrate persisted shadow runtime state across restarts (Red-Team HIGH #8)
         for sid, saved in self.parity.load_all_runtime_states().items():
@@ -525,54 +661,241 @@ class ShadowPortfolioDaemon:
             self._plans_blocked[sid] = saved["plans_blocked"]
             self._open_positions[sid] = saved["open_positions"]
             if isinstance(saved.get("plugin_state"), dict):
-                self._plugin_states[sid] = saved["plugin_state"]
+                self._plugin_states[sid] = _normalize_plugin_state(saved["plugin_state"])
             for fkey_s, fts in (saved.get("last_funding_ts") or {}).items():
                 if ":" in str(fkey_s):
                     v, sym = str(fkey_s).split(":", 1)
                     self._last_delivered_funding_ts[(sid, v, sym)] = int(fts)
 
-    def _warmup_plugin_state_from_candles(self, cfg: StrategyConfig, state: dict[str, Any], ts_now: int) -> None:
-        """Warm up TrendCTA resampled ohlc_hist (high, low, close) buffers from completed 1h candle buckets (R2-1)."""
+    def _warmup_plugin_state_from_candles(
+        self,
+        cfg: StrategyConfig,
+        cfg_sha: str,
+        state: dict[str, Any],
+        ts_now: int,
+    ) -> None:
+        """Warm up TrendCTA (ohlc_hist/TR/EMA/missed buckets/active_bucket) & FundingCarry (funding_hist/vol rets)."""
         sid = cfg.strategy_id
-        if sid in self._warmed_strategies:
+        warm_key = (sid, cfg_sha)
+        plugin_id = str(cfg.plugin_id or "funding_carry")
+        params = cfg.params or {}
+        hour_floor = (int(ts_now) // HOUR_MS) * HOUR_MS
+
+        # Retry ONLY still-unwarmed cold-start funding keys (zero 96h lockout if funding DB fills after daemon boot!)
+        if warm_key in self._warmed_strategies:
+            if plugin_id == "funding_carry":
+                pending_keys = self._unwarmed_funding_keys.get(warm_key)
+                if pending_keys:
+                    lb_h = max(1, int(cfg.lookback_hours))
+                    f_lookback_ms = (lb_h + 24) * HOUR_MS
+                    funding_hist: dict[tuple[str, str], dict[int, float]] = state.setdefault("funding_hist", {})
+                    first_funding_ts: dict[str, int] = state.setdefault("first_funding_ts", {})
+                    for fv, sym in list(pending_keys):
+                        f_key = (sid, fv, sym)
+                        fbars = self.store.load_funding(fv, sym, start_ms=ts_now - f_lookback_ms, end_ms=ts_now)
+                        max_warm_ts = -1
+                        fmap = funding_hist.setdefault((fv, sym), {})
+                        for fb in fbars:
+                            if _is_finite(fb.funding_rate):
+                                fts = int(fb.ts_ms)
+                                fmap[fts] = float(fb.funding_rate)
+                                if fts > max_warm_ts:
+                                    max_warm_ts = fts
+                                prev_f = first_funding_ts.get(sym)
+                                if prev_f is None or fts < prev_f:
+                                    first_funding_ts[sym] = fts
+                        if max_warm_ts >= 0:
+                            self._last_delivered_funding_ts[f_key] = max_warm_ts
+                            pending_keys.discard((fv, sym))
             return
-        self._warmed_strategies.add(sid)
-        if (cfg.plugin_id or "") != "trend_cta":
+
+        self._warmed_strategies.add(warm_key)
+
+        if plugin_id == "trend_cta":
+            cp = parse_cta_params(cfg)
+            tf_h = cp["tf_h"]
+            tf_ms = cp["tf_ms"]
+            entry_n = cp["entry_n"]
+            exit_n = cp["exit_n"]
+            atr_n = cp["atr_n"]
+            ema_n = cp["ema_n"]
+            cap_n = max(entry_n, exit_n, atr_n) + 5
+            alpha = (2.0 / (ema_n + 1.0)) if ema_n > 0 else 0.0
+            current_open_bucket = (int(ts_now) // tf_ms) * tf_ms
+            need_bars = max(cap_n, ema_n * 3 if ema_n > 0 else 0) + 10
+            lookback_ms = max(tf_h * need_bars * HOUR_MS, 30 * 86_400_000)
+
+            ohlc_hist: dict[str, list[tuple[float, float, float]]] = state.setdefault("ohlc_hist", {})
+            tr_hist: dict[str, list[float]] = state.setdefault("tr_hist", {})
+            ema_state: dict[str, float] = state.setdefault("ema_state", {})
+            bars_seen: dict[str, int] = state.setdefault("bars_seen", {})
+            last_warmed_bts: dict[str, int] = state.setdefault("last_warmed_bucket_ts", {})
+            active_bucket: dict[str, dict[str, Any]] = state.setdefault("active_bucket", {})
+
+            for sym in cfg.symbols:
+                # ALWAYS evict any persisted stale active_bucket from an earlier bucket BEFORE seeding
+                # (prevents double-committing an old bucket out of order when cur_open_closed_1h is empty!)
+                cur_ab = active_bucket.get(sym)
+                if cur_ab is not None and int(cur_ab.get("bts", -1)) < current_open_bucket:
+                    active_bucket.pop(sym, None)
+                    cur_ab = None
+
+                candles = self.store.load_candles(cfg.venue_a, sym, start_ms=ts_now - lookback_ms, end_ms=ts_now)
+                if not candles:
+                    continue
+                completed_buckets: dict[int, list[Any]] = {}
+                cur_open_closed_1h: list[Any] = []
+                for c in candles:
+                    c_ts = int(c.ts_ms)
+                    b = (c_ts // tf_ms) * tf_ms
+                    if b < current_open_bucket:
+                        completed_buckets.setdefault(b, []).append(c)
+                    elif b == current_open_bucket and c_ts < hour_floor:
+                        # Strictly closed 1h bars inside current_open_bucket (excludes open hour_floor candle!)
+                        cur_open_closed_1h.append(c)
+
+                completed_ordered: list[tuple[int, tuple[float, float, float]]] = []
+                for bts in sorted(completed_buckets.keys()):
+                    grp = sorted(completed_buckets[bts], key=lambda x: x.ts_ms)
+                    if len(grp) < tf_h:
+                        continue
+                    completed_ordered.append((
+                        bts,
+                        (
+                            max(float(x.high) for x in grp),
+                            min(float(x.low) for x in grp),
+                            float(grp[-1].close),
+                        ),
+                    ))
+
+                existing_series = ohlc_hist.get(sym, [])
+                if not existing_series or len(existing_series) < entry_n:
+                    if completed_ordered:
+                        comp_bars = [bar for _, bar in completed_ordered]
+                        ohlc_hist[sym] = comp_bars[-cap_n:]
+                        bars_seen[sym] = len(comp_bars)
+                        trs: list[float] = []
+                        for idx_i, (b_hi, b_lo, _b_cl) in enumerate(comp_bars):
+                            pc_i = comp_bars[idx_i - 1][2] if idx_i > 0 else None
+                            trs.append(compute_true_range(b_hi, b_lo, pc_i))
+                        tr_hist[sym] = trs[-(atr_n + 5) :]
+                        _, emas = compute_causal_atr_and_ema(comp_bars, atr_n, ema_n)
+                        ema_state[sym] = emas[-1]
+                        last_warmed_bts[sym] = completed_ordered[-1][0]
+                else:
+                    # Restart catch-up: reconcile any completed buckets missed during downtime
+                    prev_bts = int(last_warmed_bts.get(sym, -1))
+                    missed = [(bts, bar) for bts, bar in completed_ordered if bts > prev_bts]
+                    if missed:
+                        series = ohlc_hist.setdefault(sym, [])
+                        tr_s = tr_hist.setdefault(sym, [])
+                        for bts, (b_hi, b_lo, b_cl) in missed:
+                            prev_c = series[-1][2] if series else None
+                            tr_s.append(compute_true_range(b_hi, b_lo, prev_c))
+                            if len(tr_s) > atr_n + 5:
+                                del tr_s[: len(tr_s) - (atr_n + 5)]
+                            if sym not in ema_state:
+                                ema_state[sym] = b_cl
+                            elif ema_n > 0:
+                                ema_state[sym] = alpha * b_cl + (1.0 - alpha) * float(ema_state[sym])
+                            else:
+                                ema_state[sym] = b_cl
+                            series.append((b_hi, b_lo, b_cl))
+                            if len(series) > cap_n:
+                                del series[: len(series) - cap_n]
+                            bars_seen[sym] = int(bars_seen.get(sym, 0)) + 1
+                            last_warmed_bts[sym] = bts
+
+                # Seed current_open_bucket from closed 1h bars in [current_open_bucket, hour_floor) if missing
+                if cur_open_closed_1h and cur_ab is None:
+                    cur_open_closed_1h.sort(key=lambda x: x.ts_ms)
+                    expected_h = max(0, (hour_floor - current_open_bucket) // HOUR_MS)
+                    is_partial = (int(cur_open_closed_1h[0].ts_ms) != current_open_bucket) or (
+                        len(cur_open_closed_1h) < expected_h
+                    )
+                    active_bucket[sym] = {
+                        "bts": float(current_open_bucket),
+                        "high": max(float(x.high) for x in cur_open_closed_1h),
+                        "low": min(float(x.low) for x in cur_open_closed_1h),
+                        "close": float(cur_open_closed_1h[-1].close),
+                        "partial": is_partial,
+                    }
+            return
+
+        if plugin_id == "funding_carry":
+            lb_h = max(1, int(cfg.lookback_hours))
+            vol_lb_h = max(24, min(336, _param_int(params, "vol_lookback_hours", 168)))
+            funding_hist = state.setdefault("funding_hist", {})
+            first_funding_ts = state.setdefault("first_funding_ts", {})
+            dual = _is_dual_venue(cfg)
+            f_venues = [cfg.venue_a, cfg.venue_b] if dual else [cfg.venue_a]
+            f_lookback_ms = (lb_h + 24) * HOUR_MS
+            unwarmed_set = self._unwarmed_funding_keys.setdefault(warm_key, set())
+            for sym in cfg.symbols:
+                for fv in f_venues:
+                    if not fv:
+                        continue
+                    fmap = funding_hist.setdefault((fv, sym), {})
+                    f_key = (sid, fv, sym)
+                    has_persisted_cursor = f_key in self._last_delivered_funding_ts
+                    # On fresh start, warm ALL historical funding strictly <= ts_now silently and pin cursor
+                    # ONLY when rows exist (if DB is still cold/empty, retry silently on next cycle — zero 96h lockout!)
+                    cutoff_end = self._last_delivered_funding_ts[f_key] if has_persisted_cursor else ts_now
+                    fbars = self.store.load_funding(fv, sym, start_ms=ts_now - f_lookback_ms, end_ms=cutoff_end)
+                    max_warm_ts = -1
+                    for fb in fbars:
+                        if _is_finite(fb.funding_rate):
+                            fts = int(fb.ts_ms)
+                            fmap[fts] = float(fb.funding_rate)
+                            if fts > max_warm_ts:
+                                max_warm_ts = fts
+                            prev_f = first_funding_ts.get(sym)
+                            if prev_f is None or fts < prev_f:
+                                first_funding_ts[sym] = fts
+                    if not has_persisted_cursor:
+                        if max_warm_ts >= 0:
+                            self._last_delivered_funding_ts[f_key] = max_warm_ts
+                            unwarmed_set.discard((fv, sym))
+                        else:
+                            unwarmed_set.add((fv, sym))
+            self._refresh_carry_hourly_log_rets(cfg, state, ts_now, lookback_h=vol_lb_h + 24)
+            self._last_vol_refresh_hour[warm_key] = hour_floor
+
+    def _refresh_carry_hourly_log_rets(
+        self,
+        cfg: StrategyConfig,
+        state: dict[str, Any],
+        ts_now: int,
+        *,
+        lookback_h: int = 192,
+    ) -> None:
+        """Refresh strictly closed 1h candle log-returns (ts <= hour_floor - 1h) for causal vol-tiered leverage."""
+        if str(cfg.plugin_id or "funding_carry") != "funding_carry":
             return
         params = cfg.params or {}
-        tf_h = max(1, int(params.get("timeframe_hours", 12)))
-        entry_n = max(5, int(params.get("entry_n", 40)))
-        atr_n = max(5, int(params.get("atr_n", 14)))
-        cap_n = max(entry_n, atr_n) + 5
-        tf_ms = tf_h * 3_600_000
-        current_open_bucket = (int(ts_now) // tf_ms) * tf_ms
-        lookback_ms = max(tf_h * (cap_n + 10) * 3_600_000, 30 * 86_400_000)
-        ohlc_hist: dict[str, list[tuple[float, float, float]]] = state.setdefault("ohlc_hist", {})
+        if not bool(params.get("vol_target_leverage_enabled", False)):
+            return
+        vol_lb_h = max(24, min(336, _param_int(params, "vol_lookback_hours", 168)))
+        hour_floor = (int(ts_now) // HOUR_MS) * HOUR_MS
+        last_closed_bar_ts = hour_floor - HOUR_MS
+        if last_closed_bar_ts <= 0:
+            return
+        start_ms = last_closed_bar_ts - max(lookback_h, vol_lb_h + 24) * HOUR_MS
+        hourly_log_rets: dict[str, dict[int, float]] = state.setdefault("hourly_log_rets", {})
+        dual = _is_dual_venue(cfg)
         for sym in cfg.symbols:
-            if len(ohlc_hist.get(sym, [])) >= entry_n:
-                continue
-            candles = self.store.load_candles(cfg.venue_a, sym, start_ms=ts_now - lookback_ms, end_ms=ts_now)
-            if not candles:
-                continue
-            buckets: dict[int, list[Any]] = {}
-            for c in candles:
-                b = (int(c.ts_ms) // tf_ms) * tf_ms
-                # Strictly exclude currently open/incomplete bucket (zero lookahead!)
-                if b >= current_open_bucket:
-                    continue
-                buckets.setdefault(b, []).append(c)
-            completed: list[tuple[float, float, float]] = []
-            for bts in sorted(buckets.keys()):
-                grp = sorted(buckets[bts], key=lambda x: x.ts_ms)
-                if len(grp) < tf_h:
-                    continue
-                completed.append((
-                    max(float(x.high) for x in grp),
-                    min(float(x.low) for x in grp),
-                    float(grp[-1].close),
-                ))
-            if completed:
-                ohlc_hist[sym] = completed[-cap_n:]
+            rmap = hourly_log_rets.setdefault(sym, {})
+            if dual and cfg.venue_b:
+                for c in self.store.load_candles(cfg.venue_b, sym, start_ms=start_ms, end_ms=last_closed_bar_ts):
+                    if c.ts_ms <= last_closed_bar_ts and c.open > 0 and c.close > 0:
+                        rmap[int(c.ts_ms)] = math.log(float(c.close) / float(c.open))
+            for c in self.store.load_candles(cfg.venue_a, sym, start_ms=start_ms, end_ms=last_closed_bar_ts):
+                if c.ts_ms <= last_closed_bar_ts and c.open > 0 and c.close > 0:
+                    rmap[int(c.ts_ms)] = math.log(float(c.close) / float(c.open))
+            cutoff_r = last_closed_bar_ts - (vol_lb_h + 48) * HOUR_MS
+            if len(rmap) > vol_lb_h + 72:
+                for old_t in [t for t in rmap if int(t) < cutoff_r]:
+                    rmap.pop(old_t, None)
 
     def _load_latest_bbo_map(self, symbols: list[str], venues: set[str], now_ms: int) -> dict[tuple[str, str], BBOTick]:
         lookback_ms = max(int(self.max_bbo_stale_sec * 1000.0 * 4), 3_600_000)
@@ -582,9 +905,11 @@ class ShadowPortfolioDaemon:
             if not venue:
                 continue
             for sym in symbols:
-                ticks = self.store.load_bbo_ticks(venue, sym, start_ms=start_ms, end_ms=now_ms + 30_000)
-                if ticks:
-                    merged[(venue, sym)] = ticks[-1]
+                latest_tick = self.store.load_latest_bbo_tick(
+                    venue, sym, min_ts_ms=start_ms, max_ts_ms=now_ms + 30_000
+                )
+                if latest_tick is not None:
+                    merged[(venue, sym)] = latest_tick
         # Merge cache strictly by max ts_ms & prune expired cache entries (Red-Team HIGH #8)
         stale_cutoff = int(now_ms - self.max_bbo_stale_sec * 1000.0)
         for key, cached in list(self._latest_bbo_cache.items()):
@@ -641,16 +966,22 @@ class ShadowPortfolioDaemon:
         bbo_b: BBOTick | None,
         fill_ts_ms: int,
     ) -> None:
-        """Maintain realistic paper positions, fees, and funding accrual for PLANNED_SHADOW fills."""
+        """Maintain realistic paper positions, venue-accurate fees, liquidation penalties, and funding accrual."""
         sid = cfg.strategy_id
         positions = self._open_positions.setdefault(sid, {})
         realized = self._realized_pnl.setdefault(sid, 0.0)
         sym = intent.symbol
         action = str(intent.action)
+        reason = str(intent.reason or "")
         notional = float(intent.notional_usd)
-        fee_a = _effective_leg_fee_bps(cfg, cfg.fee_a_bps) / 10_000.0
-        fee_b = _effective_leg_fee_bps(cfg, cfg.fee_b_bps) / 10_000.0
-        dual_fee = fee_a + fee_b
+        fee_a_entry = _effective_leg_fee_bps(cfg, cfg.fee_a_bps, cfg.venue_a, is_leg_b=False, is_exit=False) / 10_000.0
+        fee_b_entry = _effective_leg_fee_bps(cfg, cfg.fee_b_bps, cfg.venue_b, is_leg_b=True, is_exit=False) / 10_000.0
+        fee_a_exit = _effective_leg_fee_bps(cfg, cfg.fee_a_bps, cfg.venue_a, is_leg_b=False, is_exit=True) / 10_000.0
+        fee_b_exit = _effective_leg_fee_bps(cfg, cfg.fee_b_bps, cfg.venue_b, is_leg_b=True, is_exit=True) / 10_000.0
+        dual_fee_entry = fee_a_entry + fee_b_entry
+        dual_fee_exit = fee_a_exit + fee_b_exit
+        eff_weight = min(float(cfg.per_position_weight), 1.0 / max(1, int(cfg.max_positions)))
+        slot_cap = float(cfg.capital_usd) * eff_weight
 
         if action in ("OPEN_LONG", "OPEN_SHORT"):
             if bbo_a is None or sym in positions:
@@ -662,12 +993,13 @@ class ShadowPortfolioDaemon:
                 "single_venue": True,
                 "action": action,
                 "notional": notional,
+                "slot_margin": slot_cap,
                 "entry_ts_ms": int(fill_ts_ms),
                 "entry_a": entry_px,
                 "last_mark_a": bbo_a.mid,
                 "accrued_funding": 0.0,
             }
-            self._realized_pnl[sid] = realized - notional * fee_a
+            self._realized_pnl[sid] = realized - notional * fee_a_entry
             return
 
         if action in ("OPEN_SHORT_A_LONG_B", "OPEN_LONG_A_SHORT_B"):
@@ -677,10 +1009,12 @@ class ShadowPortfolioDaemon:
             entry_b = bbo_b.ask if action == "OPEN_SHORT_A_LONG_B" else bbo_b.bid
             if entry_a <= 0 or entry_b <= 0:
                 return
+            _, carry_slot_margin, _ = compute_carry_slot_sizing(cfg, cfg.leverage)
             positions[sym] = {
                 "single_venue": False,
                 "action": action,
                 "notional": notional,
+                "slot_margin": carry_slot_margin,
                 "entry_ts_ms": int(fill_ts_ms),
                 "entry_a": entry_a,
                 "entry_b": entry_b,
@@ -688,7 +1022,7 @@ class ShadowPortfolioDaemon:
                 "last_mark_b": bbo_b.mid,
                 "accrued_funding": 0.0,
             }
-            self._realized_pnl[sid] = realized - notional * dual_fee
+            self._realized_pnl[sid] = realized - notional * dual_fee_entry
             return
 
         if action in ("CLOSE", "CLOSE_PAIR"):
@@ -704,7 +1038,16 @@ class ShadowPortfolioDaemon:
                     gross = ((bbo_a.bid - pos["entry_a"]) / pos["entry_a"]) * pos["notional"]
                 else:
                     gross = ((pos["entry_a"] - bbo_a.ask) / pos["entry_a"]) * pos["notional"]
-                self._realized_pnl[sid] = realized + gross + accrued_funding - pos["notional"] * fee_a
+                exit_fee_a = (
+                    max(fee_a_exit, TAKER_FEE_BPS.get(cfg.venue_a, TAKER_FEE_BPS_DEFAULT) / 10_000.0)
+                    if reason in ("CHANDELIER_STOP", "MARGIN_LIQUIDATION")
+                    else fee_a_exit
+                )
+                extra_pen = 0.0
+                if reason == "MARGIN_LIQUIDATION":
+                    pos_slot_m = float(pos.get("slot_margin", slot_cap))
+                    extra_pen = max(pos_slot_m * 0.10, float(pos["notional"]) * 0.02)
+                self._realized_pnl[sid] = realized + gross + accrued_funding - pos["notional"] * exit_fee_a - extra_pen
             else:
                 if bbo_a is None or bbo_b is None:
                     positions[sym] = pos
@@ -715,7 +1058,19 @@ class ShadowPortfolioDaemon:
                 else:
                     pnl_a = ((bbo_a.bid - pos["entry_a"]) / pos["entry_a"]) * pos["notional"]
                     pnl_b = ((pos["entry_b"] - bbo_b.ask) / pos["entry_b"]) * pos["notional"]
-                self._realized_pnl[sid] = realized + pnl_a + pnl_b + accrued_funding - pos["notional"] * dual_fee
+                exit_cost = dual_fee_exit
+                extra_pen = 0.0
+                if reason == "MARGIN_LIQUIDATION":
+                    _, default_cm, _ = compute_carry_slot_sizing(cfg, cfg.leverage)
+                    pos_slot_m = float(pos.get("slot_margin", default_cm))
+                    extra_pen = max(pos_slot_m * 0.90, float(pos["notional"]) * 0.05)
+                elif reason == "MARGIN_PROTECT_EXIT":
+                    taker_a = max(fee_a_exit, TAKER_FEE_BPS.get(cfg.venue_a, TAKER_FEE_BPS_DEFAULT) / 10_000.0)
+                    taker_b = max(fee_b_exit, TAKER_FEE_BPS.get(cfg.venue_b, TAKER_FEE_BPS_DEFAULT) / 10_000.0)
+                    raw_ps = (cfg.params or {}).get("protective_exit_slip_bps", 5.0)
+                    storm_slip_bps = max(5.0, float(raw_ps) if _is_finite(raw_ps) else 5.0)
+                    exit_cost = taker_a + taker_b + (2.0 * storm_slip_bps) / 10_000.0
+                self._realized_pnl[sid] = realized + pnl_a + pnl_b + accrued_funding - pos["notional"] * exit_cost - extra_pen
 
     def _compute_mtm_equity(
         self,
@@ -818,6 +1173,22 @@ class ShadowPortfolioDaemon:
                 if str(cfg.status).upper() in ALLOWED_SHADOW_STATUSES
             }
 
+            # Compute required venues & full symbol union BEFORE collect_live so collector covers all 24 symbols!
+            venues_needed: set[str] = set()
+            symbols_needed: set[str] = set(self.bbo_symbols)
+            for cfg in shadow_cfgs.values():
+                if cfg.venue_a:
+                    venues_needed.add(cfg.venue_a)
+                if _is_dual_venue(cfg):
+                    venues_needed.add(cfg.venue_b)
+                for s in cfg.symbols:
+                    symbols_needed.add(s.upper())
+            if not venues_needed:
+                venues_needed.update({"hyperliquid", "gate"})
+            sorted_syms_needed = sorted(symbols_needed)
+            if self._collector.symbols != sorted_syms_needed:
+                self._collector.symbols = sorted_syms_needed
+
             # 3) Gather live BBO ticks (injected, live-collected, or latest stored)
             if collect_live:
                 collected, _errs = self._collector.capture_round()
@@ -833,19 +1204,7 @@ class ShadowPortfolioDaemon:
                         if prev_c is None or t.ts_ms >= prev_c.ts_ms:
                             self._latest_bbo_cache[(t.venue, t.symbol)] = t
 
-            venues_needed: set[str] = set()
-            symbols_needed: set[str] = set(self.bbo_symbols)
-            for cfg in shadow_cfgs.values():
-                if cfg.venue_a:
-                    venues_needed.add(cfg.venue_a)
-                if _is_dual_venue(cfg):
-                    venues_needed.add(cfg.venue_b)
-                for s in cfg.symbols:
-                    symbols_needed.add(s.upper())
-            if not venues_needed:
-                venues_needed.update({"hyperliquid", "gate"})
-
-            bbo_map = self._load_latest_bbo_map(sorted(symbols_needed), venues_needed, ts_now)
+            bbo_map = self._load_latest_bbo_map(sorted_syms_needed, venues_needed, ts_now)
             if not bbo_map:
                 self.notifier.emit(
                     "P1",
@@ -919,161 +1278,88 @@ class ShadowPortfolioDaemon:
                 meta={"symbols": len(bbo_map), "venues": len(venues_needed), "strategies": len(shadow_cfgs)},
             )
 
-            # 4) Step each active SHADOW_LIVE strategy
+            # 4) Step each active SHADOW_LIVE strategy with per-strategy exception isolation
             records: list[ShadowParityRecord] = []
+            hour_floor = (int(ts_now) // HOUR_MS) * HOUR_MS
             for sid, cfg in sorted(shadow_cfgs.items()):
-                self._started_ts_ms.setdefault(sid, ts_now)
-                self._plans_created.setdefault(sid, 0)
-                self._plans_blocked.setdefault(sid, 0)
-                self._spread_history.setdefault(sid, [])
-                state = self._plugin_states.setdefault(sid, {})
-                plugin = self.registry.resolve_for_config(cfg)
-                self._warmup_plugin_state_from_candles(cfg, state, ts_now)
+                try:
+                    loaded_entry = self.watcher.get_loaded(sid)
+                    cfg_sha = loaded_entry[1] if (isinstance(loaded_entry, tuple) and len(loaded_entry) == 2) else sha256_obj(cfg.to_dict())
 
-                step_half_spreads: list[float] = []
-                dual = _is_dual_venue(cfg)
+                    self._started_ts_ms.setdefault(sid, ts_now)
+                    self._plans_created.setdefault(sid, 0)
+                    self._plans_blocked.setdefault(sid, 0)
+                    self._spread_history.setdefault(sid, [])
+                    state = self._plugin_states.setdefault(sid, {})
+                    plugin = self.registry.resolve_for_config(cfg)
+                    self._warmup_plugin_state_from_candles(cfg, cfg_sha, state, ts_now)
 
-                # Deliver ONLY new BBO ticks per (sid, venue, sym) & snapshot plugin state for atomic rollback on BLOCKED
-                for sym in cfg.symbols:
-                    ta = bbo_map.get((cfg.venue_a, sym))
-                    tb = bbo_map.get((cfg.venue_b, sym)) if dual else None
+                    # Refresh closed 1h log-returns whenever hour_floor advances (keeps 7d vol leverage live!)
+                    warm_key = (sid, cfg_sha)
+                    if str(cfg.plugin_id or "funding_carry") == "funding_carry":
+                        if self._last_vol_refresh_hour.get(warm_key) != hour_floor:
+                            vol_lb_h = max(24, min(336, _param_int(cfg.params or {}, "vol_lookback_hours", 168)))
+                            self._refresh_carry_hourly_log_rets(cfg, state, ts_now, lookback_h=vol_lb_h + 24)
+                            self._last_vol_refresh_hour[warm_key] = hour_floor
 
-                    if ta is not None and not dual:
-                        step_half_spreads.append(ta.spread_bps * 0.5)
-                    elif ta is not None and tb is not None and dual:
-                        step_half_spreads.append((ta.spread_bps + tb.spread_bps) * 0.5)
-
-                    for tick in (ta, tb):
-                        if tick is None:
-                            continue
-                        dedup_key = (sid, tick.venue, sym)
-                        if self._last_delivered_bbo_ts.get(dedup_key, -1) >= tick.ts_ms:
-                            continue
-                        self._last_delivered_bbo_ts[dedup_key] = tick.ts_ms
-                        ev = MarketEvent(
-                            kind="BBO",
-                            ts_ms=tick.ts_ms,
-                            venue=tick.venue,
-                            symbol=sym,
-                            payload={"bid": tick.bid, "ask": tick.ask, "mid": tick.mid, "spread_bps": tick.spread_bps},
-                        )
-                        self._step_plugin_and_submit(cfg, plugin, state, ev, bbo_map, ts_now)
-
-                # Deliver NEW realized funding bars sorted strictly chronologically across venues (R2-2)
-                funding_venues = [cfg.venue_a, cfg.venue_b] if dual else [cfg.venue_a]
-                for sym in cfg.symbols:
-                    pending_bars: list[tuple[int, str, Any]] = []
-                    for fvenue in funding_venues:
-                        if not fvenue:
-                            continue
-                        f_key = (sid, fvenue, sym)
-                        last_f_ts = self._last_delivered_funding_ts.get(f_key, ts_now - 86_400_000)
-                        for fb in self.store.load_funding(fvenue, sym, start_ms=last_f_ts + 1, end_ms=ts_now):
-                            if fb.ts_ms > self._last_delivered_funding_ts.get(f_key, -1):
-                                pending_bars.append((int(fb.ts_ms), fvenue, fb))
-                    pending_bars.sort(key=lambda item: (item[0], item[1]))
-                    for fb_ts, fvenue, fb in pending_bars:
-                        f_key = (sid, fvenue, sym)
-                        if fb_ts <= self._last_delivered_funding_ts.get(f_key, -1):
-                            continue
-                        self._last_delivered_funding_ts[f_key] = fb_ts
-                        self._accrue_funding_on_open_positions(cfg, fvenue, sym, fb.funding_rate, fb_ts)
-                        ev_f = MarketEvent(
-                            kind="FUNDING",
-                            ts_ms=fb_ts,
-                            venue=fvenue,
-                            symbol=sym,
-                            payload={
-                                "funding_rate": fb.funding_rate,
-                                "interval_hours": fb.interval_hours,
-                                "apr_pct": fb.apr_pct,
-                            },
-                        )
-                        self._step_plugin_and_submit(cfg, plugin, state, ev_f, bbo_map, ts_now)
-
-                # Keep bounded spread history (last 240 samples)
-                hist = self._spread_history[sid]
-                hist.extend(step_half_spreads)
-                if len(hist) > 240:
-                    del hist[:-240]
-
-                # Sustained wide live spread kill guard (exact 1-leg / 2-leg scaling, Red-Team BLOCKER #6)
-                assumed_slip = _assumed_total_slip_bps(cfg)
-                if step_half_spreads:
-                    cur_ratio = statistics.median(step_half_spreads) / assumed_slip
-                    if cur_ratio > self.max_spread_ratio:
-                        since = self._wide_spread_since_ms.get(sid)
-                        if since is None:
-                            self._wide_spread_since_ms[sid] = ts_now
-                            since = ts_now
-                        elapsed_wide_sec = (ts_now - since) / 1000.0
-                        if elapsed_wide_sec >= self.wide_spread_kill_sec and not self.bridge.kill_switch.is_engaged():
-                            self.bridge.kill_switch.engage(
-                                KillTrigger.SLIPPAGE_EXCEEDED,
-                                actor="shadow-daemon",
-                                detail=f"{sid}: spread_ratio={cur_ratio:.2f}x sustained {elapsed_wide_sec:.0f}s",
-                            )
-                            self.notifier.emit(
-                                "P0",
-                                "SPREAD_KILL_ENGAGED",
-                                f"Shadow KillSwitch Engaged ({sid})",
-                                f"Live spread {cur_ratio:.2f}x > {self.max_spread_ratio:.2f}x for {elapsed_wide_sec:.0f}s",
-                            )
-                    else:
-                        self._wide_spread_since_ms[sid] = None
-
-                # Compute & persist MTM equity + runtime state + Shadow-vs-Backtest Parity record
-                eq_usd, realized_usd, unr_usd = self._compute_mtm_equity(cfg, bbo_map)
-                open_cnt = len(self._open_positions.get(sid, {}))
-                self.parity.record_equity(ts_now, sid, eq_usd, realized_usd, unr_usd, open_cnt)
-                sid_funding_ts = {
-                    f"{v}:{sym}": ts
-                    for (s_id, v, sym), ts in self._last_delivered_funding_ts.items()
-                    if s_id == sid
-                }
-                self.parity.save_runtime_state(
-                    sid,
-                    started_ts_ms=self._started_ts_ms[sid],
-                    realized_pnl_usd=realized_usd,
-                    plans_created=self._plans_created[sid],
-                    plans_blocked=self._plans_blocked[sid],
-                    open_positions=self._open_positions.get(sid, {}),
-                    updated_ts_ms=ts_now,
-                    plugin_state=self._plugin_states.get(sid, {}),
-                    last_funding_ts=sid_funding_ts,
-                )
-
-                chain_ok_now, _, _ = self.bridge.audit.verify_chain()
-                ks_now = self.bridge.kill_switch.is_engaged()
-                rec = self.parity.evaluate_strategy(
-                    cfg,
-                    window_start_ms=self._started_ts_ms[sid],
-                    window_end_ms=ts_now,
-                    shadow_equity_usd=eq_usd,
-                    live_half_spreads_bps=hist,
-                    plans_created=self._plans_created[sid],
-                    plans_blocked=self._plans_blocked[sid],
-                    open_positions=open_cnt,
-                    bbo_freshness_sec=bbo_freshness_sec,
-                    audit_chain_valid=chain_ok_now,
-                    kill_switch_engaged=ks_now,
-                    max_spread_ratio=self.max_spread_ratio,
-                    max_drift_bps=self.max_drift_bps,
-                    drift_check_min_hours=self.drift_check_min_hours,
-                )
-
-                if rec.status == "DRIFT_EXCEEDED" and not self.bridge.kill_switch.is_engaged():
-                    self.bridge.kill_switch.engage(
-                        KillTrigger.RISK_DRAWDOWN,
-                        actor="shadow-daemon",
-                        detail=f"{sid}: shadow-vs-backtest drift {rec.drift_bps:+.1f}bp > {self.max_drift_bps:.1f}bp",
+                    step_half_spreads = self._step_strategy_portfolio_cycle(
+                        cfg, plugin, state, bbo_map, ts_now, hour_floor
                     )
-                    self.notifier.emit(
-                        "P0",
-                        "PARITY_DRIFT_KILL",
-                        f"Shadow Parity Drift Kill ({sid})",
-                        f"drift={rec.drift_bps:+.1f}bp shadow={rec.shadow_return_pct:+.2f}% bt={rec.backtest_return_pct:+.2f}%",
+
+                    # Keep bounded spread history (last 240 samples)
+                    hist = self._spread_history[sid]
+                    hist.extend(step_half_spreads)
+                    if len(hist) > 240:
+                        del hist[:-240]
+
+                    # Sustained wide live spread kill guard (exact 1-leg / 2-leg scaling, Red-Team BLOCKER #6)
+                    assumed_slip = _assumed_total_slip_bps(cfg)
+                    if step_half_spreads:
+                        cur_ratio = statistics.median(step_half_spreads) / assumed_slip
+                        if cur_ratio > self.max_spread_ratio:
+                            since = self._wide_spread_since_ms.get(sid)
+                            if since is None:
+                                self._wide_spread_since_ms[sid] = ts_now
+                                since = ts_now
+                            elapsed_wide_sec = (ts_now - since) / 1000.0
+                            if elapsed_wide_sec >= self.wide_spread_kill_sec and not self.bridge.kill_switch.is_engaged():
+                                self.bridge.kill_switch.engage(
+                                    KillTrigger.SLIPPAGE_EXCEEDED,
+                                    actor="shadow-daemon",
+                                    detail=f"{sid}: spread_ratio={cur_ratio:.2f}x sustained {elapsed_wide_sec:.0f}s",
+                                )
+                                self.notifier.emit(
+                                    "P0",
+                                    "SPREAD_KILL_ENGAGED",
+                                    f"Shadow KillSwitch Engaged ({sid})",
+                                    f"Live spread {cur_ratio:.2f}x > {self.max_spread_ratio:.2f}x for {elapsed_wide_sec:.0f}s",
+                                )
+                        else:
+                            self._wide_spread_since_ms[sid] = None
+
+                    # Compute & persist MTM equity + runtime state + Shadow-vs-Backtest Parity record
+                    eq_usd, realized_usd, unr_usd = self._compute_mtm_equity(cfg, bbo_map)
+                    open_cnt = len(self._open_positions.get(sid, {}))
+                    self.parity.record_equity(ts_now, sid, eq_usd, realized_usd, unr_usd, open_cnt)
+                    sid_funding_ts = {
+                        f"{v}:{sym}": ts
+                        for (s_id, v, sym), ts in self._last_delivered_funding_ts.items()
+                        if s_id == sid
+                    }
+                    self.parity.save_runtime_state(
+                        sid,
+                        started_ts_ms=self._started_ts_ms[sid],
+                        realized_pnl_usd=realized_usd,
+                        plans_created=self._plans_created[sid],
+                        plans_blocked=self._plans_blocked[sid],
+                        open_positions=self._open_positions.get(sid, {}),
+                        updated_ts_ms=ts_now,
+                        plugin_state=self._plugin_states.get(sid, {}),
+                        last_funding_ts=sid_funding_ts,
                     )
+
+                    chain_ok_now, _, _ = self.bridge.audit.verify_chain()
+                    ks_now = self.bridge.kill_switch.is_engaged()
                     rec = self.parity.evaluate_strategy(
                         cfg,
                         window_start_ms=self._started_ts_ms[sid],
@@ -1085,12 +1371,49 @@ class ShadowPortfolioDaemon:
                         open_positions=open_cnt,
                         bbo_freshness_sec=bbo_freshness_sec,
                         audit_chain_valid=chain_ok_now,
-                        kill_switch_engaged=True,
+                        kill_switch_engaged=ks_now,
                         max_spread_ratio=self.max_spread_ratio,
                         max_drift_bps=self.max_drift_bps,
                         drift_check_min_hours=self.drift_check_min_hours,
                     )
-                records.append(rec)
+
+                    if rec.status == "DRIFT_EXCEEDED" and not self.bridge.kill_switch.is_engaged():
+                        self.bridge.kill_switch.engage(
+                            KillTrigger.RISK_DRAWDOWN,
+                            actor="shadow-daemon",
+                            detail=f"{sid}: shadow-vs-backtest drift {rec.drift_bps:+.1f}bp > {self.max_drift_bps:.1f}bp",
+                        )
+                        self.notifier.emit(
+                            "P0",
+                            "PARITY_DRIFT_KILL",
+                            f"Shadow Parity Drift Kill ({sid})",
+                            f"drift={rec.drift_bps:+.1f}bp shadow={rec.shadow_return_pct:+.2f}% bt={rec.backtest_return_pct:+.2f}%",
+                        )
+                        rec = self.parity.evaluate_strategy(
+                            cfg,
+                            window_start_ms=self._started_ts_ms[sid],
+                            window_end_ms=ts_now,
+                            shadow_equity_usd=eq_usd,
+                            live_half_spreads_bps=hist,
+                            plans_created=self._plans_created[sid],
+                            plans_blocked=self._plans_blocked[sid],
+                            open_positions=open_cnt,
+                            bbo_freshness_sec=bbo_freshness_sec,
+                            audit_chain_valid=chain_ok_now,
+                            kill_switch_engaged=True,
+                            max_spread_ratio=self.max_spread_ratio,
+                            max_drift_bps=self.max_drift_bps,
+                            drift_check_min_hours=self.drift_check_min_hours,
+                        )
+                    records.append(rec)
+                except Exception as strat_exc:
+                    logger.exception("Isolated strategy error for %s (continuing sibling strategies): %s", sid, strat_exc)
+                    self.notifier.emit(
+                        "P1",
+                        "SHADOW_STRATEGY_ERROR",
+                        f"Shadow Strategy Execution Error ({sid})",
+                        f"trace={trace_id} strategy={sid} error={type(strat_exc).__name__}: {strat_exc}",
+                    )
 
             overall_status = "KILL_TRIPPED" if self.bridge.kill_switch.is_engaged() else (
                 "WARN_WIDE_SPREAD" if any(r.status == "WARN_WIDE_SPREAD" for r in records) else "PARITY_OK"
@@ -1106,6 +1429,286 @@ class ShadowPortfolioDaemon:
                 detail="OK" if overall_status == "PARITY_OK" else overall_status,
             )
 
+    def _submit_intent_to_bridge(
+        self,
+        cfg: StrategyConfig,
+        intent: OrderIntent,
+        bbo_map: dict[tuple[str, str], BBOTick],
+        ts_now: int,
+    ) -> tuple[str, bool]:
+        """Submit one OrderIntent to ExecutionBridge & apply shadow fill. Returns (plan.status, plan.duplicate)."""
+        sid = cfg.strategy_id
+        dual = _is_dual_venue(cfg)
+        ta = bbo_map.get((cfg.venue_a, intent.symbol))
+        tb = bbo_map.get((cfg.venue_b, intent.symbol)) if dual else None
+        bbo_by_venue: dict[str, BBOTick] = {}
+        if ta is not None:
+            bbo_by_venue[cfg.venue_a] = ta
+        if tb is not None and dual:
+            bbo_by_venue[cfg.venue_b] = tb
+
+        plan = self.bridge.submit_intent(cfg, intent, bbo_by_venue, now_ms=ts_now)
+        if plan.status == "PLANNED_SHADOW":
+            if not plan.duplicate:
+                self._plans_created[sid] = self._plans_created.get(sid, 0) + 1
+                self._apply_shadow_fill(cfg, intent, ta, tb, fill_ts_ms=ts_now)
+        else:
+            self._plans_blocked[sid] = self._plans_blocked.get(sid, 0) + 1
+        return plan.status, bool(plan.duplicate)
+
+    def _step_strategy_portfolio_cycle(
+        self,
+        cfg: StrategyConfig,
+        plugin: Any,
+        state: dict[str, Any],
+        bbo_map: dict[tuple[str, str], BBOTick],
+        ts_now: int,
+        hour_floor: int,
+    ) -> list[float]:
+        """Deliver FUNDING-before-BBO with Pass-1 exit-before-entry barrier and Pass-2 edge-ranked entries."""
+        sid = cfg.strategy_id
+        dual = _is_dual_venue(cfg)
+        plugin_id = str(cfg.plugin_id or "funding_carry")
+        step_half_spreads: list[float] = []
+
+        # A) Gather new FUNDING bars (silently catch up missed historical bars < hour_floor; group live bars by ts)
+        funding_venues = [cfg.venue_a, cfg.venue_b] if dual else [cfg.venue_a]
+        live_funding_events: dict[str, list[MarketEvent]] = {sym: [] for sym in cfg.symbols}
+        f_hist_state = state.setdefault("funding_hist", {}) if plugin_id == "funding_carry" else None
+        first_f_state = state.setdefault("first_funding_ts", {}) if plugin_id == "funding_carry" else None
+
+        for sym in cfg.symbols:
+            pending_bars: list[tuple[int, str, Any]] = []
+            for fvenue in funding_venues:
+                if not fvenue:
+                    continue
+                f_key = (sid, fvenue, sym)
+                if plugin_id == "funding_carry" and f_key not in self._last_delivered_funding_ts:
+                    # Cold-start empty funding DB: wait for _warmup_plugin_state_from_candles retry
+                    # so historical rows warm funding_hist silently without pinning cursor to ts_now.
+                    continue
+                last_f_ts = self._last_delivered_funding_ts.get(f_key, self._started_ts_ms.get(sid, ts_now))
+                for fb in self.store.load_funding(fvenue, sym, start_ms=last_f_ts + 1, end_ms=ts_now):
+                    if fb.ts_ms > self._last_delivered_funding_ts.get(f_key, -1):
+                        pending_bars.append((int(fb.ts_ms), fvenue, fb))
+            pending_bars.sort(key=lambda item: (item[0], item[1]))
+
+            live_grouped: dict[int, list[tuple[str, Any]]] = {}
+            for fb_ts, fvenue, fb in pending_bars:
+                f_key = (sid, fvenue, sym)
+                if fb_ts <= self._last_delivered_funding_ts.get(f_key, -1):
+                    continue
+                self._last_delivered_funding_ts[f_key] = fb_ts
+                self._accrue_funding_on_open_positions(cfg, fvenue, sym, fb.funding_rate, fb_ts)
+                if fb_ts < hour_floor:
+                    # Missed historical bar after downtime: ingest into funding_hist silently (no phantom historical orders)
+                    if f_hist_state is not None and _is_finite(fb.funding_rate):
+                        fmap = f_hist_state.setdefault((fvenue, sym), {})
+                        fmap[fb_ts] = float(fb.funding_rate)
+                        if first_f_state is not None:
+                            prev_f = first_f_state.get(sym)
+                            if prev_f is None or fb_ts < prev_f:
+                                first_f_state[sym] = fb_ts
+                else:
+                    live_grouped.setdefault(fb_ts, []).append((fvenue, fb))
+
+            for fb_ts in sorted(live_grouped.keys()):
+                group = live_grouped[fb_ts]
+                for idx_g, (fvenue, fb) in enumerate(group):
+                    live_funding_events[sym].append(
+                        MarketEvent(
+                            kind="FUNDING",
+                            ts_ms=fb_ts,
+                            venue=fvenue,
+                            symbol=sym,
+                            payload={
+                                "funding_rate": fb.funding_rate,
+                                "interval_hours": fb.interval_hours,
+                                "apr_pct": fb.apr_pct,
+                                "defer_decision": idx_g < (len(group) - 1),
+                            },
+                        )
+                    )
+
+        # B) Gather new BBO ticks & spread telemetry
+        live_bbo_events: dict[str, list[MarketEvent]] = {sym: [] for sym in cfg.symbols}
+        for sym in cfg.symbols:
+            ta = bbo_map.get((cfg.venue_a, sym))
+            tb = bbo_map.get((cfg.venue_b, sym)) if dual else None
+            if ta is not None and not dual:
+                step_half_spreads.append(ta.spread_bps * 0.5)
+            elif ta is not None and tb is not None and dual:
+                step_half_spreads.append((ta.spread_bps + tb.spread_bps) * 0.5)
+
+            for tick in (ta, tb):
+                if tick is None:
+                    continue
+                dedup_key = (sid, tick.venue, sym)
+                if self._last_delivered_bbo_ts.get(dedup_key, -1) >= tick.ts_ms:
+                    continue
+                self._last_delivered_bbo_ts[dedup_key] = tick.ts_ms
+                live_bbo_events[sym].append(
+                    MarketEvent(
+                        kind="BBO",
+                        ts_ms=tick.ts_ms,
+                        venue=tick.venue,
+                        symbol=sym,
+                        payload={"bid": tick.bid, "ask": tick.ask, "mid": tick.mid, "spread_bps": tick.spread_bps},
+                    )
+                )
+
+        # Custom plugins not using open_pos fallback directly to standard single-step submission (FUNDING before BBO)
+        if plugin_id not in ("funding_carry", "trend_cta"):
+            for sym in cfg.symbols:
+                for ev in live_funding_events[sym] + live_bbo_events[sym]:
+                    self._step_plugin_and_submit(cfg, plugin, state, ev, bbo_map, ts_now)
+            return step_half_spreads
+
+        pos_keys = ("open_pos", "positions", "pending_actions", "cooldown_until")
+        open_pos_map: dict[str, Any] = state.setdefault("open_pos", {})
+        open_syms = [
+            sym
+            for sym in cfg.symbols
+            if sym in open_pos_map or sym in self._open_positions.get(sid, {})
+        ]
+        open_sym_set = set(open_syms)
+        reversal_candidates: dict[str, tuple[OrderIntent, dict[str, Any] | None]] = {}
+
+        # C) PASS 1 — Open positions FIRST (exits, stops, reversals) freeing slots & gross leverage before any entries!
+        for sym in open_syms:
+            if plugin_id == "funding_carry" and len(live_bbo_events[sym]) > 1:
+                pass1_bbo_evs = [
+                    MarketEvent(
+                        kind=ev.kind,
+                        ts_ms=ev.ts_ms,
+                        venue=ev.venue,
+                        symbol=ev.symbol,
+                        payload={**ev.payload, "defer_decision": idx_b < (len(live_bbo_events[sym]) - 1)},
+                    )
+                    for idx_b, ev in enumerate(live_bbo_events[sym])
+                ]
+            else:
+                pass1_bbo_evs = live_bbo_events[sym]
+            for ev in live_funding_events[sym] + pass1_bbo_evs:
+                pos_snapshots = {k: copy.deepcopy(state[k]) for k in pos_keys if k in state}
+                intents = plugin.on_event(ev, state, cfg)
+                if not intents:
+                    continue
+
+                close_intents = [i for i in intents if str(i.action) in ("CLOSE", "CLOSE_PAIR")]
+                open_intents = [i for i in intents if str(i.action).startswith("OPEN_")]
+                close_blocked = False
+                for c_int in close_intents:
+                    c_status, c_dup = self._submit_intent_to_bridge(cfg, c_int, bbo_map, ts_now)
+                    if c_status != "PLANNED_SHADOW":
+                        close_blocked = True
+                        break
+                    if c_dup and sym in self._open_positions.get(sid, {}):
+                        close_blocked = True
+                        break
+
+                if close_blocked:
+                    # Atomic rollback: if CLOSE is BLOCKED, abort any paired reversal OPEN_* too!
+                    for k in pos_keys:
+                        if k in pos_snapshots:
+                            state[k] = pos_snapshots[k]
+                        else:
+                            state.pop(k, None)
+                    continue
+
+                if open_intents:
+                    # Queue reversal OPEN_* into Pass 2's cross-symbol edge-ranked candidate pool
+                    rev_int = open_intents[-1]
+                    rev_pos = copy.deepcopy(state.get("open_pos", {}).pop(sym, None))
+                    reversal_candidates[sym] = (rev_int, rev_pos)
+
+        # D) PASS 2 — Flat symbols telemetry & edge-ranked candidate collection (no alphabetical slot stealing!)
+        base_open = copy.deepcopy(state.get("open_pos", {}))
+        entry_candidates: dict[str, tuple[OrderIntent, dict[str, Any] | None]] = dict(reversal_candidates)
+        for sym in cfg.symbols:
+            if sym in open_sym_set:
+                continue
+            sym_events = live_funding_events[sym] + live_bbo_events[sym]
+            if not sym_events:
+                continue
+            if plugin_id == "funding_carry" and len(sym_events) > 1:
+                pass2_events = [
+                    MarketEvent(
+                        kind=ev.kind,
+                        ts_ms=ev.ts_ms,
+                        venue=ev.venue,
+                        symbol=ev.symbol,
+                        payload={**ev.payload, "defer_decision": idx_e < (len(sym_events) - 1)},
+                    )
+                    for idx_e, ev in enumerate(sym_events)
+                ]
+            else:
+                pass2_events = sym_events
+            for ev in pass2_events:
+                # Evaluate every flat symbol against the same post-Pass-1 open_pos snapshot
+                state["open_pos"] = copy.deepcopy(base_open)
+                intents = plugin.on_event(ev, state, cfg)
+                for intent in intents:
+                    if str(intent.action).startswith("OPEN_"):
+                        cand_pos = copy.deepcopy(state.get("open_pos", {}).get(sym))
+                        prev = entry_candidates.get(sym)
+                        if prev is None or float(intent.expected_edge_bps) >= float(prev[0].expected_edge_bps):
+                            entry_candidates[sym] = (intent, cand_pos)
+            state["open_pos"] = copy.deepcopy(base_open)
+
+        state["open_pos"] = base_open
+
+        # Rank ALL candidate entries strictly by (-expected_edge_bps, symbol) matching backtester.py & evaluate()
+        ranked = sorted(
+            entry_candidates.items(),
+            key=lambda kv: (-float(kv[1][0].expected_edge_bps), kv[0]),
+        )
+        cta_atr_n = parse_cta_params(cfg)["atr_n"] if plugin_id == "trend_cta" else 14
+        for sym, (intent, cand_pos) in ranked:
+            cur_open = state.setdefault("open_pos", {})
+            if sym in cur_open or len(cur_open) >= int(cfg.max_positions):
+                continue
+
+            submit_intent = intent
+            commit_pos = copy.deepcopy(cand_pos) if isinstance(cand_pos, dict) else None
+            if plugin_id == "trend_cta" and commit_pos is not None:
+                cur_gross = sum(float(p_item.get("notional", 0.0)) for p_item in cur_open.values())
+                tr_s = state.get("tr_hist", {}).get(sym, [])
+                atr_prev = (sum(tr_s[-cta_atr_n:]) / float(len(tr_s[-cta_atr_n:]))) if tr_s else 0.0
+                recomp_notional, slot_cap = compute_cta_entry_notional(
+                    cfg,
+                    entry_px=float(commit_pos.get("entry_px", 0.0)),
+                    atr_prev=atr_prev,
+                    cur_gross_notional=cur_gross,
+                )
+                if recomp_notional < 10.0:
+                    continue
+                commit_pos["notional"] = recomp_notional
+                commit_pos["slot_margin"] = slot_cap
+                submit_intent = OrderIntent(
+                    intent.strategy_id,
+                    intent.symbol,
+                    intent.action,
+                    recomp_notional,
+                    intent.expected_edge_bps,
+                    intent.reason,
+                    intent.ts_ms,
+                )
+
+            status, is_dup = self._submit_intent_to_bridge(cfg, submit_intent, bbo_map, ts_now)
+            if status == "PLANNED_SHADOW":
+                if not is_dup:
+                    if commit_pos is not None:
+                        cur_open[sym] = commit_pos
+                else:
+                    # Reconcile duplicate intent against actual shadow ledger so state["open_pos"] never drifts
+                    if sym in self._open_positions.get(sid, {}) and commit_pos is not None:
+                        cur_open[sym] = commit_pos
+                    else:
+                        cur_open.pop(sym, None)
+
+        return step_half_spreads
+
     def _step_plugin_and_submit(
         self,
         cfg: StrategyConfig,
@@ -1117,39 +1720,46 @@ class ShadowPortfolioDaemon:
     ) -> None:
         """Invoke plugin.on_event(), submit intents via ExecutionBridge, and rollback position state if BLOCKED."""
         sid = cfg.strategy_id
-        dual = _is_dual_venue(cfg)
-        pos_keys = ("open_pos", "positions")
+        pos_keys = ("open_pos", "positions", "pending_actions", "cooldown_until")
         pos_snapshots = {k: copy.deepcopy(state[k]) for k in pos_keys if k in state}
         intents = plugin.on_event(ev, state, cfg)
         if not intents:
             return
 
         any_blocked = False
+        any_planned = False
+        blocked_open_syms: list[str] = []
         for intent in intents:
-            ta = bbo_map.get((cfg.venue_a, intent.symbol))
-            tb = bbo_map.get((cfg.venue_b, intent.symbol)) if dual else None
-            bbo_by_venue: dict[str, BBOTick] = {}
-            if ta is not None:
-                bbo_by_venue[cfg.venue_a] = ta
-            if tb is not None and dual:
-                bbo_by_venue[cfg.venue_b] = tb
-
-            plan = self.bridge.submit_intent(cfg, intent, bbo_by_venue, now_ms=ts_now)
-            if plan.status == "PLANNED_SHADOW":
-                if not plan.duplicate:
-                    self._plans_created[sid] = self._plans_created.get(sid, 0) + 1
-                    self._apply_shadow_fill(cfg, intent, ta, tb, fill_ts_ms=ts_now)
+            status, is_dup = self._submit_intent_to_bridge(cfg, intent, bbo_map, ts_now)
+            if status == "PLANNED_SHADOW":
+                any_planned = True
+                if is_dup and str(intent.action).startswith("OPEN_") and intent.symbol not in self._open_positions.get(sid, {}):
+                    for k in ("open_pos", "positions"):
+                        if isinstance(state.get(k), dict):
+                            state[k].pop(intent.symbol, None)
             else:
-                self._plans_blocked[sid] = self._plans_blocked.get(sid, 0) + 1
                 any_blocked = True
+                if str(intent.action).startswith("OPEN_"):
+                    blocked_open_syms.append(intent.symbol)
+                elif str(intent.action) in ("CLOSE", "CLOSE_PAIR"):
+                    # Abort any subsequent reversal OPEN_* if CLOSE was BLOCKED
+                    break
 
-        # Restore only position dicts on BLOCKED so updated market telemetry (latest_apr/latest_mids/ohlc_hist) is kept!
+        # Restore position/action state on BLOCKED while keeping updated market telemetry (ohlc_hist/funding_hist)!
         if any_blocked:
-            for k in pos_keys:
-                if k in pos_snapshots:
-                    state[k] = pos_snapshots[k]
-                else:
-                    state.pop(k, None)
+            if not any_planned:
+                for k in pos_keys:
+                    if k in pos_snapshots:
+                        state[k] = pos_snapshots[k]
+                    else:
+                        state.pop(k, None)
+            else:
+                # Partial execution (e.g., CLOSE succeeded, reversal OPEN blocked): evict only blocked opens
+                for sym_b in blocked_open_syms:
+                    if sym_b not in self._open_positions.get(sid, {}):
+                        for k in ("open_pos", "positions"):
+                            if isinstance(state.get(k), dict):
+                                state[k].pop(sym_b, None)
 
     def _finalize_report(
         self,

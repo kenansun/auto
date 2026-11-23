@@ -292,27 +292,52 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
         def log_message(self, fmt: str, *args: Any) -> None:
             logger.info("HTTP %s - %s", self.address_string(), fmt % args)
 
-        def _send_bytes(self, status: int, content_type: str, body: bytes) -> None:
+        def _send_bytes(
+            self,
+            status: int,
+            content_type: str,
+            body: bytes,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
+            for hk, hv in (extra_headers or {}).items():
+                self.send_header(hk, hv)
             self.end_headers()
             self.wfile.write(body)
 
         def _check_loopback_host(self) -> bool:
             bind_host = str(self.server.server_address[0])
-            if bind_host not in LOOPBACK_HOSTS:
-                return True
             host_hdr = (self.headers.get("Host") or "").strip()
             if not host_hdr:
                 return True
-            return bool(re.fullmatch(r"(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?", host_hdr, re.IGNORECASE))
+            if bind_host in LOOPBACK_HOSTS:
+                return bool(re.fullmatch(r"(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?", host_hdr, re.IGNORECASE))
+            # Non-loopback private interface bind: allow exact bound IP or loopback Host headers only
+            escaped = re.escape(bind_host)
+            return bool(
+                re.fullmatch(rf"({escaped}|127\.0\.0\.1|localhost|\[::1\])(:\d{{1,5}})?", host_hdr, re.IGNORECASE)
+            )
 
-        def _send_json(self, status: int, obj: Any) -> None:
+        def _is_readonly_mode(self) -> bool:
+            if os.environ.get("ALPHALOOP_CONSOLE_READONLY") == "1":
+                return True
+            bind_host = str(self.server.server_address[0])
+            if bind_host not in LOOPBACK_HOSTS and os.environ.get("ALPHALOOP_ALLOW_REMOTE_MUTATIONS") != "1":
+                return True
+            return False
+
+        def _send_json(
+            self,
+            status: int,
+            obj: Any,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             raw = json.dumps(obj, sort_keys=True, ensure_ascii=False, allow_nan=False).encode("utf-8")
-            self._send_bytes(status, "application/json; charset=utf-8", raw)
+            self._send_bytes(status, "application/json; charset=utf-8", raw, extra_headers=extra_headers)
 
         def _read_body(self) -> tuple[bytes | None, int | None, str | None]:
             if self.headers.get("Transfer-Encoding"):
@@ -395,6 +420,9 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             try:
+                if self._is_readonly_mode():
+                    self._send_json(405, {"error": "METHOD_NOT_ALLOWED_READONLY_CONSOLE"}, extra_headers={"Allow": "GET"})
+                    return
                 if not self._check_loopback_host():
                     self._send_json(403, {"error": "FORBIDDEN_HOST_HEADER"})
                     return

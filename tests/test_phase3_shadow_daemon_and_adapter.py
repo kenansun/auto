@@ -190,6 +190,7 @@ class TestPhase3ShadowDaemonAdapterAndLLM(unittest.TestCase):
                 leverage=2.0,
                 entry_spread_apr_pct=15.0,
                 exit_spread_apr_pct=2.0,
+                lookback_hours=1,
                 exit_confirm_hours=2,
                 min_hold_hours=0,
                 slippage_per_leg_bps=0.75,
@@ -200,10 +201,10 @@ class TestPhase3ShadowDaemonAdapterAndLLM(unittest.TestCase):
 
             store = MarketDataStore(data_dir / "market_data.sqlite")
             t0 = 1_795_400_000_000
-            # Seed wide positive spread funding (HL +0.0005/1h = 438% APR vs Gate +0.0001/8h = 10.95% APR)
+            # Seed current-hour wide positive spread funding (HL +0.0005/1h = 438% APR vs Gate +0.0001/8h = 10.95% APR)
             store.upsert_funding([
-                FundingRateBar("hyperliquid", "BTC", t0 - 3_600_000, 0.0005, 1.0, PROVENANCE_REAL),
-                FundingRateBar("gate", "BTC", t0 - 3_600_000, 0.0001, 8.0, PROVENANCE_REAL),
+                FundingRateBar("hyperliquid", "BTC", t0, 0.0005, 1.0, PROVENANCE_REAL),
+                FundingRateBar("gate", "BTC", t0, 0.0001, 8.0, PROVENANCE_REAL),
             ])
             store.close()
 

@@ -36,6 +36,7 @@ class _OpenPosition:
     entry_spread_apr_pct: float
     entry_px_a: float | None
     entry_px_b: float | None
+    slot_margin_per_leg: float = 0.0
     gross_funding_usd: float = 0.0
     low_streak_hours: int = 0
     low_streak_settlements: int = 0
@@ -59,6 +60,228 @@ TAKER_FEE_BPS: dict[str, float] = {
     "gate": 5.0,
     "binance": 5.0,
 }
+
+KNOWN_FUNDING_CARRY_PARAM_KEYS: frozenset[str] = frozenset({
+    "vol_target_leverage_enabled",
+    "vol_lookback_hours",
+    "vol_target_ann_pct",
+    "min_symbol_leverage",
+    "protective_margin_exit_pct",
+    "protective_exit_slip_bps",
+})
+
+
+def _param_float(params: dict[str, Any] | None, key: str, default: float) -> float:
+    if not params:
+        return default
+    raw = params.get(key, default)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return default
+    fv = float(raw)
+    return fv if math.isfinite(fv) else default
+
+
+def _param_int(params: dict[str, Any] | None, key: str, default: int) -> int:
+    if not params:
+        return default
+    raw = params.get(key, default)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return default
+    fv = float(raw)
+    return int(round(fv)) if math.isfinite(fv) else default
+
+
+def validate_funding_carry_params(
+    params: dict[str, Any] | None,
+    *,
+    allow_nan_fallback: bool = False,
+) -> None:
+    """Fail-closed validation blocking unknown/dead param keys and invalid value types (CC-20261123-001 A1)."""
+    if params is None:
+        return
+    if not isinstance(params, dict):
+        raise ValueError(f"funding_carry params must be a dict, got {type(params).__name__}")
+    unknown = sorted(str(k) for k in params.keys() if k not in KNOWN_FUNDING_CARRY_PARAM_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown/unconsumed funding_carry params keys: {unknown}. "
+            f"Allowed keys: {sorted(KNOWN_FUNDING_CARRY_PARAM_KEYS)}"
+        )
+    for k, v in params.items():
+        if k == "vol_target_leverage_enabled":
+            if not isinstance(v, bool):
+                raise ValueError(
+                    f"funding_carry param 'vol_target_leverage_enabled' must be bool, got {type(v).__name__} ({v!r})"
+                )
+        else:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"funding_carry param '{k}' must be numeric, got {type(v).__name__} ({v!r})"
+                )
+            if (not allow_nan_fallback) and (not math.isfinite(float(v))):
+                raise ValueError(
+                    f"funding_carry param '{k}' must be finite numeric, got {v!r}"
+                )
+
+
+def compute_rolling_funding_apr(
+    rates_by_ts: dict[int, float] | dict[Any, float],
+    ts_ms: int,
+    lookback_hours: int,
+) -> float | None:
+    """Strictly causal rolling funding APR over [hour_floor(ts_ms) - (lb - 1) * 1h, ts_ms] with int-key dedup."""
+    lb = max(1, int(lookback_hours))
+    hi_ts = int(ts_ms)
+    hour_floor = (hi_ts // HOUR_MS) * HOUR_MS
+    lo_ts = hour_floor - (lb - 1) * HOUR_MS
+    # Deduplicate mixed int/str keys by normalized integer timestamp (prefer native int key on collision)
+    deduped: dict[int, float] = {}
+    for bar_ts, rate in rates_by_ts.items():
+        if isinstance(bar_ts, bool):
+            continue
+        try:
+            t_int = int(bar_ts)
+            r_val = float(rate)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(r_val):
+            continue
+        if lo_ts <= t_int <= hi_ts:
+            if t_int not in deduped or isinstance(bar_ts, int):
+                deduped[t_int] = r_val
+    if not deduped:
+        return None
+    total = sum(deduped.values())
+    return (total / float(lb)) * 24.0 * 365.0 * 100.0
+
+
+def compute_causal_symbol_leverage(
+    cfg: StrategyConfig,
+    hourly_log_rets: dict[int, float] | dict[Any, float],
+    decision_ts_ms: int,
+) -> float:
+    """Compute strictly causal volatility-tiered leverage using closed 1h bars [t - lb, t - 1h]."""
+    params = cfg.params or {}
+    if not bool(params.get("vol_target_leverage_enabled", False)):
+        return float(cfg.leverage)
+    vol_lookback_h = max(24, min(336, _param_int(params, "vol_lookback_hours", 168)))
+    vol_target_ann_pct = max(40.0, min(300.0, _param_float(params, "vol_target_ann_pct", 120.0)))
+    min_sym_lev = max(1.0, min(float(cfg.leverage), _param_float(params, "min_symbol_leverage", 1.5)))
+    # Align decision_ts to hourly grid if sub-hour BBO tick arrives; strictly closed bars end <= hour_floor
+    hour_floor = (int(decision_ts_ms) // HOUR_MS) * HOUR_MS
+    rets: list[float] = []
+    for k in range(1, vol_lookback_h + 1):
+        target_ts = hour_floor - k * HOUR_MS
+        r_val = hourly_log_rets.get(target_ts)
+        if r_val is None:
+            r_val = hourly_log_rets.get(str(target_ts))
+        if r_val is not None and math.isfinite(r_val):
+            rets.append(float(r_val))
+    if len(rets) < 24:
+        return min_sym_lev  # Fail-safe conservative leverage when volatility history is thin
+    mean_r = sum(rets) / len(rets)
+    var_r = sum((x - mean_r) ** 2 for x in rets) / max(1, len(rets) - 1)
+    ann_vol_pct = math.sqrt(max(0.0, var_r)) * math.sqrt(8760.0) * 100.0
+    if ann_vol_pct <= 1e-6:
+        return min_sym_lev
+    target_lev = vol_target_ann_pct / ann_vol_pct
+    return max(min_sym_lev, min(float(cfg.leverage), target_lev))
+
+
+def compute_carry_slot_sizing(cfg: StrategyConfig, eff_lev: float) -> tuple[float, float, float]:
+    """Return (slot_capital, slot_margin_per_leg, pos_notional) identically for batch & stream."""
+    is_spot_perp = cfg.mode == "spot_perp"
+    eff_weight = min(float(cfg.per_position_weight), 1.0 / max(1, int(cfg.max_positions)))
+    slot_capital = float(cfg.capital_usd) * eff_weight
+    vol_tier_enabled = bool((cfg.params or {}).get("vol_target_leverage_enabled", False))
+    lev_used = float(eff_lev) if vol_tier_enabled else float(cfg.leverage)
+    if is_spot_perp:
+        slot_margin_per_leg = max(1e-6, slot_capital / (1.0 + lev_used))
+        pos_notional = slot_capital * (lev_used / (1.0 + lev_used))
+    else:
+        slot_margin_per_leg = max(1e-6, slot_capital * 0.5)
+        pos_notional = slot_margin_per_leg * lev_used
+    return slot_capital, slot_margin_per_leg, pos_notional
+
+
+def evaluate_carry_margin_guard(
+    cfg: StrategyConfig,
+    *,
+    direction: str,
+    notional_usd: float,
+    slot_margin_per_leg: float,
+    anc_a: float | None,
+    anc_b: float | None,
+    hi_a: float | None,
+    lo_a: float | None,
+    hi_b: float | None,
+    lo_b: float | None,
+) -> tuple[str | None, float]:
+    """Single-kernel isolated margin guard: liquidation (>=0.90) > protective exit > rebalance (>=0.65)."""
+    is_spot_perp = cfg.mode == "spot_perp"
+    is_short_a = direction in ("SHORT_A_LONG_B", "SHORT_A_LONG_SPOT")
+    adverse_leg_move = 0.0
+    if hi_a and lo_a and anc_a and anc_a > 0:
+        mv_a = ((hi_a / anc_a) - 1.0) if is_short_a else (1.0 - (lo_a / anc_a))
+        adverse_leg_move = max(adverse_leg_move, mv_a)
+    if (not is_spot_perp) and hi_b and lo_b and anc_b and anc_b > 0:
+        mv_b = (1.0 - (lo_b / anc_b)) if is_short_a else ((hi_b / anc_b) - 1.0)
+        adverse_leg_move = max(adverse_leg_move, mv_b)
+
+    leg_lev = float(notional_usd) / max(1e-6, float(slot_margin_per_leg))
+    margin_consumed = adverse_leg_move * leg_lev
+    raw_prot = _param_float(cfg.params, "protective_margin_exit_pct", 0.0)
+    protective_exit_pct = raw_prot if (0.0 < raw_prot < 0.90) else 0.0
+
+    if margin_consumed >= 0.90:
+        return "MARGIN_LIQUIDATION", margin_consumed
+    if protective_exit_pct > 0.0 and margin_consumed >= protective_exit_pct:
+        return "MARGIN_PROTECT_EXIT", margin_consumed
+    if margin_consumed >= 0.65:
+        return "FORCED_REBALANCE", margin_consumed
+    return None, margin_consumed
+
+
+def evaluate_carry_entry_signal(
+    cfg: StrategyConfig,
+    apr_a: float | None,
+    apr_b: float | None,
+    px_a: float | None,
+    px_b: float | None,
+) -> tuple[str, str, float] | None:
+    """Return (direction, action, spread_apr) or None if hurdle/basis guard rejects entry."""
+    is_spot_perp = cfg.mode == "spot_perp"
+    if apr_a is None or ((not is_spot_perp) and apr_b is None):
+        return None
+    eff_b = 0.0 if is_spot_perp else float(apr_b or 0.0)
+    spread_ab = float(apr_a) - eff_b
+
+    if cfg.use_atb_buggy_rules:
+        if float(apr_a) >= 10.95:
+            return "SHORT_A_LONG_SPOT", "OPEN_SHORT_A_LONG_B", float(apr_a)
+        return None
+
+    if is_spot_perp or not cfg.allow_bidirectional:
+        if spread_ab < float(cfg.entry_spread_apr_pct):
+            return None
+        direction = "SHORT_A_LONG_SPOT" if is_spot_perp else "SHORT_A_LONG_B"
+        action = "OPEN_SHORT_A_LONG_B"
+        spread_abs = spread_ab
+    else:
+        if abs(spread_ab) < float(cfg.entry_spread_apr_pct):
+            return None
+        if spread_ab > 0:
+            direction, action = "SHORT_A_LONG_B", "OPEN_SHORT_A_LONG_B"
+        else:
+            direction, action = "LONG_A_SHORT_B", "OPEN_LONG_A_SHORT_B"
+        spread_abs = abs(spread_ab)
+
+    if px_a and px_b and px_a > 0 and px_b > 0:
+        raw_basis_bps = ((px_a - px_b) / px_b) * 10000.0
+        adverse_entry = -raw_basis_bps if direction in ("SHORT_A_LONG_B", "SHORT_A_LONG_SPOT") else raw_basis_bps
+        if adverse_entry > float(cfg.max_basis_entry_bps):
+            return None
+    return direction, action, spread_abs
 
 
 def _basis_pnl_usd(
@@ -95,10 +318,16 @@ class FundingCarryBacktester:
         start_ms: int | None = None,
         end_ms: int | None = None,
         extra_slippage_bps_per_leg: float = 0.0,
+        warmup_start_ms: int | None = None,
     ) -> BacktestResult:
-        """Execute deterministic causal backtest over [start_ms, end_ms]."""
+        """Execute deterministic causal backtest over [start_ms, end_ms], with optional pre-window causal warmup."""
+        validate_funding_carry_params(cfg.params, allow_nan_fallback=True)
         symbols = list(cfg.symbols)
         is_spot_perp = cfg.mode == "spot_perp"
+
+        use_prewarm = warmup_start_ms is not None and start_ms is not None and int(warmup_start_ms) < int(start_ms)
+        load_start_ms = int(warmup_start_ms) if use_prewarm else start_ms
+        eval_start_ts = int(start_ms) if use_prewarm else None
 
         rates_a: dict[str, dict[int, float]] = {}
         rates_b: dict[str, dict[int, float]] = {}
@@ -109,12 +338,12 @@ class FundingCarryBacktester:
 
         all_ts_set: set[int] = set()
         for sym in symbols:
-            fa = self.store.load_funding(cfg.venue_a, sym, start_ms, end_ms)
+            fa = self.store.load_funding(cfg.venue_a, sym, load_start_ms, end_ms)
             rates_a[sym] = {b.ts_ms: b.funding_rate for b in fa}
             all_ts_set.update(rates_a[sym].keys())
 
             if not is_spot_perp:
-                fb = self.store.load_funding(cfg.venue_b, sym, start_ms, end_ms)
+                fb = self.store.load_funding(cfg.venue_b, sym, load_start_ms, end_ms)
                 rates_b[sym] = {b.ts_ms: b.funding_rate for b in fb}
                 all_ts_set.update(rates_b[sym].keys())
             else:
@@ -122,20 +351,20 @@ class FundingCarryBacktester:
 
             # P0-1 ZERO LOOKAHEAD: Exchanges stamp 1h bar [t, t+1h) with OPEN timestamp t.
             # At decision time t, ONLY c.open is observable (c.close is not known until t+1h!).
-            ca = self.store.load_candles(cfg.venue_a, sym, start_ms, end_ms)
+            ca = self.store.load_candles(cfg.venue_a, sym, load_start_ms, end_ms)
             prices_a[sym] = {c.ts_ms: c.open for c in ca}
             candles_a[sym] = {c.ts_ms: c for c in ca}
 
             venue_b_px = f"{cfg.venue_a}_spot" if is_spot_perp else cfg.venue_b
-            cb = self.store.load_candles(venue_b_px, sym, start_ms, end_ms)
+            cb = self.store.load_candles(venue_b_px, sym, load_start_ms, end_ms)
             prices_b[sym] = {c.ts_ms: c.open for c in cb}
             candles_b[sym] = {c.ts_ms: c for c in cb}
 
         # Include venue_b_px in fingerprint so spot_perp spot candles are tamper-evident (Red-Team #9)
         venues_for_fp = [cfg.venue_a, f"{cfg.venue_a}_spot"] if is_spot_perp else [cfg.venue_a, cfg.venue_b]
-        dataset_sha, prov, row_count = self.store.fingerprint_slice(venues_for_fp, symbols, start_ms, end_ms)
+        dataset_sha, prov, row_count = self.store.fingerprint_slice(venues_for_fp, symbols, load_start_ms, end_ms)
 
-        if not all_ts_set or row_count == 0:
+        if not all_ts_set or row_count == 0 or (eval_start_ts is not None and max(all_ts_set) < eval_start_ts):
             empty_metrics = BacktestMetrics(
                 window_start_ms=start_ms or 0,
                 window_end_ms=end_ms or 0,
@@ -225,38 +454,10 @@ class FundingCarryBacktester:
 
         # Perp-Perp: slot capital is split 50/50 across Venue A & B margin.
         # Effective per-leg leverage = notional_per_leg / (slot_capital * 0.5) = cfg.leverage.
-        eff_weight = min(cfg.per_position_weight, 1.0 / max(1, cfg.max_positions))
-        slot_capital = cfg.capital_usd * eff_weight
-        if is_spot_perp:
-            base_notional_per_leg = slot_capital * (cfg.leverage / (1.0 + cfg.leverage))
-            slot_margin_per_leg = max(1e-6, slot_capital / (1.0 + cfg.leverage))
-        else:
-            base_notional_per_leg = slot_capital * (cfg.leverage / 2.0)
-            slot_margin_per_leg = max(1e-6, slot_capital * 0.5)
-
-        def _p_float(key: str, default: float) -> float:
-            raw = cfg.params.get(key, default)
-            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-                return default
-            fv = float(raw)
-            return fv if math.isfinite(fv) else default
-
-        def _p_int(key: str, default: int) -> int:
-            raw = cfg.params.get(key, default)
-            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-                return default
-            fv = float(raw)
-            return int(round(fv)) if math.isfinite(fv) else default
-
-        # Phase 2 Module A: Optional causal volatility-tiered leverage & protective margin exit (cfg.params)
-        vol_tier_enabled = bool(cfg.params.get("vol_target_leverage_enabled", False))
-        vol_lookback_h = max(24, min(336, _p_int("vol_lookback_hours", 168)))
-        vol_target_ann_pct = max(40.0, min(300.0, _p_float("vol_target_ann_pct", 120.0)))
-        min_sym_lev = max(1.0, min(cfg.leverage, _p_float("min_symbol_leverage", 1.5)))
-        raw_prot_pct = _p_float("protective_margin_exit_pct", 0.0)
-        protective_exit_pct = raw_prot_pct if (0.0 < raw_prot_pct < 0.90) else 0.0
+        slot_capital, default_slot_margin_per_leg, _base_notional = compute_carry_slot_sizing(cfg, cfg.leverage)
+        vol_tier_enabled = bool((cfg.params or {}).get("vol_target_leverage_enabled", False))
         # Enforce physical storm-exit floor >= 5.0bp/leg so protective exits cannot assume calm maker fills
-        protective_exit_slip_bps = max(5.0, _p_float("protective_exit_slip_bps", 5.0))
+        protective_exit_slip_bps = max(5.0, _param_float(cfg.params, "protective_exit_slip_bps", 5.0))
 
         # Precompute strictly causal 1h log-returns per timestamp (prefer venue_a, fallback venue_b per bar; no full-window len check)
         hourly_log_rets: dict[str, dict[int, float]] = {}
@@ -270,27 +471,6 @@ class FundingCarryBacktester:
                     if bar.open > 0 and bar.close > 0:
                         rets_map[ts_bar] = math.log(bar.close / bar.open)
                 hourly_log_rets[sym] = rets_map
-
-        def causal_symbol_leverage(sym: str, decision_ts: int) -> float:
-            """Compute strictly causal leverage using ONLY closed 1h bars [decision_ts - lb, decision_ts - 1h]."""
-            if not vol_tier_enabled:
-                return cfg.leverage
-            rmap = hourly_log_rets.get(sym, {})
-            rets: list[float] = []
-            # Bar stamped at t closes at t + 1h, so strictly t <= decision_ts - HOUR_MS is closed at decision_ts
-            for k in range(1, vol_lookback_h + 1):
-                r_val = rmap.get(decision_ts - k * HOUR_MS)
-                if r_val is not None:
-                    rets.append(r_val)
-            if len(rets) < 24:
-                return min_sym_lev  # Fail-safe conservative leverage when volatility history is thin
-            mean_r = sum(rets) / len(rets)
-            var_r = sum((x - mean_r) ** 2 for x in rets) / max(1, len(rets) - 1)
-            ann_vol_pct = math.sqrt(max(0.0, var_r)) * math.sqrt(8760.0) * 100.0
-            if ann_vol_pct <= 1e-6:
-                return min_sym_lev
-            target_lev = vol_target_ann_pct / ann_vol_pct
-            return max(min_sym_lev, min(cfg.leverage, target_lev))
 
         eff_fee_a = cfg.fee_a_bps
         eff_fee_b = cfg.fee_b_bps
@@ -328,8 +508,13 @@ class FundingCarryBacktester:
         warnings: list[str] = []
 
         warmup_end = min_ts + cfg.lookback_hours * HOUR_MS
+        if eval_start_ts is not None:
+            warmup_end = max(warmup_end, eval_start_ts)
 
         for step_idx, ts in enumerate(timeline):
+            if eval_start_ts is not None and ts < eval_start_ts:
+                continue
+
             # 1) Accrue realized funding settlements strictly AFTER entry_ts_ms
             for sym, pos in open_pos.items():
                 if ts <= pos.entry_ts_ms:
@@ -356,57 +541,52 @@ class FundingCarryBacktester:
                     else:
                         pos.low_streak_settlements = 0
 
-            # 2) Check per-leg margin safety (P1-1 + Red-Team #3 + Phase 2 Protective Exit) & exits
+            # 2) Check per-leg margin safety (Single-Kernel evaluate_carry_margin_guard) & exits
             to_close: list[tuple[str, str]] = []
             prev_bar_ts = ts - HOUR_MS
             for sym, pos in open_pos.items():
                 hold_h = (ts - pos.entry_ts_ms) / HOUR_MS
                 cur_a = prices_a[sym].get(ts)
                 cur_b = prices_b[sym].get(ts)
+                pos_slot_margin = pos.slot_margin_per_leg if pos.slot_margin_per_leg > 0 else default_slot_margin_per_leg
 
                 if ts > pos.entry_ts_ms:
                     bar_a_prev = candles_a[sym].get(prev_bar_ts)
                     bar_b_prev = candles_b[sym].get(prev_bar_ts)
                     anc_a, anc_b = anchor_px.get(sym, (pos.entry_px_a, pos.entry_px_b))
-                    # Red-Team #3: When one venue lacks historical candles (e.g. Lighter),
-                    # conservatively proxy missing-leg directional move from the present venue's candle!
                     eff_bar_a = bar_a_prev or bar_b_prev
                     eff_anc_a = anc_a if (bar_a_prev and anc_a) else anc_b
                     eff_bar_b = bar_b_prev or bar_a_prev
                     eff_anc_b = anc_b if (bar_b_prev and anc_b) else anc_a
 
-                    adverse_leg_move = 0.0
-                    is_short_a = pos.direction in ("SHORT_A_LONG_B", "SHORT_A_LONG_SPOT")
-                    if eff_bar_a and eff_anc_a and eff_anc_a > 0:
-                        mv_a = ((eff_bar_a.high / eff_anc_a) - 1.0) if is_short_a else (1.0 - (eff_bar_a.low / eff_anc_a))
-                        adverse_leg_move = max(adverse_leg_move, mv_a)
-                    if (not is_spot_perp) and eff_bar_b and eff_anc_b and eff_anc_b > 0:
-                        mv_b = (1.0 - (eff_bar_b.low / eff_anc_b)) if is_short_a else ((eff_bar_b.high / eff_anc_b) - 1.0)
-                        adverse_leg_move = max(adverse_leg_move, mv_b)
-
-                    # leg_lev uses fixed slot_margin_per_leg so vol-tiered lower notional keeps unused margin as buffer
-                    leg_lev = pos.notional_usd / slot_margin_per_leg
-                    margin_consumed = adverse_leg_move * leg_lev
-                    # Precedence: 1) >=0.90 liquidation ALWAYS checked first (single-bar jump still liquidates)
-                    if margin_consumed >= 0.90:
+                    guard_event, _margin_used = evaluate_carry_margin_guard(
+                        cfg,
+                        direction=pos.direction,
+                        notional_usd=pos.notional_usd,
+                        slot_margin_per_leg=pos_slot_margin,
+                        anc_a=eff_anc_a,
+                        anc_b=eff_anc_b,
+                        hi_a=eff_bar_a.high if eff_bar_a else None,
+                        lo_a=eff_bar_a.low if eff_bar_a else None,
+                        hi_b=eff_bar_b.high if eff_bar_b else None,
+                        lo_b=eff_bar_b.low if eff_bar_b else None,
+                    )
+                    if guard_event == "MARGIN_LIQUIDATION":
                         liquidation_count += 1
                         extra_rebal_usd[sym] = extra_rebal_usd.get(sym, 0.0) + max(
-                            slot_margin_per_leg * 0.90, pos.notional_usd * 0.05
+                            pos_slot_margin * 0.90, pos.notional_usd * 0.05
                         )
                         to_close.append((sym, "MARGIN_LIQUIDATION"))
                         continue
-                    # 2) Protective margin exit in [protective_exit_pct, 0.90) takes precedence over 0.65 rebalance
-                    #    when configured <= 0.65; exits at ts open with TAKER_TAKER + >=5bp/leg storm slip + 24h cooldown
-                    elif protective_exit_pct > 0.0 and margin_consumed >= protective_exit_pct:
+                    elif guard_event == "MARGIN_PROTECT_EXIT":
                         extra_rebal_usd[sym] = extra_rebal_usd.get(sym, 0.0) + (
                             pos.notional_usd * (protective_exit_extra_bps / 10000.0)
                         )
                         to_close.append((sym, "MARGIN_PROTECT_EXIT"))
                         continue
-                    # 3) Legacy forced collateral rebalance at 0.65 (only reachable when protective_exit_pct == 0 or >0.65)
-                    elif margin_consumed >= 0.65:
+                    elif guard_event == "FORCED_REBALANCE":
                         forced_rebalance_count += 1
-                        extra_rebal_usd[sym] = extra_rebal_usd.get(sym, 0.0) + max(1.0, slot_margin_per_leg * 0.001)
+                        extra_rebal_usd[sym] = extra_rebal_usd.get(sym, 0.0) + max(1.0, pos_slot_margin * 0.001)
                         anchor_px[sym] = (cur_a or anc_a, cur_b or anc_b)
 
                 _, basis_bps = _basis_pnl_usd(
@@ -452,7 +632,7 @@ class FundingCarryBacktester:
                 closed_trades.append(tr)
                 realized_pnl_usd += tr.net_pnl_usd
 
-            # 3) Check entries if after warmup and slots available (respecting post-stop cooldown)
+            # 3) Check entries via shared evaluate_carry_entry_signal + compute_causal_symbol_leverage
             if ts >= warmup_end and len(open_pos) < cfg.max_positions:
                 candidates: list[tuple[float, str, str, float]] = []
                 for sym in symbols:
@@ -460,39 +640,21 @@ class FundingCarryBacktester:
                         continue
                     apr_a = fast_rolling_apr(sym, step_idx, is_b=False)
                     apr_b = 0.0 if is_spot_perp else fast_rolling_apr(sym, step_idx, is_b=True)
-                    if apr_a is None or apr_b is None:
-                        continue
+                    px_a = prices_a[sym].get(ts)
+                    px_b = prices_b[sym].get(ts)
+                    sig = evaluate_carry_entry_signal(cfg, apr_a, apr_b, px_a, px_b)
+                    if sig is not None:
+                        direction, _action, spread_abs = sig
+                        candidates.append((spread_abs, sym, direction, spread_abs))
 
-                    if cfg.use_atb_buggy_rules:
-                        if apr_a >= 10.95:
-                            candidates.append((apr_a, sym, "SHORT_A_LONG_SPOT", apr_a))
-                        continue
-
-                    spread_ab = apr_a - apr_b
-                    if is_spot_perp or not cfg.allow_bidirectional:
-                        if spread_ab >= cfg.entry_spread_apr_pct:
-                            candidates.append((spread_ab, sym, "SHORT_A_LONG_SPOT" if is_spot_perp else "SHORT_A_LONG_B", spread_ab))
-                    else:
-                        if abs(spread_ab) >= cfg.entry_spread_apr_pct:
-                            direction = "SHORT_A_LONG_B" if spread_ab > 0 else "LONG_A_SHORT_B"
-                            candidates.append((abs(spread_ab), sym, direction, abs(spread_ab)))
-
-                candidates.sort(key=lambda x: x[0], reverse=True)
-                for score, sym, direction, spread_apr in candidates:
+                candidates.sort(key=lambda x: (-x[0], x[1]))
+                for _score, sym, direction, spread_apr in candidates:
                     if len(open_pos) >= cfg.max_positions:
                         break
                     px_a = prices_a[sym].get(ts)
                     px_b = prices_b[sym].get(ts)
-                    if px_a and px_b and px_a > 0 and px_b > 0:
-                        raw_basis_bps = ((px_a - px_b) / px_b) * 10000.0
-                        adverse_entry = -raw_basis_bps if direction in ("SHORT_A_LONG_B", "SHORT_A_LONG_SPOT") else raw_basis_bps
-                        if adverse_entry > cfg.max_basis_entry_bps:
-                            continue
-                    eff_lev = causal_symbol_leverage(sym, ts)
-                    if is_spot_perp:
-                        pos_notional = slot_capital * (eff_lev / (1.0 + eff_lev)) if vol_tier_enabled else base_notional_per_leg
-                    else:
-                        pos_notional = (slot_margin_per_leg * eff_lev) if vol_tier_enabled else base_notional_per_leg
+                    eff_lev = compute_causal_symbol_leverage(cfg, hourly_log_rets.get(sym, {}), ts)
+                    _, pos_slot_margin, pos_notional = compute_carry_slot_sizing(cfg, eff_lev)
                     open_pos[sym] = _OpenPosition(
                         symbol=sym,
                         direction=direction,
@@ -501,6 +663,7 @@ class FundingCarryBacktester:
                         entry_spread_apr_pct=spread_apr,
                         entry_px_a=px_a,
                         entry_px_b=px_b,
+                        slot_margin_per_leg=pos_slot_margin,
                     )
                     anchor_px[sym] = (px_a, px_b)
                     extra_rebal_usd[sym] = 0.0
@@ -549,9 +712,10 @@ class FundingCarryBacktester:
         if liquidation_count > 0:
             warnings.append(f"MARGIN_LIQUIDATION_OCCURRED ({liquidation_count} events)")
 
+        report_start_ms = max(min_ts, eval_start_ts) if eval_start_ts is not None else min_ts
         metrics = self._compute_metrics(
             cfg=cfg,
-            start_ms=min_ts,
+            start_ms=report_start_ms,
             end_ms=max_ts,
             trades=closed_trades,
             equity_curve=equity_curve,

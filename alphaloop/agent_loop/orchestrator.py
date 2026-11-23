@@ -128,6 +128,7 @@ class AgentEvolutionOrchestrator:
         start_ms: int | None = None,
         end_ms: int | None = None,
         allow_synthetic_in_unit_test: bool = False,
+        max_promotion_status: str = "SHADOW_LIVE",
     ) -> dict[str, Any]:
         """Execute 1 complete plugin-agnostic closed-loop iteration."""
         now = utc_now_ms()
@@ -162,9 +163,22 @@ class AgentEvolutionOrchestrator:
         promoted = False
         promotion_stage = "HELD"
         staged_sha = None
+        cap_status = str(max_promotion_status or "SHADOW_LIVE").upper()
         if verdict.overall_pass and red_team.decision == "APPROVE_SHADOW":
             has_verified_micro_lift = self._has_verified_micro_run_lift(cand_cfg)
-            if verdict.dq_tier == "DATA_QUALIFIED_FULL" or has_verified_micro_lift:
+            if cap_status == "BACKTESTED":
+                bt_cfg = dataclasses.replace(cand_cfg, status="BACKTESTED")
+                staged_sha = self.config_store.register_version(
+                    bt_cfg,
+                    actor=f"alphaloop:{proposal.model_used}+rt:{red_team.model_used}",
+                    reason=(
+                        f"Capped at BACKTESTED by research worker policy ({verdict.passed_count}/{verdict.total_count} gates, "
+                        f"DQ={verdict.dq_tier}, RedTeam=APPROVE_SHADOW)"
+                    ),
+                )
+                promoted = False
+                promotion_stage = "BACKTESTED"
+            elif verdict.dq_tier == "DATA_QUALIFIED_FULL" or has_verified_micro_lift:
                 staged_cfg = dataclasses.replace(cand_cfg, status="SHADOW_LIVE")
                 staged_sha = self.config_store.register_version(
                     staged_cfg,
