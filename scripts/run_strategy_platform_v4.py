@@ -419,33 +419,102 @@ def _evaluate_strategy_full(
         benchmark_report=bench_rep,
     )
 
-    # Persist REA-001 append-only trial record
-    params_hash = sha256_obj(
-        {
-            "strategy_id": strategy_id,
-            "grid_params": [p for _, _, _, p, _ in grid_factories],
-            "risk_cfg": asdict(risk_cfg),
-        }
-    )[:16]
-    trial_id = router.record_trial(
-        family_id=family_id,
-        track_name=track_name,
-        strategy_name=strategy_id,
-        params_hash=params_hash,
-        metrics={
-            "cagr_pct": round(base_sim.cagr_pct, 4),
-            "sharpe_ratio": round(base_sim.sharpe_ratio, 4),
-            "max_drawdown_pct": round(base_sim.max_drawdown_pct, 4),
-            "dsr": round(dsr_rep.dsr, 4),
-            "pbo": round(pbo_rep.pbo, 4),
-            "passed_gates": gate_report.passed_gates,
-        },
-        verdict=gate_report.verdict,
-    )
+    # Persist REA-001 append-only trial records for EVERY evaluated grid point (DEF-03: 9 -> 18 -> 27)
+    primary_idx = 0
+    if baseline_grid_label is not None:
+        for idx_pt, pt in enumerate(plateau_points):
+            if pt.label == baseline_grid_label:
+                primary_idx = idx_pt
+                break
+    else:
+        for idx_pt, pt in enumerate(plateau_points):
+            if pt.ix == 1 and pt.iy == 1:
+                primary_idx = idx_pt
+                break
+
+    risk_cfg_dict = asdict(risk_cfg)
+    trial_id = ""
+    trials_recorded_in_run = 0
+    for idx_pt, pt in enumerate(plateau_points):
+        if idx_pt == primary_idx:
+            params_hash = sha256_obj(
+                {
+                    "strategy_id": strategy_id,
+                    "grid_label": pt.label,
+                    "grid_params": [p for _, _, _, p, _ in grid_factories],
+                    "risk_cfg": risk_cfg_dict,
+                }
+            )[:16]
+            trial_id = router.record_trial(
+                family_id=family_id,
+                track_name=track_name,
+                strategy_name=strategy_id,
+                params_hash=params_hash,
+                metrics={
+                    "grid_label": pt.label,
+                    "ix": int(pt.ix),
+                    "iy": int(pt.iy),
+                    "grid_trials_in_run": len(plateau_points),
+                    "cagr_pct": round(base_sim.cagr_pct, 4),
+                    "sharpe_ratio": round(base_sim.sharpe_ratio, 4),
+                    "max_drawdown_pct": round(base_sim.max_drawdown_pct, 4),
+                    "dsr": round(dsr_rep.dsr, 4),
+                    "pbo": round(pbo_rep.pbo, 4),
+                    "passed_gates": gate_report.passed_gates,
+                },
+                verdict=gate_report.verdict,
+            )
+            trials_recorded_in_run += 1
+        else:
+            cand_hash = sha256_obj(
+                {
+                    "strategy_id": strategy_id,
+                    "grid_label": pt.label,
+                    "params": pt.params,
+                    "risk_cfg": risk_cfg_dict,
+                }
+            )[:16]
+            router.record_trial(
+                family_id=family_id,
+                track_name=track_name,
+                strategy_name=f"{strategy_id}:{pt.label}",
+                params_hash=cand_hash,
+                metrics={
+                    "grid_label": pt.label,
+                    "ix": int(pt.ix),
+                    "iy": int(pt.iy),
+                    "cagr_pct": round(pt.apr_pct, 4),
+                    "sharpe_ratio": round(pt.sharpe, 4),
+                    "max_drawdown_pct": round(pt.max_dd_pct, 4),
+                    "net_pnl_usd": round(pt.net_pnl_usd, 2),
+                },
+                verdict="GRID_CANDIDATE",
+            )
+            trials_recorded_in_run += 1
+
+    if not trial_id:
+        params_hash = sha256_obj({"strategy_id": strategy_id, "risk_cfg": risk_cfg_dict})[:16]
+        trial_id = router.record_trial(
+            family_id=family_id,
+            track_name=track_name,
+            strategy_name=strategy_id,
+            params_hash=params_hash,
+            metrics={
+                "cagr_pct": round(base_sim.cagr_pct, 4),
+                "sharpe_ratio": round(base_sim.sharpe_ratio, 4),
+                "max_drawdown_pct": round(base_sim.max_drawdown_pct, 4),
+                "dsr": round(dsr_rep.dsr, 4),
+                "pbo": round(pbo_rep.pbo, 4),
+                "passed_gates": gate_report.passed_gates,
+            },
+            verdict=gate_report.verdict,
+        )
+        trials_recorded_in_run += 1
 
     detail = {
         "trial_id": trial_id,
         "family_id": family_id,
+        "trials_recorded_in_run": trials_recorded_in_run,
         "cumulative_family_trials": router.get_family_trial_count(family_id),
         "baseline": _summarize_sim(base_sim),
         "stress_plus_2bp": {

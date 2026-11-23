@@ -1804,7 +1804,12 @@ class DataFoundationRouter:
         finally:
             con.close()
 
-    def migrate_from_v3_sqlite(self, v3_sqlite_path: Path | str) -> dict[str, Any]:
+    def migrate_from_v3_sqlite(
+        self,
+        v3_sqlite_path: Path | str,
+        *,
+        allow_synthetic_in_test: bool = False,
+    ) -> dict[str, Any]:
         """Idempotently migrate bars and metadata from legacy v3 SQLite strictly read-only (`?mode=ro`).
 
         Never modifies `v3_sqlite_path` (opens with `?mode=ro` + `PRAGMA query_only=ON`).
@@ -1896,10 +1901,12 @@ class DataFoundationRouter:
                         migrated_bars["skipped"] += 1
 
                 if web3_batch:
-                    migrated_bars["web3"] = self.upsert_bars("web3", web3_batch, allow_synthetic_in_test=False)
+                    migrated_bars["web3"] = self.upsert_bars(
+                        "web3", web3_batch, allow_synthetic_in_test=allow_synthetic_in_test
+                    )
                 if gold_batch:
                     migrated_bars["gold_macro"] = self.upsert_bars(
-                        "gold_macro", gold_batch, allow_synthetic_in_test=False
+                        "gold_macro", gold_batch, allow_synthetic_in_test=allow_synthetic_in_test
                     )
 
             asset_count = 0

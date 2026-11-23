@@ -10,6 +10,7 @@ Zero third-party dependencies (pure Python 3.12 stdlib only) and 100% STD-34 com
 
 from __future__ import annotations
 
+import atexit
 from collections import deque
 from contextlib import contextmanager
 import dataclasses
@@ -19,8 +20,10 @@ import importlib
 import inspect
 import json
 import math
+import os
 from pathlib import Path
 import random
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -46,6 +49,28 @@ V4_LAKE_DIR = AUTO_REPO_ROOT / "data" / "platform_v4_lake"
 V3_LAKE_PATH = AUTO_REPO_ROOT / "data" / "platform_v3_lake.sqlite"
 V4_RUNNER_PATH = AUTO_REPO_ROOT / "scripts" / "run_strategy_platform_v4.py"
 REQUIREMENTS_RESEARCH_PATH = AUTO_REPO_ROOT / "requirements-research.txt"
+
+
+def resolve_v4_lake_dir() -> Path:
+    """Resolve Platform v4 data lake path, honoring PLATFORM_V4_LAKE_DIR when set."""
+    env_dir = os.environ.get("PLATFORM_V4_LAKE_DIR", "").strip()
+    return Path(env_dir) if env_dir else V4_LAKE_DIR
+
+
+def has_real_v4_lake(lake_dir: Path | None = None) -> bool:
+    """Return True iff all three Option B SQLite databases exist under the resolved lake dir."""
+    root = resolve_v4_lake_dir() if lake_dir is None else Path(lake_dir)
+    return (
+        (root / "catalog.sqlite").is_file()
+        and (root / "domains" / "web3_lake.sqlite").is_file()
+        and (root / "domains" / "gold_macro_lake.sqlite").is_file()
+    )
+
+
+def resolve_v3_lake_path() -> Path:
+    """Resolve legacy Platform v3 SQLite path, honoring PLATFORM_V3_LAKE_PATH when set."""
+    env_path = os.environ.get("PLATFORM_V3_LAKE_PATH", "").strip()
+    return Path(env_path) if env_path else V3_LAKE_PATH
 
 ACTIVE_WORKSPACE_REPOS: tuple[Path, ...] = (
     AUTO_REPO_ROOT,
@@ -2552,3 +2577,583 @@ SAMPLE_DEFILLAMA_STABLECOINS_JSON = json.dumps(
         {"date": str((BASE_TS_MS + DAY_MS) // 1000), "totalCirculatingUSD": {"peggedUSD": 166_200_000_000.0}},
     ]
 )
+
+
+# ---------------------------------------------------------------------------
+# Clean-Clone Deterministic Sandbox Builders (DEF-01; NEVER spoofs REAL_EXCHANGE_API)
+# ---------------------------------------------------------------------------
+
+_CLEAN_CLONE_V4_TEMPLATE_DIR: Path | None = None
+
+
+def _cleanup_clean_clone_template() -> None:
+    global _CLEAN_CLONE_V4_TEMPLATE_DIR
+    if _CLEAN_CLONE_V4_TEMPLATE_DIR is not None and _CLEAN_CLONE_V4_TEMPLATE_DIR.exists():
+        shutil.rmtree(_CLEAN_CLONE_V4_TEMPLATE_DIR, ignore_errors=True)
+        _CLEAN_CLONE_V4_TEMPLATE_DIR = None
+
+
+atexit.register(_cleanup_clean_clone_template)
+
+
+def _generate_weekday_dates_ms(count: int, end_ms: int) -> list[int]:
+    """Generate `count` ascending UTC midnight weekday timestamps ending at or before `end_ms`."""
+    cur_ms = int(end_ms)
+    out: list[int] = []
+    while len(out) < count:
+        dt = datetime.fromtimestamp(cur_ms / 1000.0, tz=timezone.utc)
+        if dt.weekday() < 5:
+            out.append(cur_ms)
+        cur_ms -= DAY_MS
+    out.reverse()
+    return out
+
+
+def _populate_clean_clone_v4_lake(dst_dir: Path) -> Path:
+    """Populate a deterministic, multi-year Option B sandbox lake marked SYNTHETIC_TEST_ONLY."""
+    prov_mod = importlib.import_module("alphaloop.core.provenance")
+    assets_mod = import_assets()
+    models_mod = import_df_models()
+    router_mod = import_df_router()
+
+    prov_syn = str(prov_mod.PROVENANCE_SYNTHETIC)
+    router = router_mod.DataFoundationRouter(dst_dir)
+    try:
+        # 1) Web3 domain: 4 liquid coins x 1,300 12h bars (649.5d >= 600d) with realistic cyclical trends & funding
+        w3_end_ms = utc_ms(2026, 11, 22, 12, 0)
+        w3_n = 1300
+        w3_start_ms = w3_end_ms - (w3_n - 1) * 12 * HOUR_MS
+        coin_cfg = {
+            "BTC": (42000.0, 0.00055, 0.19, 34.0, 0.0, 0.00085, 0.00055, 11),
+            "ETH": (2400.0, 0.00035, 0.24, 29.0, 1.1, 0.00075, 0.00060, 17),
+            "SOL": (95.0, 0.00080, 0.30, 23.0, 2.3, 0.00105, 0.00065, 23),
+            "AVAX": (32.0, 0.00020, 0.27, 27.0, 3.6, 0.00065, 0.00050, 31),
+        }
+        w3_bars: list[Any] = []
+        for sym, (p0, drift, amp, period, phase, fund_base, fund_amp, seed) in coin_cfg.items():
+            rng = random.Random(seed)
+            px = p0
+            for i in range(w3_n):
+                ts_ev = w3_start_ms + i * 12 * HOUR_MS
+                ts_av = ts_ev + 12 * HOUR_MS
+                wave = amp * (
+                    math.sin(2.0 * math.pi * (i + 1) / period + phase)
+                    - math.sin(2.0 * math.pi * i / period + phase)
+                )
+                slow = 0.08 * (
+                    math.cos(2.0 * math.pi * (i + 1) / 140.0 + phase * 0.5)
+                    - math.cos(2.0 * math.pi * i / 140.0 + phase * 0.5)
+                )
+                ret = drift + wave + slow + rng.gauss(0.0, 0.011)
+                o = px
+                c = max(0.5, o * math.exp(max(-0.18, min(0.18, ret))))
+                hi = max(o, c) * 1.008
+                lo = min(o, c) * 0.992
+                # Strong positive carry regime in middle & upper waves so W3 passes 3x RT fee floor & trades cleanly
+                carry = fund_base + fund_amp * math.sin(2.0 * math.pi * i / 90.0 + phase)
+                if abs(carry) < 1e-6:
+                    carry = 0.0001
+                w3_bars.append(
+                    models_mod.CanonicalBar(
+                        asset_class=assets_mod.ASSET_CLASS_CRYPTO_PERP,
+                        venue="hyperliquid",
+                        symbol=sym,
+                        timeframe_h=12.0,
+                        timeframe_sec=43_200,
+                        ts_event_ms=ts_ev,
+                        ts_avail_ms=ts_av,
+                        open=round(o, 4),
+                        high=round(hi, 4),
+                        low=round(lo, 4),
+                        close=round(c, 4),
+                        volume_usd=round(50_000_000.0 * (1.0 + 0.3 * math.sin(i / 15.0)), 2),
+                        carry_rate_period=round(carry, 8),
+                        carry_interval_h=12.0,
+                        spread_bps=2.0,
+                        provenance=prov_syn,
+                        source_fingerprint=f"clean_clone_sandbox:web3:{sym}",
+                    )
+                )
+                px = c
+        router.upsert_bars("web3", w3_bars, allow_synthetic_in_test=True)
+
+        # Web3 derivatives metrics (OI/LSR) & macro (BTC_DVOL, STABLECOIN_MCAP_USD)
+        w3_metrics: list[Any] = []
+        w3_macro: list[Any] = []
+        for d_idx in range(650):
+            ts_ev = w3_start_ms + d_idx * DAY_MS
+            ts_av = ts_ev + DAY_MS
+            w3_metrics.append(
+                models_mod.Web3DerivativesMetric(
+                    venue="binance_um",
+                    symbol="BTC",
+                    ts_event_ms=ts_ev,
+                    ts_avail_ms=ts_av,
+                    open_interest_usd=round(8_000_000_000.0 + 2_500_000_000.0 * math.sin(d_idx / 28.0), 2),
+                    top_trader_lsr=round(1.15 + 0.35 * math.cos(d_idx / 21.0), 4),
+                    account_lsr=round(1.25 + 0.30 * math.sin(d_idx / 19.0), 4),
+                    taker_ls_vol_ratio=round(1.02 + 0.18 * math.sin(d_idx / 11.0), 4),
+                    provenance=prov_syn,
+                    source_fingerprint="clean_clone_sandbox:binance_um:BTC",
+                )
+            )
+            w3_macro.append(
+                models_mod.Web3MarketMacroPoint(
+                    source="deribit",
+                    series_id="BTC_DVOL",
+                    ts_event_ms=ts_ev,
+                    ts_avail_ms=ts_av,
+                    value=round(52.0 + 14.0 * math.sin(d_idx / 35.0), 2),
+                    provenance=prov_syn,
+                    source_fingerprint="clean_clone_sandbox:deribit:BTC_DVOL",
+                )
+            )
+            w3_macro.append(
+                models_mod.Web3MarketMacroPoint(
+                    source="defillama",
+                    series_id="STABLECOIN_MCAP_USD",
+                    ts_event_ms=ts_ev,
+                    ts_avail_ms=ts_av,
+                    value=round(165_000_000_000.0 + d_idx * 85_000_000.0 + 4_000_000_000.0 * math.sin(d_idx / 40.0), 2),
+                    provenance=prov_syn,
+                    source_fingerprint="clean_clone_sandbox:defillama:STABLECOIN_MCAP_USD",
+                )
+            )
+        router.upsert_web3_metrics(w3_metrics, allow_synthetic_in_test=True)
+        router.upsert_web3_macro(w3_macro, allow_synthetic_in_test=True)
+
+        # 2) Gold/Macro domain: 1,350 weekday 1d bars for GC=F (>1,850 calendar days) + 600 tail days for macro basket
+        gold_1d_ts = _generate_weekday_dates_ms(1350, utc_ms(2026, 11, 20, 0, 0))
+        gold_tail_ts = gold_1d_ts[-600:]
+        gold_bars: list[Any] = []
+        gc_close_by_ts: dict[int, float] = {}
+
+        # Generate GC=F 1d with multi-regime oscillating trends (uncorrelated phase vs BTC)
+        rng_gc = random.Random(101)
+        px_gc = 1820.0
+        for idx, ts_ev in enumerate(gold_1d_ts):
+            wave = 0.16 * (
+                math.sin(2.0 * math.pi * (idx + 1) / 95.0 + 0.7)
+                - math.sin(2.0 * math.pi * idx / 95.0 + 0.7)
+            )
+            ret = 0.00032 + wave + rng_gc.gauss(0.0, 0.0075)
+            o = px_gc
+            c = max(1200.0, o * math.exp(max(-0.06, min(0.06, ret))))
+            gc_close_by_ts[ts_ev] = c
+            gold_bars.append(
+                models_mod.CanonicalBar(
+                    asset_class=assets_mod.ASSET_CLASS_GOLD_TRADFI,
+                    venue="yahoo",
+                    symbol="GC=F",
+                    timeframe_h=24.0,
+                    timeframe_sec=86_400,
+                    ts_event_ms=ts_ev,
+                    ts_avail_ms=ts_ev + 22 * HOUR_MS,
+                    open=round(o, 2),
+                    high=round(max(o, c) * 1.006, 2),
+                    low=round(min(o, c) * 0.994, 2),
+                    close=round(c, 2),
+                    volume_usd=180_000_000.0,
+                    carry_rate_period=0.0,
+                    carry_interval_h=24.0,
+                    spread_bps=1.5,
+                    provenance=prov_syn,
+                    source_fingerprint="clean_clone_sandbox:yahoo:GC=F:1d",
+                    contract_multiplier=100.0,
+                )
+            )
+            px_gc = c
+
+        # Complementary 1d macro series aligned on last 600 weekdays
+        macro_specs_cfg = (
+            ("GLD", assets_mod.ASSET_CLASS_GOLD_TRADFI, 1.0, 0.095, 1.0, 102),
+            ("SI=F", assets_mod.ASSET_CLASS_MACRO_INDEX, 5000.0, 0.0115, 1.15, 103),
+            ("DX-Y.NYB", assets_mod.ASSET_CLASS_MACRO_INDEX, 1.0, 103.5, -0.45, 104),
+            ("IEF", assets_mod.ASSET_CLASS_MACRO_INDEX, 1.0, 96.0, 0.35, 105),
+            ("TIP", assets_mod.ASSET_CLASS_MACRO_INDEX, 1.0, 108.0, 0.40, 106),
+            ("GDX", assets_mod.ASSET_CLASS_MACRO_INDEX, 1.0, 36.0, 1.30, 107),
+            ("^GVZ", assets_mod.ASSET_CLASS_MACRO_INDEX, 1.0, 16.5, -0.20, 108),
+            ("^VIX", assets_mod.ASSET_CLASS_MACRO_INDEX, 1.0, 18.0, -0.25, 109),
+        )
+        gc_tail_base = gc_close_by_ts[gold_tail_ts[0]]
+        for sym, ac, mult, scale_or_base, beta, seed in macro_specs_cfg:
+            rng_m = random.Random(seed)
+            prev_c = gc_tail_base * scale_or_base if sym in ("GLD", "SI=F") else scale_or_base
+            for idx, ts_ev in enumerate(gold_tail_ts):
+                gc_rel = gc_close_by_ts[ts_ev] / gc_tail_base
+                if sym == "GLD":
+                    target = gc_close_by_ts[ts_ev] * scale_or_base * (1.0 + 0.002 * math.sin(idx / 12.0))
+                elif sym == "SI=F":
+                    target = gc_close_by_ts[ts_ev] * scale_or_base * (1.0 + 0.05 * math.sin(idx / 30.0))
+                else:
+                    target = scale_or_base * (gc_rel ** beta) * (1.0 + 0.06 * math.sin(idx / 24.0 + seed))
+                o = prev_c
+                c = max(2.0, target * math.exp(rng_m.gauss(0.0, 0.004)))
+                gold_bars.append(
+                    models_mod.CanonicalBar(
+                        asset_class=ac,
+                        venue="yahoo",
+                        symbol=sym,
+                        timeframe_h=24.0,
+                        timeframe_sec=86_400,
+                        ts_event_ms=ts_ev,
+                        ts_avail_ms=ts_ev + 22 * HOUR_MS,
+                        open=round(o, 2),
+                        high=round(max(o, c) * 1.005, 2),
+                        low=round(min(o, c) * 0.995, 2),
+                        close=round(c, 2),
+                        volume_usd=80_000_000.0,
+                        carry_rate_period=0.0,
+                        carry_interval_h=24.0,
+                        spread_bps=1.5,
+                        provenance=prov_syn,
+                        source_fingerprint=f"clean_clone_sandbox:yahoo:{sym}:1d",
+                        contract_multiplier=mult,
+                    )
+                )
+                prev_c = c
+
+        # GC=F 4h bars: 640 weekdays x 5 bars/day = 3,200 bars (>880 calendar days >= 700d) ending 2026-12-11
+        gc_4h_days = _generate_weekday_dates_ms(640, utc_ms(2026, 12, 11, 0, 0))
+        rng_4h = random.Random(202)
+        px_4h = 2350.0
+        bar_idx = 0
+        for day_ms in gc_4h_days:
+            for slot_h in (0, 4, 8, 12, 16):
+                ts_ev = day_ms + slot_h * HOUR_MS
+                ts_av = ts_ev + 4 * HOUR_MS
+                wave = 0.055 * (
+                    math.sin(2.0 * math.pi * (bar_idx + 1) / 55.0)
+                    - math.sin(2.0 * math.pi * bar_idx / 55.0)
+                )
+                ret = 0.00012 + wave + rng_4h.gauss(0.0, 0.0038)
+                o = px_4h
+                c = max(1600.0, o * math.exp(max(-0.035, min(0.035, ret))))
+                gold_bars.append(
+                    models_mod.CanonicalBar(
+                        asset_class=assets_mod.ASSET_CLASS_GOLD_TRADFI,
+                        venue="yahoo",
+                        symbol="GC=F",
+                        timeframe_h=4.0,
+                        timeframe_sec=14_400,
+                        ts_event_ms=ts_ev,
+                        ts_avail_ms=ts_av,
+                        open=round(o, 2),
+                        high=round(max(o, c) * 1.0035, 2),
+                        low=round(min(o, c) * 0.9965, 2),
+                        close=round(c, 2),
+                        volume_usd=35_000_000.0,
+                        carry_rate_period=0.0,
+                        carry_interval_h=4.0,
+                        spread_bps=1.5,
+                        provenance=prov_syn,
+                        source_fingerprint="clean_clone_sandbox:yahoo:GC=F:4h",
+                        contract_multiplier=100.0,
+                    )
+                )
+                px_4h = c
+                bar_idx += 1
+
+        # PAXG 12h perp (hyperliquid) + spot (binance_spot): 1,150 bars (574.5d >= 550d) in gold_macro domain
+        paxg_n = 1150
+        paxg_end_ms = utc_ms(2026, 11, 22, 12, 0)
+        paxg_start_ms = paxg_end_ms - (paxg_n - 1) * 12 * HOUR_MS
+        rng_px = random.Random(303)
+        px_spot = 2380.0
+        basis_rows: list[Any] = []
+        for i in range(paxg_n):
+            ts_ev = paxg_start_ms + i * 12 * HOUR_MS
+            ts_av = ts_ev + 12 * HOUR_MS
+            wave = 0.14 * (
+                math.sin(2.0 * math.pi * (i + 1) / 80.0 + 0.4)
+                - math.sin(2.0 * math.pi * i / 80.0 + 0.4)
+            )
+            ret = 0.00025 + wave + rng_px.gauss(0.0, 0.0055)
+            o_s = px_spot
+            c_s = max(1600.0, o_s * math.exp(max(-0.05, min(0.05, ret))))
+            basis_bps = 18.0 * math.sin(2.0 * math.pi * i / 28.0)
+            o_p = o_s * (1.0 + basis_bps / 10_000.0)
+            c_p = c_s * (1.0 + basis_bps / 10_000.0)
+            gold_bars.append(
+                models_mod.CanonicalBar(
+                    asset_class=assets_mod.ASSET_CLASS_GOLD_PERP,
+                    venue="hyperliquid",
+                    symbol="PAXG",
+                    timeframe_h=12.0,
+                    timeframe_sec=43_200,
+                    ts_event_ms=ts_ev,
+                    ts_avail_ms=ts_av,
+                    open=round(o_p, 2),
+                    high=round(max(o_p, c_p) * 1.004, 2),
+                    low=round(min(o_p, c_p) * 0.996, 2),
+                    close=round(c_p, 2),
+                    volume_usd=14_000_000.0,
+                    carry_rate_period=round(0.00012 + 0.00008 * math.sin(i / 25.0), 8),
+                    carry_interval_h=12.0,
+                    spread_bps=3.0,
+                    provenance=prov_syn,
+                    source_fingerprint="clean_clone_sandbox:hyperliquid:PAXG:12h",
+                    premium_basis_bps=round(basis_bps, 2),
+                )
+            )
+            gold_bars.append(
+                models_mod.CanonicalBar(
+                    asset_class=assets_mod.ASSET_CLASS_CRYPTO_SPOT,
+                    venue="binance_spot",
+                    symbol="PAXG",
+                    timeframe_h=12.0,
+                    timeframe_sec=43_200,
+                    ts_event_ms=ts_ev,
+                    ts_avail_ms=ts_av,
+                    open=round(o_s, 2),
+                    high=round(max(o_s, c_s) * 1.003, 2),
+                    low=round(min(o_s, c_s) * 0.997, 2),
+                    close=round(c_s, 2),
+                    volume_usd=18_000_000.0,
+                    carry_rate_period=0.0,
+                    carry_interval_h=12.0,
+                    spread_bps=2.5,
+                    provenance=prov_syn,
+                    source_fingerprint="clean_clone_sandbox:binance_spot:PAXG:12h",
+                )
+            )
+            if i >= paxg_n - 120:
+                dt = datetime.fromtimestamp(ts_ev / 1000.0, tz=timezone.utc)
+                basis_rows.append(
+                    models_mod.PAXGBasisPoint(
+                        venue_perp="hyperliquid",
+                        venue_spot="binance_spot",
+                        ref_tradfi_symbol="GC=F",
+                        timeframe_sec=43_200,
+                        ts_event_ms=ts_ev,
+                        ts_avail_ms=ts_av,
+                        paxg_perp_close=round(c_p, 2),
+                        paxg_spot_close=round(c_s, 2),
+                        gc_ref_close=round(c_s, 2),
+                        paxg_perp_spot_bps=round(basis_bps, 2),
+                        paxg_spot_gc_bps=0.0,
+                        paxg_perp_gc_bps=round(basis_bps, 2),
+                        is_weekend_frozen=(dt.weekday() >= 5),
+                        provenance=prov_syn,
+                        source_fingerprint="clean_clone_sandbox:paxg_basis",
+                    )
+                )
+            px_spot = c_s
+
+        router.upsert_bars("gold_macro", gold_bars, allow_synthetic_in_test=True)
+        router.upsert_paxg_basis(basis_rows, allow_synthetic_in_test=True)
+
+        # US Treasury TIPS real yield curve (600 weekdays)
+        yield_rows: list[Any] = []
+        for idx, ts_ev in enumerate(gold_tail_ts):
+            r10 = 1.85 - 0.35 * math.sin(2.0 * math.pi * idx / 95.0 + 0.7)
+            yield_rows.append(
+                models_mod.MacroYieldPoint(
+                    source="us_treasury_tips",
+                    ts_event_ms=ts_ev,
+                    ts_avail_ms=ts_ev + 22 * HOUR_MS,
+                    real_5y=round(r10 - 0.15, 3),
+                    real_7y=round(r10 - 0.07, 3),
+                    real_10y=round(r10, 3),
+                    real_20y=round(r10 + 0.14, 3),
+                    real_30y=round(r10 + 0.22, 3),
+                    provenance=prov_syn,
+                    source_fingerprint="clean_clone_sandbox:us_treasury_tips",
+                )
+            )
+        router.upsert_yield_curve(yield_rows, allow_synthetic_in_test=True)
+
+        # Scheduled 2025-2026 FOMC / NFP / CPI macro events (including exact Dec 2026 event week)
+        event_rows: list[Any] = []
+        for yr in (2025, 2026):
+            for mo in range(1, 13):
+                if yr == 2026 and mo == 12:
+                    continue
+                nfp_ts = utc_ms(yr, mo, 5, 13, 30)
+                cpi_ts = utc_ms(yr, mo, 12, 13, 30)
+                event_rows.append(
+                    models_mod.MacroEventRelease(
+                        event_type="NFP",
+                        event_id=f"NFP-{yr}-{mo:02d}-05",
+                        ref_period=f"{yr}-{mo:02d}",
+                        ts_release_ms=nfp_ts,
+                        ts_avail_ms=nfp_ts,
+                        is_sep_meeting=False,
+                        actual=175.0,
+                        prior=165.0,
+                        surprise_z=0.35,
+                        source="bls_sandbox",
+                        provenance=prov_syn,
+                    )
+                )
+                event_rows.append(
+                    models_mod.MacroEventRelease(
+                        event_type="CPI",
+                        event_id=f"CPI-{yr}-{mo:02d}-12",
+                        ref_period=f"{yr}-{mo:02d}",
+                        ts_release_ms=cpi_ts,
+                        ts_avail_ms=cpi_ts,
+                        is_sep_meeting=False,
+                        actual=2.7,
+                        prior=2.6,
+                        surprise_z=0.20,
+                        source="bls_sandbox",
+                        provenance=prov_syn,
+                    )
+                )
+                if mo in (1, 3, 5, 6, 7, 9, 11):
+                    fomc_ts = utc_ms(yr, mo, 18, 18, 0)
+                    event_rows.append(
+                        models_mod.MacroEventRelease(
+                            event_type="FOMC",
+                            event_id=f"FOMC-{yr}-{mo:02d}-18",
+                            ref_period=f"{yr}-{mo:02d}",
+                            ts_release_ms=fomc_ts,
+                            ts_avail_ms=fomc_ts,
+                            is_sep_meeting=(mo in (3, 6, 9)),
+                            actual=None,
+                            prior=None,
+                            surprise_z=None,
+                            source="fed_sandbox",
+                            provenance=prov_syn,
+                        )
+                    )
+        # Exact Dec 2026 event week trio
+        event_rows.extend(
+            [
+                models_mod.MacroEventRelease(
+                    event_type="NFP",
+                    event_id="NFP-2026-12-04",
+                    ref_period="2026-11",
+                    ts_release_ms=DEC_2026_NFP_MS,
+                    ts_avail_ms=DEC_2026_NFP_MS,
+                    is_sep_meeting=False,
+                    source="bls_sandbox",
+                    provenance=prov_syn,
+                ),
+                models_mod.MacroEventRelease(
+                    event_type="FOMC",
+                    event_id="FOMC-2026-12-09",
+                    ref_period="2026-12",
+                    ts_release_ms=DEC_2026_FOMC_MS,
+                    ts_avail_ms=DEC_2026_FOMC_MS,
+                    is_sep_meeting=True,
+                    source="fed_sandbox",
+                    provenance=prov_syn,
+                ),
+                models_mod.MacroEventRelease(
+                    event_type="CPI",
+                    event_id="CPI-2026-12-10",
+                    ref_period="2026-11",
+                    ts_release_ms=DEC_2026_CPI_MS,
+                    ts_avail_ms=DEC_2026_CPI_MS,
+                    is_sep_meeting=False,
+                    source="bls_sandbox",
+                    provenance=prov_syn,
+                ),
+            ]
+        )
+        router.upsert_macro_events(event_rows, allow_synthetic_in_test=True)
+
+        # Export immutable jsonl.gz partitions & SHA-256 dataset_manifests
+        router.export_domain_partition("web3", fmt="jsonl.gz")
+        router.export_domain_partition("gold_macro", fmt="jsonl.gz")
+    finally:
+        close_router(router)
+    return dst_dir
+
+
+def build_clean_clone_v4_sandbox_lake(dst_dir: Path) -> Path:
+    """Return an isolated sandbox copy of the deterministic clean-clone v4 lake (SYNTHETIC_TEST_ONLY)."""
+    global _CLEAN_CLONE_V4_TEMPLATE_DIR
+    if _CLEAN_CLONE_V4_TEMPLATE_DIR is None or not (_CLEAN_CLONE_V4_TEMPLATE_DIR / "catalog.sqlite").is_file():
+        tpl = Path(tempfile.mkdtemp(prefix="e2e_v4_clean_clone_tpl_"))
+        _populate_clean_clone_v4_lake(tpl)
+        _CLEAN_CLONE_V4_TEMPLATE_DIR = tpl
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    (dst_dir / "domains").mkdir(parents=True, exist_ok=True)
+    for rel in ("catalog.sqlite", "domains/web3_lake.sqlite", "domains/gold_macro_lake.sqlite"):
+        copy_sqlite_readonly_snapshot(_CLEAN_CLONE_V4_TEMPLATE_DIR / rel, dst_dir / rel)
+    src_pq = _CLEAN_CLONE_V4_TEMPLATE_DIR / "parquet"
+    dst_pq = dst_dir / "parquet"
+    if src_pq.is_dir():
+        if dst_pq.exists():
+            shutil.rmtree(dst_pq)
+        shutil.copytree(src_pq, dst_pq)
+    return dst_dir
+
+
+def build_clean_clone_v3_sandbox_lake(v3_path: Path) -> Path:
+    """Construct a genuine legacy v3 SQLite WAL lake (SYNTHETIC_TEST_ONLY) for clean-clone migration tests."""
+    prov_mod = importlib.import_module("alphaloop.core.provenance")
+    assets_mod = import_assets()
+    v3_mod = importlib.import_module("alphaloop.platform.data_lake")
+
+    prov_syn = str(prov_mod.PROVENANCE_SYNTHETIC)
+    lake = v3_mod.MultiAssetDataLake(v3_path)
+    try:
+        btc_spec = assets_mod.default_web3_specs(("BTC",))["BTC"]
+        gc_spec = assets_mod.default_gold_specs()["GC=F"]
+        lake.register_asset(btc_spec)
+        lake.register_asset(gc_spec)
+
+        btc_start = utc_ms(2026, 9, 1, 0, 0)
+        btc_bars = []
+        px = 62000.0
+        for i in range(1050):
+            ts_ev = btc_start + i * HOUR_MS
+            c = px * (1.0 + 0.0008 * math.sin(i / 18.0))
+            btc_bars.append(
+                v3_mod.CanonicalBar(
+                    asset_class=assets_mod.ASSET_CLASS_CRYPTO_PERP,
+                    venue="hyperliquid",
+                    symbol="BTC",
+                    timeframe_h=1.0,
+                    ts_event_ms=ts_ev,
+                    ts_avail_ms=ts_ev + HOUR_MS,
+                    open=round(px, 2),
+                    high=round(max(px, c) * 1.003, 2),
+                    low=round(min(px, c) * 0.997, 2),
+                    close=round(c, 2),
+                    volume_usd=25_000_000.0,
+                    carry_rate_period=0.000012,
+                    carry_interval_h=1.0,
+                    spread_bps=2.0,
+                    provenance=prov_syn,
+                )
+            )
+            px = c
+
+        gc_days = _generate_weekday_dates_ms(550, utc_ms(2026, 11, 20, 0, 0))
+        gc_bars = []
+        gpx = 2150.0
+        for i, ts_ev in enumerate(gc_days):
+            c = gpx * (1.0 + 0.002 * math.sin(i / 25.0))
+            gc_bars.append(
+                v3_mod.CanonicalBar(
+                    asset_class=assets_mod.ASSET_CLASS_GOLD_TRADFI,
+                    venue="yahoo",
+                    symbol="GC=F",
+                    timeframe_h=24.0,
+                    ts_event_ms=ts_ev,
+                    ts_avail_ms=ts_ev + 22 * HOUR_MS,
+                    open=round(gpx, 2),
+                    high=round(max(gpx, c) * 1.005, 2),
+                    low=round(min(gpx, c) * 0.995, 2),
+                    close=round(c, 2),
+                    volume_usd=120_000_000.0,
+                    carry_rate_period=0.0,
+                    carry_interval_h=24.0,
+                    spread_bps=1.5,
+                    provenance=prov_syn,
+                )
+            )
+            gpx = c
+
+        lake.upsert_bars(btc_bars, allow_synthetic_in_test=True)
+        lake.upsert_bars(gc_bars, allow_synthetic_in_test=True)
+    finally:
+        lake.close()
+    return v3_path
+

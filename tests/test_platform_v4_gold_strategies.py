@@ -6,6 +6,7 @@ import ast
 import bisect
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -894,21 +895,23 @@ class TestAShareContractF20AndDomainIsolation(unittest.TestCase):
 
 
 class TestRealGoldMacroLakeSmoke(unittest.TestCase):
-    """Real multi-year data smoke verification against data/platform_v4_lake/."""
+    """Real multi-year data smoke verification against data/platform_v4_lake/ (or PLATFORM_V4_LAKE_DIR)."""
 
     def test_real_lake_g1_g2_abc_and_g3_paxg_accounting_and_g7_parity(self) -> None:
-        self.assertTrue(
-            (REAL_V4_LAKE_DIR / "domains" / "gold_macro_lake.sqlite").is_file(),
-            f"Real v4 gold_macro_lake.sqlite missing at {REAL_V4_LAKE_DIR}",
-        )
+        env_dir = os.environ.get("PLATFORM_V4_LAKE_DIR", "").strip()
+        lake_dir = Path(env_dir) if env_dir else REAL_V4_LAKE_DIR
+        cat_db = lake_dir / "catalog.sqlite"
+        gold_db = lake_dir / "domains" / "gold_macro_lake.sqlite"
+        if not (cat_db.is_file() and gold_db.is_file()):
+            self.skipTest(
+                f"Real v4 gold_macro_lake.sqlite not present at {lake_dir}; "
+                "set PLATFORM_V4_LAKE_DIR or run scripts/run_strategy_platform_v4.py --refresh"
+            )
         with tempfile.TemporaryDirectory(prefix="gold_real_smoke_") as tmpdir:
             copy_dir = Path(tmpdir) / "lake"
             (copy_dir / "domains").mkdir(parents=True)
-            shutil.copy2(REAL_V4_LAKE_DIR / "catalog.sqlite", copy_dir / "catalog.sqlite")
-            shutil.copy2(
-                REAL_V4_LAKE_DIR / "domains" / "gold_macro_lake.sqlite",
-                copy_dir / "domains" / "gold_macro_lake.sqlite",
-            )
+            shutil.copy2(cat_db, copy_dir / "catalog.sqlite")
+            shutil.copy2(gold_db, copy_dir / "domains" / "gold_macro_lake.sqlite")
             router = DataFoundationRouter(copy_dir)
             self.addCleanup(router.close)
 

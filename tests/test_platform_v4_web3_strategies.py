@@ -16,10 +16,13 @@ import bisect
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import random
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from typing import Any, Sequence
 
@@ -739,101 +742,114 @@ class TestWeb3DomainIsolationAndPureStdlib(unittest.TestCase):
 
 
 class TestRealLakeWeb3SmokeAndParity(unittest.TestCase):
-    """Real multi-year data smoke + G7 parity against `/home/antigravity/kenansun/auto/data/platform_v4_lake/`."""
+    """Real multi-year data smoke + G7 parity against data/platform_v4_lake/ (or PLATFORM_V4_LAKE_DIR)."""
 
     def test_real_lake_multi_year_smoke_regime_w1_w2_w3_and_g7_parity(self) -> None:
-        self.assertTrue(REAL_V4_LAKE_DIR.is_dir(), f"Missing real platform_v4_lake at {REAL_V4_LAKE_DIR}")
-        router = DataFoundationRouter(REAL_V4_LAKE_DIR)
-        self.addCleanup(router.close)
-
-        bars_12h = {s: router.load_bars("web3", "hyperliquid", s, 43200) for s in WEB3_LIQUID_UNIVERSE}
-        dvol = router.load_web3_macro("BTC_DVOL")
-        stable = router.load_web3_macro("STABLECOIN_MCAP_USD")
-        metrics = {s: router.load_web3_metrics("binance_um", s) for s in ("BTC", "ETH", "SOL")}
-
-        self.assertGreater(len(bars_12h["BTC"]), 1000)
-        self.assertGreater(len(dvol), 500)
-        self.assertGreater(len(stable), 500)
-        self.assertGreater(len(metrics["BTC"]), 500)
-
-        reg_eng = Web3MarketRegimeEngine(
-            bars_by_symbol=bars_12h,
-            dvol_series=dvol,
-            stablecoin_series=stable,
-            metrics_by_symbol=metrics,
-        )
-        # Verify real-data regime transitions span multiple regimes with finite scalars
-        seen_regimes: set[str] = set()
-        for b in bars_12h["BTC"][60::20]:
-            snap = reg_eng.snapshot_as_of(b.ts_avail_ms)
-            seen_regimes.add(snap.regime_label)
-            self.assertTrue(math.isfinite(snap.exposure_scalar))
-        self.assertGreaterEqual(len(seen_regimes), 3)
-
-        dvol_av = [p.ts_avail_ms for p in dvol]
-        dvol_v = [p.value for p in dvol]
-
-        def _ctx_clean(ts_ms: int) -> dict[str, Any]:
-            snap = reg_eng.snapshot_as_of(ts_ms)
-            idx = bisect.bisect_right(dvol_av, ts_ms) - 1
-            dv = dvol_v[idx] if idx >= 0 else 50.0
-            return {
-                "regime_label": snap.regime_label,
-                "exposure_scalar": snap.exposure_scalar,
-                "breadth_pct_above_20d": snap.breadth_pct_above_20d,
-                "dvol": dv,
-                "rt_cost_bps": 14.0,
-                "margin_ratio": 0.90,
-            }
-
-        def _ctx_vix_shock(ts_ms: int) -> dict[str, Any]:
-            c = _ctx_clean(ts_ms)
-            c.update({"yahoo_vix": 95.0, "vix": 95.0, "macro_vix_stress_z": 12.0, "macro_gold_composite": -5.0})
-            return c
-
-        # Slice 400 real 12h bars from active 2024 bull/funding window (bars 500:900) for fast full-parity + smoke
-        majors = ("BTC", "ETH", "SOL", "AVAX")
-        bars_mid = {s: bars_12h[s][500:900] for s in majors}
-        specs_m = default_web3_specs(majors)
-        cfg_m = RiskAllocatorConfig(max_positions=4, target_annual_vol_pct=20.0, max_portfolio_leverage=1.5, max_single_weight=0.50)
-        acct = PortfolioAccountingEngine()
-
-        for strat in (
-            Web3XSMomCarryKernel(top_k=2, bottom_k=2, metrics_by_symbol=metrics),
-            Web3AdaptiveTrendKernel(metrics_by_symbol=metrics),
-            Web3RegimeCarryKernel(dvol_series=dvol),
-        ):
-            res_clean = acct.simulate(strat.clone_fresh(), specs_m, bars_mid, risk_cfg=cfg_m, context_provider=_ctx_clean)
-            res_vix = acct.simulate(strat.clone_fresh(), specs_m, bars_mid, risk_cfg=cfg_m, context_provider=_ctx_vix_shock)
-
-            self.assertEqual(res_clean.equity_curve, res_vix.equity_curve, f"D7 VIX drift on {strat.strategy_id}")
-            self.assertGreater(res_clean.trade_count, 0, f"Zero trades on real mid window for {strat.strategy_id}")
-            self.assertEqual(res_clean.liquidation_count, 0)
-            for metric_val in (res_clean.cagr_pct, res_clean.sharpe_ratio, res_clean.max_drawdown_pct, res_clean.net_pnl_usd):
-                self.assertTrue(math.isfinite(metric_val))
-
-            rep = verify_full_parity(
-                strat.clone_fresh(), specs_m, bars_mid, risk_cfg=cfg_m, batch_result=res_clean, context_provider=_ctx_clean
+        env_dir = os.environ.get("PLATFORM_V4_LAKE_DIR", "").strip()
+        lake_dir = Path(env_dir) if env_dir else REAL_V4_LAKE_DIR
+        cat_db = lake_dir / "catalog.sqlite"
+        web3_db = lake_dir / "domains" / "web3_lake.sqlite"
+        if not (cat_db.is_file() and web3_db.is_file()):
+            self.skipTest(
+                f"Real v4 web3_lake.sqlite not present at {lake_dir}; "
+                "set PLATFORM_V4_LAKE_DIR or run scripts/run_strategy_platform_v4.py --refresh"
             )
-            self.assertTrue(rep.passed, f"G7 parity failed for {strat.strategy_id}: {rep.detail}")
-            self.assertLessEqual(rep.max_abs_weight_delta, 1e-10)
-            self.assertLessEqual(rep.max_abs_equity_delta, 1e-8)
+        with tempfile.TemporaryDirectory(prefix="web3_real_smoke_") as tmpdir:
+            copy_dir = Path(tmpdir) / "lake"
+            (copy_dir / "domains").mkdir(parents=True)
+            shutil.copy2(cat_db, copy_dir / "catalog.sqlite")
+            shutil.copy2(web3_db, copy_dir / "domains" / "web3_lake.sqlite")
+            router = DataFoundationRouter(copy_dir)
+            self.addCleanup(router.close)
 
-        # Full 12-coin W1 real multi-year check (verifying HYPE PIT + honest positive net metrics)
-        specs_12 = default_web3_specs(WEB3_LIQUID_UNIVERSE)
-        cfg_12 = RiskAllocatorConfig(max_positions=6, target_annual_vol_pct=20.0, max_portfolio_leverage=1.5, max_single_weight=0.45)
-        res_w1_full = acct.simulate(
-            Web3XSMomCarryKernel(top_k=3, bottom_k=3, metrics_by_symbol=metrics),
-            specs_12,
-            bars_12h,
-            risk_cfg=cfg_12,
-            context_provider=_ctx_clean,
-        )
-        self.assertGreater(res_w1_full.days, 1000.0)
-        self.assertGreater(res_w1_full.trade_count, 100)
-        self.assertEqual(res_w1_full.liquidation_count, 0)
-        self.assertTrue(math.isfinite(res_w1_full.cagr_pct))
-        self.assertTrue(math.isfinite(res_w1_full.sharpe_ratio))
+            bars_12h = {s: router.load_bars("web3", "hyperliquid", s, 43200) for s in WEB3_LIQUID_UNIVERSE}
+            dvol = router.load_web3_macro("BTC_DVOL")
+            stable = router.load_web3_macro("STABLECOIN_MCAP_USD")
+            metrics = {s: router.load_web3_metrics("binance_um", s) for s in ("BTC", "ETH", "SOL")}
+
+            self.assertGreater(len(bars_12h["BTC"]), 1000)
+            self.assertGreater(len(dvol), 500)
+            self.assertGreater(len(stable), 500)
+            self.assertGreater(len(metrics["BTC"]), 500)
+
+            reg_eng = Web3MarketRegimeEngine(
+                bars_by_symbol=bars_12h,
+                dvol_series=dvol,
+                stablecoin_series=stable,
+                metrics_by_symbol=metrics,
+            )
+            # Verify real-data regime transitions span multiple regimes with finite scalars
+            seen_regimes: set[str] = set()
+            for b in bars_12h["BTC"][60::20]:
+                snap = reg_eng.snapshot_as_of(b.ts_avail_ms)
+                seen_regimes.add(snap.regime_label)
+                self.assertTrue(math.isfinite(snap.exposure_scalar))
+            self.assertGreaterEqual(len(seen_regimes), 3)
+
+            dvol_av = [p.ts_avail_ms for p in dvol]
+            dvol_v = [p.value for p in dvol]
+
+            def _ctx_clean(ts_ms: int) -> dict[str, Any]:
+                snap = reg_eng.snapshot_as_of(ts_ms)
+                idx = bisect.bisect_right(dvol_av, ts_ms) - 1
+                dv = dvol_v[idx] if idx >= 0 else 50.0
+                return {
+                    "regime_label": snap.regime_label,
+                    "exposure_scalar": snap.exposure_scalar,
+                    "breadth_pct_above_20d": snap.breadth_pct_above_20d,
+                    "dvol": dv,
+                    "rt_cost_bps": 14.0,
+                    "margin_ratio": 0.90,
+                }
+
+            def _ctx_vix_shock(ts_ms: int) -> dict[str, Any]:
+                c = _ctx_clean(ts_ms)
+                c.update({"yahoo_vix": 95.0, "vix": 95.0, "macro_vix_stress_z": 12.0, "macro_gold_composite": -5.0})
+                return c
+
+            # Slice 400 real 12h bars from active 2024 bull/funding window (bars 500:900) for fast full-parity + smoke
+            majors = ("BTC", "ETH", "SOL", "AVAX")
+            bars_mid = {s: bars_12h[s][500:900] for s in majors}
+            specs_m = default_web3_specs(majors)
+            cfg_m = RiskAllocatorConfig(max_positions=4, target_annual_vol_pct=20.0, max_portfolio_leverage=1.5, max_single_weight=0.50)
+            acct = PortfolioAccountingEngine()
+
+            for strat in (
+                Web3XSMomCarryKernel(top_k=2, bottom_k=2, metrics_by_symbol=metrics),
+                Web3AdaptiveTrendKernel(metrics_by_symbol=metrics),
+                Web3RegimeCarryKernel(dvol_series=dvol),
+            ):
+                res_clean = acct.simulate(strat.clone_fresh(), specs_m, bars_mid, risk_cfg=cfg_m, context_provider=_ctx_clean)
+                res_vix = acct.simulate(strat.clone_fresh(), specs_m, bars_mid, risk_cfg=cfg_m, context_provider=_ctx_vix_shock)
+
+                self.assertEqual(res_clean.equity_curve, res_vix.equity_curve, f"D7 VIX drift on {strat.strategy_id}")
+                self.assertGreater(res_clean.trade_count, 0, f"Zero trades on real mid window for {strat.strategy_id}")
+                self.assertEqual(res_clean.liquidation_count, 0)
+                for metric_val in (res_clean.cagr_pct, res_clean.sharpe_ratio, res_clean.max_drawdown_pct, res_clean.net_pnl_usd):
+                    self.assertTrue(math.isfinite(metric_val))
+
+                rep = verify_full_parity(
+                    strat.clone_fresh(), specs_m, bars_mid, risk_cfg=cfg_m, batch_result=res_clean, context_provider=_ctx_clean
+                )
+                self.assertTrue(rep.passed, f"G7 parity failed for {strat.strategy_id}: {rep.detail}")
+                self.assertLessEqual(rep.max_abs_weight_delta, 1e-10)
+                self.assertLessEqual(rep.max_abs_equity_delta, 1e-8)
+
+            # Full 12-coin W1 real multi-year check (verifying HYPE PIT + honest positive net metrics)
+            specs_12 = default_web3_specs(WEB3_LIQUID_UNIVERSE)
+            cfg_12 = RiskAllocatorConfig(max_positions=6, target_annual_vol_pct=20.0, max_portfolio_leverage=1.5, max_single_weight=0.45)
+            res_w1_full = acct.simulate(
+                Web3XSMomCarryKernel(top_k=3, bottom_k=3, metrics_by_symbol=metrics),
+                specs_12,
+                bars_12h,
+                risk_cfg=cfg_12,
+                context_provider=_ctx_clean,
+            )
+            self.assertGreater(res_w1_full.days, 1000.0)
+            self.assertGreater(res_w1_full.trade_count, 100)
+            self.assertEqual(res_w1_full.liquidation_count, 0)
+            self.assertTrue(math.isfinite(res_w1_full.cagr_pct))
+            self.assertTrue(math.isfinite(res_w1_full.sharpe_ratio))
 
 
 if __name__ == "__main__":

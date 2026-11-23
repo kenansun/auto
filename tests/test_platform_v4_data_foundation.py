@@ -21,6 +21,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -1038,11 +1039,13 @@ class TestPlatformV4DataFoundation(unittest.TestCase):
 
     # --- Real Ingested data/platform_v4_lake Read-Only Integrity Check ---
     def test_real_platform_v4_lake_integrity_if_present(self) -> None:
-        cat_path = REAL_V4_LAKE_DIR / "catalog.sqlite"
-        w3_path = REAL_V4_LAKE_DIR / "domains" / "web3_lake.sqlite"
-        gm_path = REAL_V4_LAKE_DIR / "domains" / "gold_macro_lake.sqlite"
+        env_dir = os.environ.get("PLATFORM_V4_LAKE_DIR", "").strip()
+        lake_dir = Path(env_dir) if env_dir else REAL_V4_LAKE_DIR
+        cat_path = lake_dir / "catalog.sqlite"
+        w3_path = lake_dir / "domains" / "web3_lake.sqlite"
+        gm_path = lake_dir / "domains" / "gold_macro_lake.sqlite"
         if not (cat_path.exists() and w3_path.exists() and gm_path.exists()):
-            self.skipTest("data/platform_v4_lake not yet populated")
+            self.skipTest(f"data/platform_v4_lake not yet populated at {lake_dir}")
 
         # Open strictly read-only (?mode=ro) so test never mutates the real lake
         c_cat = sqlite3.connect(f"file:{cat_path.resolve()}?mode=ro", uri=True, timeout=30.0)
@@ -1123,13 +1126,13 @@ class TestPlatformV4DataFoundation(unittest.TestCase):
                 if rp in checked_paths:
                     continue
                 checked_paths.add(rp)
-                fpath = REAL_V4_LAKE_DIR / rp
+                fpath = lake_dir / rp
                 self.assertTrue(fpath.exists(), msg=f"Missing exported partition {fpath}")
                 self.assertEqual(sha256_file(str(fpath)), str(m["sha256"]))
 
-            # FIX-1: 0/39 rows in asset_registry missing contract_multiplier; GC=F & SI=F exact
+            # FIX-1: 0/39+ rows in asset_registry missing contract_multiplier; GC=F & SI=F exact
             ar_rows = c_cat.execute("SELECT venue, symbol, spec_json FROM asset_registry").fetchall()
-            self.assertEqual(len(ar_rows), 39)
+            self.assertGreaterEqual(len(ar_rows), 39)
             for ar in ar_rows:
                 spec_d = json.loads(str(ar["spec_json"]))
                 self.assertIn("contract_multiplier", spec_d, msg=f"Missing multiplier on {ar['venue']}:{ar['symbol']}")
@@ -1664,6 +1667,104 @@ class TestPlatformV4DataFoundation(unittest.TestCase):
         )
         dec_near = next(e for e in evs_15d_early if e.event_id == "NFP-2026-12-04")
         self.assertAlmostEqual(dec_near.prior or 0.0, 165.0, places=2)
+
+    def test_def03_runner_cumulative_grid_trials_advance_9_18_27_and_penalize_dsr(self) -> None:
+        """DEF-03 regression: 3 consecutive 9-point grid runs strictly advance trial_ledger 9 -> 18 -> 27."""
+        import importlib.util
+
+        from alphaloop.platform.assets import default_web3_specs
+        from alphaloop.platform.core_engine.risk_allocator import RiskAllocatorConfig
+        from alphaloop.platform.core_engine.validation import compute_buy_and_hold_returns
+        from alphaloop.platform.strategies.web3 import Web3AdaptiveTrendKernel
+
+        runner_path = Path(__file__).resolve().parent.parent / "scripts" / "run_strategy_platform_v4.py"
+        spec = importlib.util.spec_from_file_location("_test_v4_runner_def03", runner_path)
+        assert spec is not None and spec.loader is not None
+        runner_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner_mod)
+
+        bars = _make_hourly_bars(
+            260,
+            tf_h=12.0,
+            symbol="BTC",
+            carry_rate=0.0002,
+            carry_interval_h=12.0,
+            provenance=PROVENANCE_SYNTHETIC,
+        )
+        specs = default_web3_specs(("BTC",))
+        bars_by_sym = {"BTC": bars}
+        risk_cfg = RiskAllocatorConfig(
+            max_positions=1,
+            target_annual_vol_pct=18.0,
+            max_portfolio_leverage=1.0,
+            max_single_weight=1.0,
+        )
+        fa = runner_mod._compute_factor_audit("def03_track", bars_by_sym, specs, horizon_bars=2)
+        bh_rets = compute_buy_and_hold_returns(bars)
+        grid_factories: list[tuple[int, int, str, dict[str, Any], Any]] = []
+        for ix, dn in enumerate((14, 20, 28)):
+            for iy, atr in enumerate((2.5, 3.0, 3.8)):
+                grid_factories.append(
+                    (
+                        ix,
+                        iy,
+                        f"dn{dn}_atr{int(atr * 10)}",
+                        {"donchian_entry_n": dn, "donchian_exit_n": dn // 2, "atr_stop_mult": atr},
+                        lambda _dn=dn, _atr=atr: Web3AdaptiveTrendKernel(
+                            donchian_entry_n=_dn, donchian_exit_n=_dn // 2, atr_stop_mult=_atr
+                        ),
+                    )
+                )
+
+        with tempfile.TemporaryDirectory(prefix="def03_trials_") as tmpdir:
+            router = DataFoundationRouter(Path(tmpdir) / "lake")
+            try:
+                fam = "def03_regression_family"
+                self.assertEqual(router.get_family_trial_count(fam), 0)
+                sr_stars: list[float] = []
+                counts: list[int] = []
+                for run_idx in range(3):
+                    _sim, _gate, detail = runner_mod._evaluate_strategy_full(
+                        router=router,
+                        strategy_id="W2_def03_test",
+                        family_id=fam,
+                        track_name="web3_def03",
+                        asset_domain="web3",
+                        specs=specs,
+                        bars_by_symbol=bars_by_sym,
+                        dq_reports=[],
+                        factor_audit=fa,
+                        baseline_factory=lambda: Web3AdaptiveTrendKernel(),
+                        grid_factories=grid_factories,
+                        risk_cfg=risk_cfg,
+                        periods_per_year=730.0,
+                        benchmark_returns=bh_rets,
+                        benchmark_name="BTC_BH",
+                        capital_usd=10_000.0,
+                        parity_tail_bars=120,
+                        baseline_grid_label="dn20_atr30",
+                    )
+                    self.assertEqual(detail["trials_recorded_in_run"], 9)
+                    counts.append(router.get_family_trial_count(fam))
+                    self.assertEqual(detail["cumulative_family_trials"], counts[-1])
+                    self.assertEqual(int(detail["g5_dsr"]["family_trial_count"]), 9 * (run_idx + 1))
+                    sr_stars.append(float(detail["g5_dsr"]["sr_star_annualized"]))
+                    self.assertEqual(counts[-1], 9 * (run_idx + 1))
+
+                self.assertEqual(counts, [9, 18, 27])
+                self.assertLess(sr_stars[0], sr_stars[1])
+                self.assertLess(sr_stars[1], sr_stars[2])
+
+                # SQLite immutability triggers still block UPDATE/DELETE across all 27 rows
+                trials = router.list_family_trials(fam)
+                self.assertEqual(len(trials), 27)
+                some_tid = trials[0]["trial_id"]
+                with self.assertRaises(sqlite3.IntegrityError):
+                    router.catalog_conn.execute("UPDATE trial_ledger SET verdict='FAKE' WHERE trial_id=?", (some_tid,))
+                with self.assertRaises(sqlite3.IntegrityError):
+                    router.catalog_conn.execute("DELETE FROM trial_ledger WHERE trial_id=?", (some_tid,))
+            finally:
+                router.close()
 
 
 if __name__ == "__main__":

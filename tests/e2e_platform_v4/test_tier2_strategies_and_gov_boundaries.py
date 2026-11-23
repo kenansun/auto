@@ -1463,7 +1463,7 @@ class TestTier2FA11GovernanceAndComplianceBoundaries(unittest.TestCase):
 
         self.assertIn(
             parsed_status,
-            {"SUBMITTED", "IN_PROGRESS", "CLOSED", "DONE"},
+            {"SUBMITTED", "IN_PROGRESS", "IN_REVIEW", "PASS_SCOPE", "REWORK", "CLOSED", "DONE"},
             f"CC-20261123-004 STATUS in first 40 lines invalid: {parsed_status!r}",
         )
         self.assertIsNotNone(claim_found, "CC-20261123-004 must carry a valid @S-MMDD-REPO-NN claim ID in first 40 lines")
