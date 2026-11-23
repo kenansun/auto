@@ -1,13 +1,14 @@
 """Multi-Asset Domain Specifications: Web3 Perps/Spot, Gold (PAXG & TradFi), Macro, and A-Share Extension.
 
-Implements QuantConnect LEAN's asset-modeling discipline so the Strategy R&D Platform v3
-shares one unified data lake, factor engine, regime profiler, parameter inferrer, and
-anti-overfitting harness across Web3 and Gold while preserving exact venue/calendar/cost physics
-(and leaving a clean extension point for CN A-shares).
+Implements QuantConnect LEAN's asset-modeling discipline so the Strategy R&D Platform v4
+maintains physically separated asset-native strategies on a unified PIT data contract
+while preserving exact venue/calendar/cost/contract-multiplier physics across Web3,
+Gold/Macro, and future CN A-shares.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -107,12 +108,15 @@ class AssetSpec:
     quote_currency: str = "USD"
     proxy_symbol: str = ""  # E.g. PAXG -> GC=F for cross-source arbitration
     tags: tuple[str, ...] = field(default_factory=tuple)
+    contract_multiplier: float = 1.0  # E.g. 100.0 troy oz for COMEX GC=F, 5000.0 for SI=F
 
     def __post_init__(self) -> None:
         if self.asset_class not in VALID_ASSET_CLASSES:
             raise ValueError(f"Unsupported asset_class: {self.asset_class!r}")
-        if self.max_leverage_cap <= 0.0:
+        if not math.isfinite(self.max_leverage_cap) or self.max_leverage_cap <= 0.0:
             raise ValueError("max_leverage_cap must be positive")
+        if not math.isfinite(self.contract_multiplier) or self.contract_multiplier <= 0.0:
+            raise ValueError("contract_multiplier must be finite and positive")
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -191,6 +195,27 @@ COST_CN_A_SHARE = CostModel(
     stamp_duty_sell_bps=5.0,
 )
 
+COST_BINANCE_PERP = CostModel(
+    maker_fee_bps=2.0,
+    taker_fee_bps=5.0,
+    slippage_bps_per_leg=1.5,
+    annual_carry_drag_bps=0.0,  # Funding settled explicitly per bar
+)
+
+COST_BINANCE_SPOT = CostModel(
+    maker_fee_bps=10.0,
+    taker_fee_bps=10.0,
+    slippage_bps_per_leg=2.0,
+    annual_carry_drag_bps=0.0,
+)
+
+COST_OKX_PERP = CostModel(
+    maker_fee_bps=2.0,
+    taker_fee_bps=5.0,
+    slippage_bps_per_leg=1.5,
+    annual_carry_drag_bps=0.0,
+)
+
 
 WEB3_LIQUID_UNIVERSE: tuple[str, ...] = (
     "BTC", "ETH", "SOL", "XRP", "DOGE", "AVAX",
@@ -208,27 +233,61 @@ GOLD_MACRO_SYMBOLS: tuple[str, ...] = (
     "SI=F",      # COMEX Silver Futures (Gold/Silver ratio)
 )
 
+GOLD_MACRO_SYMBOLS_V4: tuple[str, ...] = GOLD_MACRO_SYMBOLS + (
+    "^GVZ",      # CBOE Gold ETF Volatility Index
+    "GDX",       # VanEck Gold Miners ETF
+    "SLV",       # iShares Silver Trust ETF
+    "UUP",       # Invesco DB US Dollar Index Bullish Fund
+    "TLT",       # iShares 20+ Year Treasury Bond ETF
+)
+
+DEFAULT_CONTRACT_MULTIPLIERS: dict[str, float] = {
+    "GC=F": 100.0,    # COMEX Gold Futures: 100 troy oz per contract
+    "SI=F": 5000.0,   # COMEX Silver Futures: 5,000 troy oz per contract
+}
+
 
 def default_web3_specs(
     symbols: tuple[str, ...] | list[str] = WEB3_LIQUID_UNIVERSE,
     venue: str = "hyperliquid",
 ) -> dict[str, AssetSpec]:
-    cost = COST_HYPERLIQUID_PERP if venue == "hyperliquid" else COST_GATE_PERP
+    venue_norm = venue.lower()
+    if venue_norm == "hyperliquid":
+        cost = COST_HYPERLIQUID_PERP
+    elif venue_norm == "binance_um":
+        cost = COST_BINANCE_PERP
+    elif venue_norm == "binance_spot":
+        cost = COST_BINANCE_SPOT
+    elif venue_norm == "okx":
+        cost = COST_OKX_PERP
+    else:
+        cost = COST_GATE_PERP
+
+    is_spot_venue = venue_norm.endswith("_spot")
     out: dict[str, AssetSpec] = {}
     for sym in symbols:
         s = sym.upper()
         is_gold_token = s in ("PAXG", "XAUT", "XAU")
+        if is_spot_venue:
+            ac = ASSET_CLASS_CRYPTO_SPOT
+            tags = ("gold", "spot_24_7") if is_gold_token else ("web3", "crypto_spot", "spot_24_7")
+            lev_cap = 1.0
+        else:
+            ac = ASSET_CLASS_GOLD_PERP if is_gold_token else ASSET_CLASS_CRYPTO_PERP
+            tags = ("gold", "perp_24_7") if is_gold_token else ("web3", "crypto_major", "perp_24_7")
+            lev_cap = 2.0
         out[s] = AssetSpec(
             symbol=s,
-            asset_class=ASSET_CLASS_GOLD_PERP if is_gold_token else ASSET_CLASS_CRYPTO_PERP,
+            asset_class=ac,
             venue=venue,
             calendar=CALENDAR_CRYPTO_24_7,
             cost_model=cost,
-            max_leverage_cap=2.0,
+            max_leverage_cap=lev_cap,
             base_currency=s,
             quote_currency="USD",
             proxy_symbol="GC=F" if is_gold_token else "",
-            tags=("gold", "perp_24_7") if is_gold_token else ("web3", "crypto_major", "perp_24_7"),
+            tags=tags,
+            contract_multiplier=1.0,
         )
     return out
 
@@ -246,6 +305,7 @@ def default_gold_specs() -> dict[str, AssetSpec]:
             quote_currency="USD",
             proxy_symbol="GC=F",
             tags=("gold", "paxg", "perp_24_7"),
+            contract_multiplier=1.0,
         ),
         "GC=F": AssetSpec(
             symbol="GC=F",
@@ -258,6 +318,7 @@ def default_gold_specs() -> dict[str, AssetSpec]:
             quote_currency="USD",
             proxy_symbol="PAXG",
             tags=("gold", "comex", "tradfi"),
+            contract_multiplier=DEFAULT_CONTRACT_MULTIPLIERS["GC=F"],
         ),
         "GLD": AssetSpec(
             symbol="GLD",
@@ -270,6 +331,7 @@ def default_gold_specs() -> dict[str, AssetSpec]:
             quote_currency="USD",
             proxy_symbol="GC=F",
             tags=("gold", "etf", "tradfi"),
+            contract_multiplier=1.0,
         ),
     }
 
@@ -289,6 +351,45 @@ def default_macro_specs() -> dict[str, AssetSpec]:
             base_currency=sym,
             quote_currency="USD",
             tags=("macro", "gold_regime"),
+            contract_multiplier=DEFAULT_CONTRACT_MULTIPLIERS.get(sym, 1.0),
+        )
+    return out
+
+
+def default_macro_specs_v4() -> dict[str, AssetSpec]:
+    """Expanded 13-symbol Gold & Macro AssetSpec registry for Platform v4."""
+    tag_map: dict[str, tuple[str, ...]] = {
+        "GC=F": ("gold", "comex", "tradfi", "globex_23_5"),
+        "GLD": ("gold", "etf", "tradfi", "us_rth"),
+        "SI=F": ("macro", "silver", "comex", "globex_23_5"),
+        "SLV": ("macro", "silver", "etf", "us_rth"),
+        "DX-Y.NYB": ("macro", "usd", "index", "globex_23_5"),
+        "UUP": ("macro", "usd", "etf", "us_rth"),
+        "^TNX": ("macro", "rates", "yield_10y", "us_rth"),
+        "TIP": ("macro", "rates", "tips_etf", "us_rth"),
+        "IEF": ("macro", "rates", "treasury_7_10y", "us_rth"),
+        "TLT": ("macro", "rates", "treasury_20y", "us_rth"),
+        "^VIX": ("macro", "vol", "equity_stress", "globex_23_5"),
+        "^GVZ": ("macro", "vol", "gold_vol", "us_rth"),
+        "GDX": ("macro", "miners", "etf", "us_rth"),
+    }
+    globex_syms = {"GC=F", "SI=F", "DX-Y.NYB", "^VIX"}
+    out: dict[str, AssetSpec] = {}
+    for sym in GOLD_MACRO_SYMBOLS_V4:
+        ac = ASSET_CLASS_GOLD_TRADFI if sym in ("GC=F", "GLD") else ASSET_CLASS_MACRO_INDEX
+        cal = CALENDAR_GOLD_TRADFI_23_5 if sym in globex_syms else CALENDAR_US_DAILY
+        out[sym] = AssetSpec(
+            symbol=sym,
+            asset_class=ac,
+            venue="yahoo",
+            calendar=cal,
+            cost_model=COST_GOLD_FUTURES_ETF,
+            max_leverage_cap=2.0 if sym == "GC=F" else (1.5 if sym == "GLD" else 1.0),
+            base_currency="XAU" if sym in ("GC=F", "GLD") else sym,
+            quote_currency="USD",
+            proxy_symbol="PAXG" if sym == "GC=F" else ("GC=F" if sym == "GLD" else ""),
+            tags=tag_map.get(sym, ("macro", "gold_regime")),
+            contract_multiplier=DEFAULT_CONTRACT_MULTIPLIERS.get(sym, 1.0),
         )
     return out
 

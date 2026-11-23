@@ -1,4 +1,4 @@
-"""Causal Market Regime Profiler & Physics-Based Automatic Parameter Inference Engine.
+"""Causal Market Regime Profiler & Physics-Based Automatic Parameter Inference Engine (v4 Remediated).
 
 Directly answers the core R&D question:
   "How do we infer parameters automatically from market dynamics and customize strategies
@@ -8,6 +8,8 @@ Two-layer institutional design (Carver + AFML + QuantPedia):
   1. Causal MarketRegimeProfiler: Classifies each bar strictly causally (`t <= now`,
      ZERO Viterbi lookahead) with hysteresis persistence into interpretable states:
      TREND_EXPANSION / TREND_CALM / SQUEEZE_COIL / RANGE_CHOP / HIGH_VOL_STRESS / CARRY_RICH.
+     **D7 Hard Isolation**: Yahoo `^VIX` (`macro_vix_stress_z`) NEVER touches Web3/crypto
+     assets or any track with `use_macro_overlay=False`.
   2. AutoParameterInferrer: Derives baseline parameters from market physics BEFORE any grid scan:
      - Cost-to-Volatility Horizon Law (prevents ATB H6 / CFD swap churn disasters!)
      - Carver Volatility Targeting (auto-scales leverage inversely to realized volatility)
@@ -20,11 +22,12 @@ from __future__ import annotations
 
 import logging
 import math
-import statistics
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 from alphaloop.platform.assets import (
+    ASSET_CLASS_CRYPTO_PERP,
+    ASSET_CLASS_CRYPTO_SPOT,
     ASSET_CLASS_GOLD_PERP,
     ASSET_CLASS_GOLD_TRADFI,
     AssetSpec,
@@ -45,6 +48,21 @@ ARCHETYPE_MULTI_FACTOR_TREND = "MULTI_FACTOR_TREND_CTA"
 ARCHETYPE_GOLD_MACRO_TREND = "GOLD_MACRO_TREND_SQUEEZE"
 ARCHETYPE_CARRY_HARVEST = "VOL_TIERED_CARRY"
 ARCHETYPE_DEFENSIVE_OBSERVE = "DEFENSIVE_OBSERVE_ONLY"
+
+_WEB3_ASSET_CLASSES: frozenset[str] = frozenset(
+    {ASSET_CLASS_CRYPTO_PERP, ASSET_CLASS_CRYPTO_SPOT, "WEB3", "CRYPTO"}
+)
+_GOLD_MACRO_ASSET_CLASSES: frozenset[str] = frozenset(
+    {ASSET_CLASS_GOLD_PERP, ASSET_CLASS_GOLD_TRADFI}
+)
+
+
+def is_web3_asset_class(asset_class: str | None) -> bool:
+    """Return True if `asset_class` belongs to Web3/crypto (strictly isolated from TradFi Yahoo ^VIX)."""
+    if not asset_class:
+        return False
+    ac = str(asset_class).strip().upper()
+    return ac in _WEB3_ASSET_CLASSES or "CRYPTO" in ac or "WEB3" in ac
 
 
 @dataclass(frozen=True)
@@ -126,10 +144,31 @@ def _clamp(val: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, val))
 
 
-def classify_raw_regime(snap: FactorSnapshot) -> str:
-    """Strictly causal point-in-time classification of one FactorSnapshot."""
+def _fmedian(vals: Sequence[float]) -> float:
+    n = len(vals)
+    if n == 0:
+        return 0.0
+    ordered = sorted(vals)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(ordered[mid])
+    return 0.5 * (float(ordered[mid - 1]) + float(ordered[mid]))
+
+
+def classify_raw_regime(
+    snap: FactorSnapshot,
+    *,
+    use_macro_overlay: bool = False,
+    asset_class: str | None = None,
+) -> str:
+    """Strictly causal point-in-time classification of one FactorSnapshot.
+
+    D7 Hard Guard: Yahoo `^VIX` (`macro_vix_stress_z`) NEVER affects regime classification
+    when `use_macro_overlay=False` OR when `asset_class` is Web3/crypto.
+    """
     vol_pct = snap.get("vol_pctile_60", 0.5)
-    vix_z = snap.get("macro_vix_stress_z", 0.0)
+    allow_vix = bool(use_macro_overlay) and not is_web3_asset_class(asset_class)
+    vix_z = snap.get("macro_vix_stress_z", 0.0) if allow_vix else 0.0
     sq = snap.get("squeeze_ratio_20", 1.0)
     adx = snap.get("adx_14", 15.0)
     er = snap.get("kaufman_er_20", 0.3)
@@ -137,7 +176,7 @@ def classify_raw_regime(snap: FactorSnapshot) -> str:
     vr = snap.get("variance_ratio_20", 1.0)
     abs_carry = abs(snap.get("carry_apr_24h", 0.0))
 
-    if vol_pct >= 0.88 or vix_z >= 2.2:
+    if vol_pct >= 0.88 or (allow_vix and vix_z >= 2.2):
         return REGIME_HIGH_VOL_STRESS
     if sq < 0.85 and vol_pct <= 0.30:
         return REGIME_SQUEEZE_COIL
@@ -153,14 +192,26 @@ def classify_raw_regime(snap: FactorSnapshot) -> str:
 class CausalRegimeTracker:
     """Streaming-identical causal regime state machine with hysteresis anti-whipsaw."""
 
-    def __init__(self, confirm_bars: int = 2) -> None:
+    def __init__(
+        self,
+        confirm_bars: int = 2,
+        *,
+        use_macro_overlay: bool = False,
+        asset_class: str | None = None,
+    ) -> None:
         self.confirm_bars = max(1, int(confirm_bars))
+        self.asset_class = asset_class
+        self.use_macro_overlay = bool(use_macro_overlay) and not is_web3_asset_class(asset_class)
         self.confirmed: str = REGIME_TREND_CALM
         self._pending: str = ""
         self._pending_count: int = 0
 
     def step(self, snap: FactorSnapshot) -> RegimePoint:
-        raw = classify_raw_regime(snap)
+        raw = classify_raw_regime(
+            snap,
+            use_macro_overlay=self.use_macro_overlay,
+            asset_class=self.asset_class,
+        )
         # Immediate emergency escalation into HIGH_VOL_STRESS (fail-safe risk defense)
         if raw == REGIME_HIGH_VOL_STRESS:
             self.confirmed = REGIME_HIGH_VOL_STRESS
@@ -189,7 +240,7 @@ class CausalRegimeTracker:
             vol_pctile_60=round(snap.get("vol_pctile_60", 0.5), 3),
             squeeze_ratio_20=round(snap.get("squeeze_ratio_20", 1.0), 3),
             hurst_proxy_40=round(snap.get("hurst_proxy_40", 0.5), 3),
-            macro_gold_composite=round(snap.get("macro_gold_composite", 0.0), 3),
+            macro_gold_composite=round(snap.get("macro_gold_composite", 0.0), 3) if self.use_macro_overlay else 0.0,
         )
 
     def classify_series(self, snaps: list[FactorSnapshot]) -> list[RegimePoint]:
@@ -197,13 +248,15 @@ class CausalRegimeTracker:
 
 
 def _excess_kurtosis(vals: list[float]) -> float:
-    if len(vals) < 10:
+    n = len(vals)
+    if n < 10:
         return 0.0
-    mu = statistics.mean(vals)
-    m2 = sum((x - mu) ** 2 for x in vals) / len(vals)
+    mu = math.fsum(vals) / n
+    diffs = [x - mu for x in vals]
+    m2 = math.fsum(d * d for d in diffs) / n
     if m2 <= 1e-18:
         return 0.0
-    m4 = sum((x - mu) ** 4 for x in vals) / len(vals)
+    m4 = math.fsum((d * d) * (d * d) for d in diffs) / n
     return _clamp((m4 / (m2 * m2)) - 3.0, -2.0, 30.0)
 
 
@@ -217,8 +270,21 @@ class MarketRegimeProfiler:
         snaps: list[FactorSnapshot],
         execution_mode: str = "TAKER_TAKER",
         warmup_bars: int = 35,
+        use_macro_overlay: bool | None = None,
     ) -> tuple[MarketProfile, list[RegimePoint]]:
-        tracker = CausalRegimeTracker(confirm_bars=2)
+        if use_macro_overlay is None:
+            eff_macro = (
+                spec.asset_class in _GOLD_MACRO_ASSET_CLASSES
+                and not is_web3_asset_class(spec.asset_class)
+            )
+        else:
+            eff_macro = bool(use_macro_overlay) and not is_web3_asset_class(spec.asset_class)
+
+        tracker = CausalRegimeTracker(
+            confirm_bars=2,
+            use_macro_overlay=eff_macro,
+            asset_class=spec.asset_class,
+        )
         regime_pts = tracker.classify_series(snaps)
         valid_snaps = snaps[warmup_bars:] if len(snaps) > warmup_bars + 10 else snaps
         valid_regs = regime_pts[warmup_bars:] if len(regime_pts) > warmup_bars + 10 else regime_pts
@@ -227,10 +293,10 @@ class MarketRegimeProfiler:
         log_rets = [
             math.log(ordered[i].close / ordered[i - 1].close)
             for i in range(1, len(ordered))
-            if ordered[i - 1].close > 0 and ordered[i].close > 0
+            if ordered[i - 1].close > 0.0 and ordered[i].close > 0.0
         ]
         abs_ret_bps = [abs(r) * 10_000.0 for r in log_rets]
-        bar_med_move = statistics.median(abs_ret_bps) if abs_ret_bps else 10.0
+        bar_med_move = _fmedian(abs_ret_bps) if abs_ret_bps else 10.0
         rt_cost = spec.cost_model.round_trip_cost_bps(execution_mode=execution_mode)
 
         # Cost-to-Volatility Horizon Law:
@@ -244,9 +310,9 @@ class MarketRegimeProfiler:
             hmoves = [
                 abs(closes[i] / closes[i - h] - 1.0) * 10_000.0
                 for i in range(h, len(closes))
-                if closes[i - h] > 0
+                if closes[i - h] > 0.0
             ]
-            if hmoves and statistics.median(hmoves) >= max(3.0 * rt_cost, 15.0):
+            if hmoves and _fmedian(hmoves) >= max(3.0 * rt_cost, 15.0):
                 min_h = h
                 cost_feasible = True
                 break
@@ -254,16 +320,16 @@ class MarketRegimeProfiler:
             min_h = 24
 
         vols_ann = sorted(s.get("realized_vol_ann_20", 20.0) for s in valid_snaps)
-        vol_med = statistics.median(vols_ann) if vols_ann else 20.0
+        vol_med = _fmedian(vols_ann) if vols_ann else 20.0
         vol_p75 = vols_ann[min(len(vols_ann) - 1, int(0.75 * len(vols_ann)))] if vols_ann else vol_med
 
-        adx_med = statistics.median([s.get("adx_14", 15.0) for s in valid_snaps]) if valid_snaps else 15.0
-        er_med = statistics.median([s.get("kaufman_er_20", 0.3) for s in valid_snaps]) if valid_snaps else 0.3
-        hurst_med = statistics.median([s.get("hurst_proxy_40", 0.5) for s in valid_snaps]) if valid_snaps else 0.5
-        vr_med = statistics.median([s.get("variance_ratio_20", 1.0) for s in valid_snaps]) if valid_snaps else 1.0
+        adx_med = _fmedian([s.get("adx_14", 15.0) for s in valid_snaps]) if valid_snaps else 15.0
+        er_med = _fmedian([s.get("kaufman_er_20", 0.3) for s in valid_snaps]) if valid_snaps else 0.3
+        hurst_med = _fmedian([s.get("hurst_proxy_40", 0.5) for s in valid_snaps]) if valid_snaps else 0.5
+        vr_med = _fmedian([s.get("variance_ratio_20", 1.0) for s in valid_snaps]) if valid_snaps else 1.0
         carry_vals = [s.get("carry_apr_24h", 0.0) for s in valid_snaps]
         abs_carries = sorted(abs(x) for x in carry_vals)
-        carry_med = statistics.median(carry_vals) if carry_vals else 0.0
+        carry_med = _fmedian(carry_vals) if carry_vals else 0.0
         carry_p90 = abs_carries[min(len(abs_carries) - 1, int(0.90 * len(abs_carries)))] if abs_carries else 0.0
 
         reg_counts: dict[str, int] = {}
@@ -295,7 +361,11 @@ class MarketRegimeProfiler:
             p90_abs_carry_apr_pct=round(carry_p90, 2),
             current_regime=valid_regs[-1].confirmed_regime if valid_regs else REGIME_RANGE_CHOP,
             regime_distribution_pct=reg_dist,
-            macro_gold_latest=round(valid_snaps[-1].get("macro_gold_composite", 0.0), 3) if valid_snaps else 0.0,
+            macro_gold_latest=(
+                round(valid_snaps[-1].get("macro_gold_composite", 0.0), 3)
+                if (valid_snaps and eff_macro)
+                else 0.0
+            ),
         )
         return profile, regime_pts
 
@@ -317,22 +387,22 @@ class AutoParameterInferrer:
 
         tf_h = profiles[0].timeframe_h
         asset_class = specs[0].asset_class
-        is_gold_track = all(s.asset_class in (ASSET_CLASS_GOLD_PERP, ASSET_CLASS_GOLD_TRADFI) for s in specs)
+        is_gold_track = all(s.asset_class in _GOLD_MACRO_ASSET_CLASSES for s in specs)
         allow_short = all(s.calendar.allow_short for s in specs)
         max_lev_cap = min(s.max_leverage_cap for s in specs)
 
-        vol_p75 = statistics.median([p.realized_vol_ann_p75_pct for p in profiles])
-        vol_med = statistics.median([p.realized_vol_ann_median_pct for p in profiles])
-        er_med = statistics.median([p.median_kaufman_er for p in profiles])
-        adx_med = statistics.median([p.median_adx_14 for p in profiles])
-        hurst_med = statistics.median([p.median_hurst_proxy for p in profiles])
-        vr_med = statistics.median([p.median_variance_ratio for p in profiles])
-        kurt_med = statistics.median([p.excess_kurtosis for p in profiles])
-        rt_cost = statistics.median([p.round_trip_cost_bps for p in profiles])
-        bar_move = statistics.median([p.bar_median_abs_ret_bps for p in profiles])
-        min_hold = int(max(2, round(statistics.median([p.min_cost_feasible_horizon_bars for p in profiles]))))
+        vol_p75 = _fmedian([p.realized_vol_ann_p75_pct for p in profiles])
+        vol_med = _fmedian([p.realized_vol_ann_median_pct for p in profiles])
+        er_med = _fmedian([p.median_kaufman_er for p in profiles])
+        adx_med = _fmedian([p.median_adx_14 for p in profiles])
+        hurst_med = _fmedian([p.median_hurst_proxy for p in profiles])
+        vr_med = _fmedian([p.median_variance_ratio for p in profiles])
+        kurt_med = _fmedian([p.excess_kurtosis for p in profiles])
+        rt_cost = _fmedian([p.round_trip_cost_bps for p in profiles])
+        bar_move = _fmedian([p.bar_median_abs_ret_bps for p in profiles])
+        min_hold = int(max(2, round(_fmedian([p.min_cost_feasible_horizon_bars for p in profiles]))))
         cost_feasible = any(p.cost_feasible for p in profiles)
-        carry_p90 = statistics.median([p.p90_abs_carry_apr_pct for p in profiles])
+        carry_p90 = _fmedian([p.p90_abs_carry_apr_pct for p in profiles])
 
         trace: list[str] = []
 
@@ -359,16 +429,16 @@ class AutoParameterInferrer:
         )
 
         # 3. Persistence & Noise -> Adaptive Donchian & EWMAC Speed Weights
-        # Clean persistent trend -> medium lookback; noisy/choppy -> slower lookback to cut whipsaw
-        persistence_score = 0.45 * er_med + 0.35 * _clamp((hurst_med - 0.35) / 0.35, 0.0, 1.0) + 0.20 * _clamp((adx_med - 12.0) / 25.0, 0.0, 1.0)
+        persistence_score = (
+            0.45 * er_med
+            + 0.35 * _clamp((hurst_med - 0.35) / 0.35, 0.0, 1.0)
+            + 0.20 * _clamp((adx_med - 12.0) / 25.0, 0.0, 1.0)
+        )
         if tf_h >= 24.0:
-            # Daily bar scale (e.g., Gold GC=F/GLD daily): 20..55 trading days
             entry_n = int(round(_clamp(55.0 - 25.0 * persistence_score, 20.0, 55.0)))
         elif tf_h >= 8.0:
-            # 12h bar scale (e.g., Web3/PAXG 12h): 24..48 bars (12..24 days)
             entry_n = int(round(_clamp(48.0 - 20.0 * persistence_score, 24.0, 48.0)))
         else:
-            # 4h bar scale: 12..36 bars
             entry_n = int(round(_clamp(36.0 - 18.0 * persistence_score, 12.0, 36.0)))
         exit_n = max(6, int(round(entry_n * 0.40)))
 
@@ -388,7 +458,7 @@ class AutoParameterInferrer:
         pos_buffer = _clamp(0.08 + 0.06 * (rt_cost / max(bar_move, 1.0)), 0.08, 0.25)
         trace.append(
             f"Stop & Buffer Calibration (kurtosis={kurt_med:.1f}): Chandelier ATR mult={atr_stop_mult:.2f}, "
-            f"Carver inertia buffer={pos_buffer*100:.1f}%."
+            f"Carver inertia buffer={pos_buffer * 100:.1f}%."
         )
 
         # 5. Regime Exposure Schedule & Archetype Selection
@@ -398,7 +468,7 @@ class AutoParameterInferrer:
         elif is_gold_track:
             archetype = ARCHETYPE_GOLD_MACRO_TREND
             trace.append(
-                "Archetype=GOLD_MACRO_TREND_SQUEEZE: combines Donchian/EWMAC trend + squeeze breakout "
+                "Archetype=GOLD_MACRO_TREND_SQUEEZE: combines Donchian/EWMAC trend "
                 "conditioned on QuantPedia Gold-Treasury/DXY/TIP real-rate macro regime."
             )
         elif adx_med < 17.0 and carry_p90 >= 15.0 and er_med < 0.25:
@@ -409,8 +479,8 @@ class AutoParameterInferrer:
         else:
             archetype = ARCHETYPE_MULTI_FACTOR_TREND
             trace.append(
-                f"Archetype=MULTI_FACTOR_TREND_CTA: cross-asset vol-targeted multi-speed trend + breakout "
-                f"with regime-adaptive exposure scaling."
+                "Archetype=MULTI_FACTOR_TREND_CTA: cross-asset vol-targeted multi-speed trend + breakout "
+                "with regime-adaptive exposure scaling."
             )
 
         regime_exposure_map = {

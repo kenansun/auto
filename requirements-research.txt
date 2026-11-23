@@ -1,0 +1,15 @@
+# AlphaLoop Strategy R&D Platform v4 — Optional Research Plane Accelerators
+#
+# Dual-Plane Architecture (Verdict A):
+# - Edge / Execution & Shadow Nodes (GCP Tokyo, Tencent Tokyo, Huawei SG):
+#   Zero mandatory third-party dependencies — all core modules run natively on Python 3.12 stdlib.
+# - Research & Analytical Nodes (Devbox, GCP Tokyo 7.7 GiB /mnt/backup_disk, elastic Node #6+):
+#   Optional permissive-license accelerators (BSD-3-Clause / Apache-2.0 / MIT only).
+#   Zero copyleft libraries permitted.
+
+numpy>=2.0.0,<3.0.0          # BSD-3-Clause: vectorized CSCV PBO / covariance shrinkage acceleration
+scipy>=1.14.0,<2.0.0         # BSD-3-Clause: high-precision statistical tests & optimization
+pyarrow>=18.0.0,<21.0.0      # Apache-2.0: immutable Parquet partition export & columnar IO
+duckdb>=1.1.0,<2.0.0         # MIT: strictly read-only in-memory analytical SQL over Parquet/JSONL
+polars>=1.12.0,<2.0.0        # MIT: high-throughput multi-asset feature engineering on research nodes
+pytest>=8.3.0,<9.0.0         # MIT: optional parallel test runner for research plane

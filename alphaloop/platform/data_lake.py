@@ -1,20 +1,17 @@
-"""Unified Point-in-Time Multi-Asset Data Foundation (SQLite WAL + Dual Timestamps + Real Collectors).
+"""Unified Point-in-Time Multi-Asset Data Lake Facade (SQLite WAL + Exact timeframe_sec Index + DQ-MA-01..07).
 
-Architectural pillars synthesized from industry leaders & SCHQ standards:
-- NautilusTrader dual-timestamp discipline (`ts_event_ms` vs `ts_avail_ms`):
-  every bar records BOTH bar open/event time AND availability time (bar close).
-  Causal queries (`as_of_ms`) strictly filter `ts_avail_ms <= as_of_ms` to eliminate lookahead.
-- STD-32 Reuse-First: reuses `alphaloop.data.collectors` (HyperliquidCollector, GateCollector)
-  and `alphaloop.core.db.connect_wal` — zero duplicated exchange collectors.
-- STD-34 Compliant: WAL + busy_timeout, exponential backoff + jitter on HTTP, zero silent
-  exception swallowing, finite OHLCV validation, zero synthetic data fallback.
-- Cross-Source Gold Arbitration: explicitly quantifies PAXG vs GC=F basis, return correlation,
-  and dual-source ADX14 divergence (resolving the CC-20261117-006 PAXG 15.8 vs GC 32.4 blind spot).
+Preserves 100% v3 backwards compatibility for `MultiAssetDataLake` and `YahooFinanceCollector`
+while upgrading:
+- D10: `resample_canonical_bars` delegates to `data_foundation.models.resample_bars(..., require_complete=True)`
+- D11: Tightened 24/7 calendar gap budget (`DQ-MA-04`), new blocking `DQ-MA-07` perp funding coverage
+  & unit sanity check, and preserved `carry_interval_h` across resampling
+- D14: Exact `timeframe_sec INTEGER` index (`idx_canonical_pit_sec` / `idx_canonical_ev_sec`) with
+  automatic idempotent legacy v3 schema upgrade + collision-proof UUID-nonce audit upserts
+- D15d: Contract multiplier propagation in `YahooFinanceCollector` (`GC=F=100.0`, `SI=F=5000.0`)
 """
 
 from __future__ import annotations
 
-import hashlib
 import http.client
 import json
 import logging
@@ -25,85 +22,75 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from alphaloop.core.db import connect_wal, transaction
 from alphaloop.core.provenance import PROVENANCE_REAL, sha256_obj, utc_now_ms
 from alphaloop.data.collectors import GateCollector, HyperliquidCollector
-from alphaloop.data.quality import ALLOWED_REAL_PROVENANCES, MIN_VALID_EPOCH_MS
+from alphaloop.data.quality import ALLOWED_REAL_PROVENANCES
 from alphaloop.data.store import MarketDataStore
 from alphaloop.platform.assets import (
+    ASSET_CLASS_CRYPTO_PERP,
     ASSET_CLASS_GOLD_PERP,
     ASSET_CLASS_GOLD_TRADFI,
     ASSET_CLASS_MACRO_INDEX,
     AssetSpec,
+    DEFAULT_CONTRACT_MULTIPLIERS,
     GOLD_MACRO_SYMBOLS,
     TradingCalendar,
+)
+from alphaloop.platform.data_foundation.models import (
+    DAY_MS,
+    HOUR_MS,
+    CanonicalBar,
+    DomainStoreProtocol,
+    MacroEventRelease,
+    MacroYieldPoint,
+    MultiAssetDQCheck,
+    MultiAssetDQReport,
+    PAXGBasisPoint,
+    Web3DerivativesMetric,
+    Web3MarketMacroPoint,
+    audit_bars_quality,
+    check_canonical_bar,
+    classify_tradfi_session_tag,
+    fingerprint_canonical_bars,
+    resample_bars,
+    validate_canonical_bar,
 )
 
 logger = logging.getLogger(__name__)
 
-HOUR_MS = 3_600_000
-DAY_MS = 86_400_000
-YAHOO_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AlphaLoop-PlatformV3/1.0"
+YAHOO_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AlphaLoop-PlatformV4/1.0"
 
-
-@dataclass(frozen=True)
-class CanonicalBar:
-    """Unified Point-in-Time OHLCV + Carry bar across Web3, Gold, Macro, and Equities."""
-
-    asset_class: str
-    venue: str
-    symbol: str
-    timeframe_h: float
-    ts_event_ms: int        # Bar open timestamp (UTC ms)
-    ts_avail_ms: int        # Earliest causal visibility timestamp (bar close UTC ms >= ts_event_ms)
-    open: float
-    high: float
-    low: float
-    close: float
-    volume_usd: float
-    carry_rate_period: float = 0.0   # Realized funding/carry rate over this bar (decimal; + means longs pay shorts)
-    carry_interval_h: float = 1.0    # Settlement interval hours of carry_rate_period
-    spread_bps: float = 0.0          # Observed top-of-book spread if known, else 0.0
-    provenance: str = PROVENANCE_REAL
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class MultiAssetDQCheck:
-    gate_id: str
-    name: str
-    passed: bool
-    value: str
-    threshold: str
-    detail: str
-
-
-@dataclass
-class MultiAssetDQReport:
-    dataset_label: str
-    asset_class: str
-    row_count: int
-    dataset_sha256: str
-    provenance: str
-    passed: bool
-    checks: list[MultiAssetDQCheck] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "dataset_label": self.dataset_label,
-            "asset_class": self.asset_class,
-            "row_count": self.row_count,
-            "dataset_sha256": self.dataset_sha256,
-            "provenance": self.provenance,
-            "passed": self.passed,
-            "checks": [asdict(c) for c in self.checks],
-        }
+__all__ = [
+    "HOUR_MS",
+    "DAY_MS",
+    "YAHOO_USER_AGENT",
+    "CanonicalBar",
+    "Web3DerivativesMetric",
+    "Web3MarketMacroPoint",
+    "MacroYieldPoint",
+    "MacroEventRelease",
+    "PAXGBasisPoint",
+    "DomainStoreProtocol",
+    "MultiAssetDQCheck",
+    "MultiAssetDQReport",
+    "CrossSourceDivergenceReport",
+    "check_canonical_bar",
+    "validate_canonical_bar",
+    "fingerprint_canonical_bars",
+    "resample_bars",
+    "resample_canonical_bars",
+    "MultiAssetDataLake",
+    "audit_bars_quality",
+    "audit_cross_source_divergence",
+    "YahooFinanceCollector",
+    "ingest_real_web3_and_gold_lake",
+]
 
 
 @dataclass
@@ -126,95 +113,24 @@ class CrossSourceDivergenceReport:
         return asdict(self)
 
 
-def validate_canonical_bar(bar: CanonicalBar) -> tuple[bool, str]:
-    """Fail-closed bar integrity & Point-in-Time check (STD-34 Pillar 6)."""
-    if bar.ts_event_ms < MIN_VALID_EPOCH_MS or bar.ts_avail_ms < bar.ts_event_ms:
-        return False, "invalid_or_lookahead_timestamp"
-    if bar.timeframe_h <= 0.0 or not math.isfinite(bar.timeframe_h):
-        return False, "invalid_timeframe"
-    nums = (bar.open, bar.high, bar.low, bar.close, bar.volume_usd, bar.carry_rate_period, bar.spread_bps)
-    if not all(math.isfinite(x) for x in nums):
-        return False, "non_finite_numeric"
-    if bar.open <= 0.0 or bar.high <= 0.0 or bar.low <= 0.0 or bar.close <= 0.0:
-        return False, "non_positive_price"
-    if bar.high < max(bar.open, bar.close) - 1e-12 or bar.low > min(bar.open, bar.close) + 1e-12:
-        return False, "ohlc_envelope_violation"
-    if bar.low > bar.high:
-        return False, "inverted_high_low"
-    if bar.volume_usd < 0.0 or bar.spread_bps < 0.0:
-        return False, "negative_volume_or_spread"
-    return True, "ok"
-
-
-def fingerprint_canonical_bars(bars: list[CanonicalBar]) -> tuple[str, str, int]:
-    """Compute deterministic SHA-256 hash and provenance union over a CanonicalBar sequence."""
-    h = hashlib.sha256()
-    provs: set[str] = set()
-    ordered = sorted(bars, key=lambda b: (b.venue, b.symbol, b.timeframe_h, b.ts_event_ms))
-    for b in ordered:
-        provs.add(b.provenance)
-        h.update(
-            f"{b.venue}|{b.symbol}|{b.timeframe_h:.4f}|{b.ts_event_ms}|{b.ts_avail_ms}|"
-            f"{b.open:.8f}|{b.high:.8f}|{b.low:.8f}|{b.close:.8f}|{b.volume_usd:.4f}|"
-            f"{b.carry_rate_period:.10f}|{b.provenance}\n".encode("utf-8")
-        )
-    prov_str = "+".join(sorted(provs)) if provs else "EMPTY"
-    return h.hexdigest(), prov_str, len(ordered)
-
-
-def resample_canonical_bars(bars: list[CanonicalBar], target_timeframe_h: float) -> list[CanonicalBar]:
-    """Strictly causal UTC-aligned bar resampling (e.g. 1h -> 4h / 12h / 24h).
-
-    Preserves exact Point-in-Time visibility: bucket ts_avail_ms = max(ts_avail_ms) of constituent bars.
-    Drops incomplete trailing bucket only if fewer than half the expected bars exist when resampling
-    fine intraday bars into coarse bars, while keeping complete aligned buckets deterministic.
-    """
-    if not bars:
-        return []
-    tf_ms = int(round(target_timeframe_h * HOUR_MS))
-    if tf_ms <= 0:
-        raise ValueError("target_timeframe_h must be positive")
-    ordered = sorted(bars, key=lambda b: b.ts_event_ms)
-    if abs(ordered[0].timeframe_h - target_timeframe_h) < 1e-6:
-        return list(ordered)
-
-    buckets: dict[int, list[CanonicalBar]] = {}
-    for b in ordered:
-        b_start = (b.ts_event_ms // tf_ms) * tf_ms
-        buckets.setdefault(b_start, []).append(b)
-
-    out: list[CanonicalBar] = []
-    for b_start in sorted(buckets):
-        grp = buckets[b_start]
-        first = grp[0]
-        last = grp[-1]
-        provs = sorted({x.provenance for x in grp})
-        carry_sum = sum(x.carry_rate_period for x in grp)
-        spread_avg = statistics.mean(x.spread_bps for x in grp)
-        out.append(
-            CanonicalBar(
-                asset_class=first.asset_class,
-                venue=first.venue,
-                symbol=first.symbol,
-                timeframe_h=float(target_timeframe_h),
-                ts_event_ms=b_start,
-                ts_avail_ms=max(b_start + tf_ms, max(x.ts_avail_ms for x in grp)),
-                open=first.open,
-                high=max(x.high for x in grp),
-                low=min(x.low for x in grp),
-                close=last.close,
-                volume_usd=sum(x.volume_usd for x in grp),
-                carry_rate_period=carry_sum,
-                carry_interval_h=float(target_timeframe_h),
-                spread_bps=spread_avg,
-                provenance="+".join(provs),
-            )
-        )
-    return out
+def resample_canonical_bars(
+    bars: Sequence[CanonicalBar],
+    target_timeframe_h: float,
+    *,
+    require_complete: bool = True,
+    min_subbars: int | None = None,
+) -> list[CanonicalBar]:
+    """Strictly causal UTC-aligned bar resampling delegating to data_foundation.models.resample_bars."""
+    return resample_bars(
+        bars,
+        target_timeframe_h,
+        require_complete=require_complete,
+        min_subbars=min_subbars,
+    )
 
 
 class MultiAssetDataLake:
-    """SQLite WAL Point-in-Time multi-asset research lake with JSONL export boundary."""
+    """SQLite WAL Point-in-Time multi-asset research lake (v3-compatible facade with v4 integer indexing)."""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -242,6 +158,7 @@ class MultiAssetDataLake:
                     venue TEXT NOT NULL,
                     symbol TEXT NOT NULL,
                     timeframe_h REAL NOT NULL,
+                    timeframe_sec INTEGER NOT NULL,
                     ts_event_ms INTEGER NOT NULL,
                     ts_avail_ms INTEGER NOT NULL,
                     open REAL NOT NULL,
@@ -253,14 +170,57 @@ class MultiAssetDataLake:
                     carry_interval_h REAL NOT NULL,
                     spread_bps REAL NOT NULL,
                     provenance TEXT NOT NULL,
-                    PRIMARY KEY (venue, symbol, timeframe_h, ts_event_ms)
+                    source_fingerprint TEXT NOT NULL DEFAULT '',
+                    session_tag TEXT NOT NULL DEFAULT 'ALL_24_7',
+                    premium_basis_bps REAL NOT NULL DEFAULT 0.0,
+                    contract_multiplier REAL NOT NULL DEFAULT 1.0,
+                    PRIMARY KEY (venue, symbol, timeframe_sec, ts_event_ms)
                 );
+                """
+            )
+            # Idempotent in-place schema upgrade for legacy v3 databases lacking v4 columns
+            cols = {
+                str(r["name"])
+                for r in self.conn.fetch_all("PRAGMA table_info(canonical_bars)")
+            }
+            if "timeframe_sec" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE canonical_bars ADD COLUMN timeframe_sec INTEGER NOT NULL DEFAULT 0;"
+                )
+            if "source_fingerprint" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE canonical_bars ADD COLUMN source_fingerprint TEXT NOT NULL DEFAULT '';"
+                )
+            if "session_tag" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE canonical_bars ADD COLUMN session_tag TEXT NOT NULL DEFAULT 'ALL_24_7';"
+                )
+            if "premium_basis_bps" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE canonical_bars ADD COLUMN premium_basis_bps REAL NOT NULL DEFAULT 0.0;"
+                )
+            if "contract_multiplier" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE canonical_bars ADD COLUMN contract_multiplier REAL NOT NULL DEFAULT 1.0;"
+                )
+            self.conn.execute(
+                """
+                UPDATE canonical_bars
+                SET timeframe_sec = CAST(ROUND(timeframe_h * 3600.0) AS INTEGER)
+                WHERE timeframe_sec <= 0;
+                """
+            )
+            # Exact integer timeframe_sec indexes (fixes D14 ABS(timeframe_h - ?) scan defeat)
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_canonical_pit_sec
+                ON canonical_bars (venue, symbol, timeframe_sec, ts_avail_ms);
                 """
             )
             self.conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_canonical_pit
-                ON canonical_bars (venue, symbol, timeframe_h, ts_avail_ms);
+                CREATE INDEX IF NOT EXISTS idx_canonical_ev_sec
+                ON canonical_bars (venue, symbol, timeframe_sec, ts_event_ms, ts_avail_ms);
                 """
             )
             self.conn.execute(
@@ -312,24 +272,31 @@ class MultiAssetDataLake:
                 (spec.venue, spec.symbol, spec.asset_class, json.dumps(spec.to_dict(), sort_keys=True), utc_now_ms()),
             )
 
-    def upsert_bars(self, bars: list[CanonicalBar]) -> tuple[int, int]:
+    def upsert_bars(
+        self,
+        bars: Sequence[CanonicalBar],
+        *,
+        allow_synthetic_in_test: bool = True,
+    ) -> tuple[int, int]:
         """Persist validated bars; returns (accepted_count, rejected_count)."""
         if not bars:
             return 0, 0
         valid_rows: list[tuple[Any, ...]] = []
         rejected = 0
         for b in bars:
-            ok, reason = validate_canonical_bar(b)
+            ok, reason = check_canonical_bar(b, allow_synthetic_in_test=allow_synthetic_in_test)
             if not ok:
                 rejected += 1
                 logger.warning("Rejected invalid bar %s/%s@%s: %s", b.venue, b.symbol, b.ts_event_ms, reason)
                 continue
+            tf_sec = int(b.timeframe_sec) if b.timeframe_sec > 0 else int(round(float(b.timeframe_h) * 3600.0))
             valid_rows.append(
                 (
                     b.asset_class,
                     b.venue,
                     b.symbol,
                     float(b.timeframe_h),
+                    tf_sec,
                     int(b.ts_event_ms),
                     int(b.ts_avail_ms),
                     float(b.open),
@@ -341,6 +308,10 @@ class MultiAssetDataLake:
                     float(b.carry_interval_h),
                     float(b.spread_bps),
                     b.provenance,
+                    b.source_fingerprint,
+                    b.session_tag,
+                    float(b.premium_basis_bps),
+                    float(b.contract_multiplier),
                 )
             )
         if valid_rows:
@@ -348,10 +319,11 @@ class MultiAssetDataLake:
                 self.conn.executemany(
                     """
                     INSERT OR REPLACE INTO canonical_bars
-                    (asset_class, venue, symbol, timeframe_h, ts_event_ms, ts_avail_ms,
+                    (asset_class, venue, symbol, timeframe_h, timeframe_sec, ts_event_ms, ts_avail_ms,
                      open, high, low, close, volume_usd, carry_rate_period, carry_interval_h,
-                     spread_bps, provenance)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     spread_bps, provenance, source_fingerprint, session_tag, premium_basis_bps,
+                     contract_multiplier)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     valid_rows,
                 )
@@ -366,14 +338,16 @@ class MultiAssetDataLake:
         end_ms: int | None = None,
         as_of_ms: int | None = None,
     ) -> list[CanonicalBar]:
-        """Load bars with optional Point-in-Time `as_of_ms` causal visibility guard."""
+        """Load bars using exact integer timeframe_sec index with optional PIT `as_of_ms` guard."""
+        tf_sec = int(round(float(timeframe_h) * 3600.0))
         sql = (
-            "SELECT asset_class, venue, symbol, timeframe_h, ts_event_ms, ts_avail_ms, "
+            "SELECT asset_class, venue, symbol, timeframe_h, timeframe_sec, ts_event_ms, ts_avail_ms, "
             "open, high, low, close, volume_usd, carry_rate_period, carry_interval_h, "
-            "spread_bps, provenance FROM canonical_bars "
-            "WHERE venue=? AND symbol=? AND ABS(timeframe_h - ?) < 1e-6"
+            "spread_bps, provenance, source_fingerprint, session_tag, premium_basis_bps, "
+            "contract_multiplier FROM canonical_bars "
+            "WHERE venue=? AND symbol=? AND timeframe_sec=?"
         )
-        params: list[Any] = [venue, symbol, float(timeframe_h)]
+        params: list[Any] = [venue, symbol, tf_sec]
         if start_ms is not None:
             sql += " AND ts_event_ms >= ?"
             params.append(int(start_ms))
@@ -402,6 +376,11 @@ class MultiAssetDataLake:
                 carry_interval_h=float(r["carry_interval_h"]),
                 spread_bps=float(r["spread_bps"]),
                 provenance=r["provenance"],
+                source_fingerprint=str(r["source_fingerprint"] or ""),
+                timeframe_sec=int(r["timeframe_sec"]),
+                session_tag=str(r["session_tag"] or "ALL_24_7"),
+                premium_basis_bps=float(r["premium_basis_bps"]),
+                contract_multiplier=float(r["contract_multiplier"]),
             )
             for r in rows
         ]
@@ -456,10 +435,12 @@ class MultiAssetDataLake:
 
     def save_factor_audit(self, track_name: str, dataset_sha256: str, payload: dict[str, Any]) -> str:
         now = utc_now_ms()
-        aid = f"FA-{sha256_obj({'t': track_name, 'd': dataset_sha256, 'ts': now})[:10]}"
+        nonce = uuid.uuid4().hex[:8]
+        aid = f"FA-{sha256_obj({'t': track_name, 'd': dataset_sha256, 'ts': now, 'n': nonce})[:12]}"
         with transaction(self.conn):
             self.conn.execute(
-                "INSERT INTO factor_audits (audit_id, created_ts_ms, track_name, dataset_sha256, payload_json) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO factor_audits (audit_id, created_ts_ms, track_name, dataset_sha256, payload_json) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (aid, now, track_name, dataset_sha256, json.dumps(payload, sort_keys=True)),
             )
         return aid
@@ -473,10 +454,12 @@ class MultiAssetDataLake:
         payload: dict[str, Any],
     ) -> str:
         now = utc_now_ms()
-        sid = f"REG-{sha256_obj({'v': venue, 's': symbol, 'r': regime_label, 'ts': now})[:10]}"
+        nonce = uuid.uuid4().hex[:8]
+        sid = f"REG-{sha256_obj({'v': venue, 's': symbol, 'r': regime_label, 'ts': now, 'n': nonce})[:12]}"
         with transaction(self.conn):
             self.conn.execute(
-                "INSERT INTO regime_snapshots (snapshot_id, created_ts_ms, venue, symbol, timeframe_h, regime_label, payload_json) "
+                "INSERT OR REPLACE INTO regime_snapshots "
+                "(snapshot_id, created_ts_ms, venue, symbol, timeframe_h, regime_label, payload_json) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (sid, now, venue, symbol, float(timeframe_h), regime_label, json.dumps(payload, sort_keys=True)),
             )
@@ -491,10 +474,12 @@ class MultiAssetDataLake:
         payload: dict[str, Any],
     ) -> str:
         now = utc_now_ms()
-        bid = f"BP-{sha256_obj({'t': track_name, 'a': archetype, 'd': dataset_sha256, 'ts': now})[:10]}"
+        nonce = uuid.uuid4().hex[:8]
+        bid = f"BP-{sha256_obj({'t': track_name, 'a': archetype, 'd': dataset_sha256, 'ts': now, 'n': nonce})[:12]}"
         with transaction(self.conn):
             self.conn.execute(
-                "INSERT INTO strategy_blueprints (blueprint_id, created_ts_ms, track_name, archetype, verdict, dataset_sha256, payload_json) "
+                "INSERT OR REPLACE INTO strategy_blueprints "
+                "(blueprint_id, created_ts_ms, track_name, archetype, verdict, dataset_sha256, payload_json) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (bid, now, track_name, archetype, verdict, dataset_sha256, json.dumps(payload, sort_keys=True)),
             )
@@ -503,13 +488,13 @@ class MultiAssetDataLake:
     def summary_stats(self) -> dict[str, Any]:
         rows = self.conn.fetch_all(
             """
-            SELECT asset_class, venue, symbol, timeframe_h,
+            SELECT asset_class, venue, symbol, timeframe_h, timeframe_sec,
                    COUNT(*) AS n_bars,
                    MIN(ts_event_ms) AS min_ts,
                    MAX(ts_event_ms) AS max_ts
             FROM canonical_bars
-            GROUP BY asset_class, venue, symbol, timeframe_h
-            ORDER BY asset_class, venue, symbol, timeframe_h
+            GROUP BY asset_class, venue, symbol, timeframe_h, timeframe_sec
+            ORDER BY asset_class, venue, symbol, timeframe_sec
             """
         )
         return {
@@ -522,127 +507,7 @@ class MultiAssetDataLake:
         self.conn.close()
 
 
-def audit_bars_quality(
-    bars: list[CanonicalBar],
-    calendar: TradingCalendar,
-    dataset_label: str = "dataset",
-    min_bars: int = 40,
-    allow_synthetic_in_test: bool = False,
-) -> MultiAssetDQReport:
-    """Multi-Asset Data Quality Certification (DQ-MA-01 .. DQ-MA-06)."""
-    ds_sha, prov, row_count = fingerprint_canonical_bars(bars)
-    asset_class = bars[0].asset_class if bars else "UNKNOWN"
-    prov_parts = set(prov.split("+")) if prov and prov != "EMPTY" else set()
-
-    dq1_ok = (
-        row_count >= min_bars
-        and bool(ds_sha)
-        and (
-            (bool(prov_parts) and prov_parts.issubset(ALLOWED_REAL_PROVENANCES))
-            or allow_synthetic_in_test
-        )
-    )
-
-    ordered = sorted(bars, key=lambda b: b.ts_event_ms)
-    non_monotonic = 0
-    pit_violations = 0
-    invalid_ohlc = 0
-    max_gap_h = 0.0
-    max_jump_pct = 0.0
-    flat_streak = 0
-    max_flat_streak = 0
-
-    prev: CanonicalBar | None = None
-    for b in ordered:
-        ok, _ = validate_canonical_bar(b)
-        if not ok:
-            invalid_ohlc += 1
-        if b.ts_avail_ms < b.ts_event_ms:
-            pit_violations += 1
-        if b.high == b.low and b.open == b.close:
-            flat_streak += 1
-            if flat_streak > max_flat_streak:
-                max_flat_streak = flat_streak
-        else:
-            flat_streak = 0
-        if prev is not None:
-            if b.ts_event_ms <= prev.ts_event_ms:
-                non_monotonic += 1
-            else:
-                gap_h = (b.ts_event_ms - prev.ts_event_ms) / float(HOUR_MS)
-                if gap_h > max_gap_h:
-                    max_gap_h = gap_h
-            if prev.close > 0:
-                jump = abs(b.close / prev.close - 1.0) * 100.0
-                if jump > max_jump_pct:
-                    max_jump_pct = jump
-        prev = b
-
-    expected_step_h = ordered[0].timeframe_h if ordered else 1.0
-    gap_budget_h = max(calendar.max_expected_gap_hours, expected_step_h * 4.5)
-
-    checks = [
-        MultiAssetDQCheck(
-            gate_id="DQ-MA-01",
-            name="Provenance & Sample Floor",
-            passed=dq1_ok,
-            value=f"{prov} (n={row_count})",
-            threshold=f"REAL & n>={min_bars}",
-            detail=f"sha256={ds_sha[:12]}",
-        ),
-        MultiAssetDQCheck(
-            gate_id="DQ-MA-02",
-            name="Point-in-Time Causal Visibility",
-            passed=(pit_violations == 0 and non_monotonic == 0),
-            value=f"pit_err={pit_violations}, non_mono={non_monotonic}",
-            threshold="0 violations",
-            detail="ts_avail_ms >= ts_event_ms and strictly increasing",
-        ),
-        MultiAssetDQCheck(
-            gate_id="DQ-MA-03",
-            name="OHLCV Finite & Envelope Integrity",
-            passed=(invalid_ohlc == 0),
-            value=f"invalid={invalid_ohlc}",
-            threshold="0 invalid bars",
-            detail="Checks NaN/Inf, positive prices, high>=max(O,C), low<=min(O,C)",
-        ),
-        MultiAssetDQCheck(
-            gate_id="DQ-MA-04",
-            name="Calendar-Aware Gap Continuity",
-            passed=(max_gap_h <= gap_budget_h * 2.0),
-            value=f"max_gap={max_gap_h:.1f}h",
-            threshold=f"<={gap_budget_h * 2.0:.1f}h ({calendar.calendar_id})",
-            detail=f"timeframe={expected_step_h}h",
-        ),
-        MultiAssetDQCheck(
-            gate_id="DQ-MA-05",
-            name="Extreme Glitch Jump Guard",
-            passed=(max_jump_pct <= 80.0),
-            value=f"max_bar_jump={max_jump_pct:.2f}%",
-            threshold="<=80.0%",
-            detail="Blocks 10x decimal/currency corruption spikes",
-        ),
-        MultiAssetDQCheck(
-            gate_id="DQ-MA-06",
-            name="Frozen Feed Guard",
-            passed=(max_flat_streak <= max(12, int(round(row_count * 0.10)))),
-            value=f"max_flat_streak={max_flat_streak}",
-            threshold="<=max(12, 10% bars)",
-            detail="Detects dead/frozen price feeds",
-        ),
-    ]
-    return MultiAssetDQReport(
-        dataset_label=dataset_label,
-        asset_class=asset_class,
-        row_count=row_count,
-        dataset_sha256=ds_sha,
-        provenance=prov,
-        passed=all(c.passed for c in checks),
-        checks=checks,
-    )
-
-
-def _quick_adx14(bars: list[CanonicalBar]) -> float:
+def _quick_adx14(bars: Sequence[CanonicalBar]) -> float:
     """Compute final Wilder ADX(14) cleanly for dual-source arbitration."""
     if len(bars) < 30:
         return 0.0
@@ -686,8 +551,8 @@ def _quick_adx14(bars: list[CanonicalBar]) -> float:
 
 
 def audit_cross_source_divergence(
-    bars_a: list[CanonicalBar],
-    bars_b: list[CanonicalBar],
+    bars_a: Sequence[CanonicalBar],
+    bars_b: Sequence[CanonicalBar],
     label_a: str = "PAXG",
     label_b: str = "GC=F",
 ) -> CrossSourceDivergenceReport:
@@ -725,14 +590,14 @@ def audit_cross_source_divergence(
             rets_a.append(math.log(ba.close / pa.close))
             rets_b.append(math.log(bb.close / pb.close))
 
-    med_basis = statistics.median(bases_bps)
+    med_basis = float(statistics.median(bases_bps))
     abs_sorted = sorted(abs(x) for x in bases_bps)
-    p95_abs = abs_sorted[min(len(abs_sorted) - 1, int(0.95 * len(abs_sorted)))]
+    p95_abs = float(abs_sorted[min(len(abs_sorted) - 1, int(0.95 * len(abs_sorted)))])
 
     corr = 0.0
     if len(rets_a) >= 5:
-        ma = statistics.mean(rets_a)
-        mb = statistics.mean(rets_b)
+        ma = sum(rets_a) / len(rets_a)
+        mb = sum(rets_b) / len(rets_b)
         va = sum((x - ma) ** 2 for x in rets_a)
         vb = sum((y - mb) ** 2 for y in rets_b)
         if va > 0 and vb > 0:
@@ -772,7 +637,7 @@ def audit_cross_source_divergence(
 
 
 class YahooFinanceCollector:
-    """STD-34 compliant public Yahoo Finance Chart JSON collector for Gold & Macro daily/1h series."""
+    """STD-34 compliant public Yahoo Finance Chart JSON collector (v3-compatible + D15d multipliers)."""
 
     BASE_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
 
@@ -809,10 +674,16 @@ class YahooFinanceCollector:
         asset_class: str = ASSET_CLASS_MACRO_INDEX,
         range_str: str = "5y",
         interval: str = "1d",
+        contract_multiplier: float | None = None,
     ) -> list[CanonicalBar]:
         """Fetch real historical OHLCV from Yahoo Finance with strict Point-in-Time ts_avail_ms."""
         tf_h = 24.0 if interval == "1d" else 1.0
         tf_ms = DAY_MS if interval == "1d" else HOUR_MS
+        mult = (
+            float(contract_multiplier)
+            if contract_multiplier is not None
+            else float(DEFAULT_CONTRACT_MULTIPLIERS.get(symbol, 1.0))
+        )
         now_ms = utc_now_ms()
         encoded_sym = urllib.parse.quote(symbol, safe="")
         url = f"{self.BASE_URL}/{encoded_sym}?range={range_str}&interval={interval}"
@@ -822,6 +693,8 @@ class YahooFinanceCollector:
             logger.warning("Yahoo returned empty chart result for %s", symbol)
             return []
         res = results[0]
+        meta = res.get("meta") or {}
+        inst_type = str(meta.get("instrumentType") or "")
         timestamps = res.get("timestamp") or []
         quotes = ((res.get("indicators") or {}).get("quote") or [{}])[0]
         opens = quotes.get("open") or []
@@ -831,7 +704,7 @@ class YahooFinanceCollector:
         vols = quotes.get("volume") or []
 
         seen: dict[int, CanonicalBar] = {}
-        for ts_s, o, h, l, c, v in zip(timestamps, opens, highs, lows, closes, vols):
+        for idx, (ts_s, o, h, l, c, v) in enumerate(zip(timestamps, opens, highs, lows, closes, vols)):
             if o is None or h is None or l is None or c is None:
                 continue
             o_f, h_f, l_f, c_f = float(o), float(h), float(l), float(c)
@@ -839,16 +712,31 @@ class YahooFinanceCollector:
                 continue
             if o_f <= 0 or h_f <= 0 or l_f <= 0 or c_f <= 0:
                 continue
-            # Normalize daily bars to UTC midnight; enforce ts_avail_ms = bar close (never peek live unclosed bar)
-            raw_ms = int(ts_s) * 1000
-            ts_ev = (raw_ms // DAY_MS) * DAY_MS if interval == "1d" else (raw_ms // HOUR_MS) * HOUR_MS
+            ts_int = int(ts_s)
+            v_f = max(0.0, float(v or 0.0))
+            if interval == "1h":
+                if ts_int % 60 != 0:
+                    continue
+                if (
+                    idx > 0
+                    and (ts_int - int(timestamps[idx - 1])) == 1800
+                    and (ts_int % 3600) == 0
+                    and v_f == 0.0
+                    and inst_type.upper() in ("ETF", "EQUITY", "INDEX")
+                ):
+                    continue
+                ts_ev = ts_int * 1000
+            else:
+                raw_ms = ts_int * 1000
+                ts_ev = (raw_ms // DAY_MS) * DAY_MS
             ts_av = ts_ev + tf_ms
             if ts_av > now_ms:
                 continue
-            # Guard tiny provider rounding anomalies in high/low envelope
+            if ts_ev in seen:
+                continue
             h_clean = max(h_f, o_f, c_f)
             l_clean = min(l_f, o_f, c_f)
-            vol_usd = max(0.0, float(v or 0.0)) * c_f
+            vol_usd = v_f * c_f * mult
             seen[ts_ev] = CanonicalBar(
                 asset_class=asset_class,
                 venue="yahoo",
@@ -864,6 +752,9 @@ class YahooFinanceCollector:
                 carry_rate_period=0.0,
                 carry_interval_h=tf_h,
                 provenance=PROVENANCE_REAL,
+                source_fingerprint=f"yahoo:v8:{symbol}:{interval}:{range_str}",
+                session_tag=classify_tradfi_session_tag(ts_ev, symbol, inst_type, tf_h),
+                contract_multiplier=mult,
             )
         return sorted(seen.values(), key=lambda x: x.ts_event_ms)
 
@@ -886,7 +777,7 @@ def ingest_real_web3_and_gold_lake(
 
     all_perp_syms = list(dict.fromkeys([s.upper() for s in web3_symbols] + ["PAXG"]))
     for sym in all_perp_syms:
-        ac = ASSET_CLASS_GOLD_PERP if sym == "PAXG" else "CRYPTO_PERP"
+        ac = ASSET_CLASS_GOLD_PERP if sym == "PAXG" else ASSET_CLASS_CRYPTO_PERP
         try:
             candles = hl.fetch_candles_1h(sym, days=crypto_days)
             funding = hl.fetch_funding_history(sym, days=crypto_days)
@@ -910,7 +801,7 @@ def ingest_real_web3_and_gold_lake(
                 )
                 for c in candles
             ]
-            acc, rej = lake.upsert_bars(cbars)
+            acc, rej = lake.upsert_bars(cbars, allow_synthetic_in_test=False)
             summary["web3_hl"][sym] = {"bars_1h": acc, "rejected": rej, "funding_bars": len(funding)}
         except Exception as exc:
             msg = f"HL fetch failed for {sym}: {exc}"
@@ -941,7 +832,7 @@ def ingest_real_web3_and_gold_lake(
                     )
                     for c in gcandles
                 ]
-                acc, rej = lake.upsert_bars(gcbars)
+                acc, rej = lake.upsert_bars(gcbars, allow_synthetic_in_test=False)
                 summary["web3_gate"][sym] = {"bars_1h": acc, "rejected": rej, "funding_bars": len(gfunding)}
             except Exception as exc:
                 msg = f"Gate fetch failed for {sym}: {exc}"
@@ -952,7 +843,7 @@ def ingest_real_web3_and_gold_lake(
         ac = ASSET_CLASS_GOLD_TRADFI if msym in ("GC=F", "GLD") else ASSET_CLASS_MACRO_INDEX
         try:
             mbars = yahoo.fetch_bars(msym, asset_class=ac, range_str=gold_macro_range, interval="1d")
-            acc, rej = lake.upsert_bars(mbars)
+            acc, rej = lake.upsert_bars(mbars, allow_synthetic_in_test=False)
             summary["gold_macro_yahoo"][msym] = {"bars_1d": acc, "rejected": rej}
             time.sleep(0.15)
         except Exception as exc:
