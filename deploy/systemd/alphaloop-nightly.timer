@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily timer for AlphaLoop v2.2 Nightly Strategy Factory (01:15 UTC)
+
+[Timer]
+OnCalendar=*-*-* 01:15:00 UTC
+RandomizedDelaySec=180
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=AlphaLoop v2.2 Always-On Shadow Portfolio Daemon (SHADOW_DRY_RUN ONLY)
+After=network-online.target alphaloop-bbo.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alphaloop
+Group=alphaloop
+WorkingDirectory=/opt/alphaloop
+EnvironmentFile=-/opt/alphaloop/.env
+ExecStart=/usr/bin/python3 -u /opt/alphaloop/scripts/run_shadow_daemon.py --data-dir /opt/alphaloop/data --bootstrap-balanced --interval-sec 30
+Restart=on-failure
+RestartSec=15
+MemoryMax=512M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alphaloop/data
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

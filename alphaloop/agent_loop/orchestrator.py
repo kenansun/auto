@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 PROPOSER_SYSTEM_PROMPT = (
     "You are a quantitative strategy researcher. Given compact telemetry diagnostics, plugin metadata, "
     "and current StrategyConfig, output a single JSON object with keys: hypothesis (str), "
-    "economic_rationale (str), param_changes (dict of allowed numeric/bool fields), kill_criteria (str). "
+    "economic_rationale (str), param_changes (dict of allowed numeric fields), kill_criteria (str). "
     "Focus on fixing the exact diagnosed failure mode without overfitting."
 )
 
@@ -312,25 +312,50 @@ class AgentEvolutionOrchestrator:
         feedback: FeedbackEvent,
         metrics: BacktestMetrics,
     ) -> AgentProposal:
+        import math
+
         now = utc_now_ms()
+        bounds = plugin.mutable_param_bounds()
         payload = {
             "plugin": plugin.metadata(),
             "feedback": feedback.to_dict(),
             "current_config": cfg.to_dict(),
-            "allowed_bounds": plugin.mutable_param_bounds(),
+            "allowed_bounds": bounds,
         }
         llm_out, model_used = self.router.invoke_json("QUANT_HYPOTHESIS", PROPOSER_SYSTEM_PROMPT, payload)
-        if llm_out and isinstance(llm_out.get("param_changes"), dict):
-            return AgentProposal(
-                proposal_id=f"PROP-{sha256_obj({'t': now, 'm': model_used})[:8]}",
-                ts_ms=now,
-                model_used=model_used,
-                role="QUANT_HYPOTHESIS",
-                hypothesis=str(llm_out.get("hypothesis", "")),
-                economic_rationale=str(llm_out.get("economic_rationale", "")),
-                param_changes=dict(llm_out["param_changes"]),
-                kill_criteria=str(llm_out.get("kill_criteria", "Any G1-G6 failure")),
+        if isinstance(llm_out, dict) and isinstance(llm_out.get("param_changes"), dict):
+            raw_changes = llm_out["param_changes"]
+            sanitized: dict[str, Any] = {}
+            rejected_keys: list[str] = []
+            for k, v in raw_changes.items():
+                if k not in bounds:
+                    rejected_keys.append(str(k))
+                    continue
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+                    rejected_keys.append(str(k))
+                    continue
+                lo, hi = bounds[k]
+                if float(v) < float(lo) or float(v) > float(hi):
+                    rejected_keys.append(f"{k}={v}∉[{lo},{hi}]")
+                    continue
+                sanitized[k] = v
+
+            if sanitized and not rejected_keys:
+                return AgentProposal(
+                    proposal_id=f"PROP-{sha256_obj({'t': now, 'm': model_used})[:8]}",
+                    ts_ms=now,
+                    model_used=model_used,
+                    role="QUANT_HYPOTHESIS",
+                    hypothesis=str(llm_out.get("hypothesis", "")),
+                    economic_rationale=str(llm_out.get("economic_rationale", "")),
+                    param_changes=sanitized,
+                    kill_criteria=str(llm_out.get("kill_criteria", "Any G1-G6 failure")),
+                )
+            logger.warning(
+                "LLM proposal rejected fail-closed (invalid/out-of-bounds keys=%s); falling back deterministically",
+                rejected_keys or ["EMPTY_CHANGES"],
             )
+            model_used = f"deterministic-fallback(sanitized_reject={model_used})"
 
         changes, hyp, econ, kill = plugin.fallback_proposal(cfg, feedback, metrics)
         return AgentProposal(
@@ -355,6 +380,8 @@ class AgentEvolutionOrchestrator:
     ) -> RedTeamVerdict:
         now = utc_now_ms()
         rt_spec = self.router.select_red_team_route(proposer_family)
+        if rt_spec.family == proposer_family:
+            raise RuntimeError(f"Cross-family Red-Team violation: proposer={proposer_family} == critic={rt_spec.family}")
         compact_diff = {
             k: {"before": getattr(base_cfg, k), "after": getattr(cand_cfg, k)}
             for k in cand_cfg.to_dict()
@@ -387,12 +414,23 @@ class AgentEvolutionOrchestrator:
             decision = str(llm_out["decision"])
             if (not verdict.overall_pass or cand_m.liquidation_count > 0) and decision == "APPROVE_SHADOW":
                 decision = "REJECT"
+            raw_findings = llm_out.get("findings", [])
+            if isinstance(raw_findings, list):
+                clean_findings = [f for f in raw_findings if isinstance(f, dict)]
+            else:
+                clean_findings = [
+                    {
+                        "severity": "MINOR",
+                        "item": "MALFORMED_FINDINGS",
+                        "detail": str(raw_findings)[:200],
+                    }
+                ]
             return RedTeamVerdict(
                 verdict_id=f"RT-{sha256_obj({'t': now, 'd': decision})[:8]}",
                 ts_ms=now,
                 model_used=model_used,
                 decision=decision,
-                findings=list(llm_out.get("findings", [])),
+                findings=clean_findings,
                 summary=str(llm_out.get("summary", "")),
             )
 

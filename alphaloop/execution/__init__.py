@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from alphaloop.execution.arb_executor_adapter import (
+    ADAPTER_LIVE_EXECUTION_ENABLED,
+    to_arb_audit_record_envelope,
+    to_arb_plan_risk_envelope,
+)
 from alphaloop.execution.bridge import (
     GENESIS_PREV_HASH,
     LIVE_EXECUTION_ENABLED,
@@ -15,6 +20,7 @@ from alphaloop.execution.bridge import (
 )
 
 __all__ = [
+    "ADAPTER_LIVE_EXECUTION_ENABLED",
     "GENESIS_PREV_HASH",
     "LIVE_EXECUTION_ENABLED",
     "KillTrigger",
@@ -22,6 +28,8 @@ __all__ = [
     "ExecutionPlan",
     "ExecutionKillSwitch",
     "ExecutionAuditChain",
-    "HotConfigWatcher",
     "ExecutionBridge",
+    "HotConfigWatcher",
+    "to_arb_plan_risk_envelope",
+    "to_arb_audit_record_envelope",
 ]

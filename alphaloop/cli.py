@@ -129,6 +129,25 @@ def cmd_exec_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_shadow_once(args: argparse.Namespace) -> int:
+    from alphaloop.daemon.shadow_runner import ShadowPortfolioDaemon
+
+    daemon = ShadowPortfolioDaemon(args.data_dir)
+    try:
+        summary = daemon.run_once(collect_live=bool(args.collect_live))
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+    finally:
+        daemon.close()
+    return 0
+
+
+def cmd_shadow_parity(args: argparse.Namespace) -> int:
+    ctx = ConsoleAppContext(args.data_dir)
+    print(json.dumps(ctx.read_shadow_parity_snapshot(), indent=2, ensure_ascii=False))
+    ctx.close()
+    return 0
+
+
 def cmd_plugins(_args: argparse.Namespace) -> int:
     reg = default_registry()
     print(json.dumps(reg.list_plugins(), indent=2, ensure_ascii=False))
@@ -236,7 +255,14 @@ def main(argv: list[str] | None = None) -> int:
     pex = sub.add_parser("exec-status", help="Inspect Shadow Execution Bridge audit chain & kill switch status")
     pex.set_defaults(func=cmd_exec_status)
 
-    ppl = sub.add_parser("plugins", help="List registered Strategy Factory v2.1 plugins")
+    pso = sub.add_parser("shadow-once", help="Run one SHADOW_DRY_RUN cycle and update shadow_parity_report.json")
+    pso.add_argument("--collect-live", action="store_true", help="Also collect live exchange BBO before stepping")
+    pso.set_defaults(func=cmd_shadow_once)
+
+    psp = sub.add_parser("shadow-parity", help="Print latest Shadow-vs-Backtest parity report JSON")
+    psp.set_defaults(func=cmd_shadow_parity)
+
+    ppl = sub.add_parser("plugins", help="List registered Strategy Factory v2.2 plugins")
     ppl.set_defaults(func=cmd_plugins)
 
     pmr = sub.add_parser("micro-run", help="Evaluate captured BBO window via Fast Micro-Run state machine")

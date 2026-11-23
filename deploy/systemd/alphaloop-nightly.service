@@ -1,0 +1,19 @@
+[Unit]
+Description=AlphaLoop v2.2 Nightly Incremental Backfill & 6-Gate Factory Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=alphaloop
+Group=alphaloop
+WorkingDirectory=/opt/alphaloop
+EnvironmentFile=-/opt/alphaloop/.env
+ExecStart=/usr/bin/python3 -u /opt/alphaloop/scripts/run_nightly_factory.py --data-dir /opt/alphaloop/data --days 3
+MemoryMax=768M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alphaloop/data
+StandardOutput=journal
+StandardError=journal

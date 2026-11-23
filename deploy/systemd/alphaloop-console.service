@@ -1,0 +1,23 @@
+[Unit]
+Description=AlphaLoop v2.2 Local Strategy R&D Web Console (Loopback Only 127.0.0.1:8796)
+After=network-online.target
+
+[Service]
+Type=simple
+User=alphaloop
+Group=alphaloop
+WorkingDirectory=/opt/alphaloop
+EnvironmentFile=-/opt/alphaloop/.env
+ExecStart=/usr/bin/python3 -m alphaloop.cli --data-dir /opt/alphaloop/data serve --host 127.0.0.1 --port 8796
+Restart=on-failure
+RestartSec=10
+MemoryMax=384M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alphaloop/data
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

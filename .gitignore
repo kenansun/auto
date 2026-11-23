@@ -19,6 +19,7 @@ data/state/
 data/fleet_audit/
 data/research_run/
 data/phase2_run/
+data/phase3_research/
 data/*.json
 config/fleet_roles.json
 .DS_Store

@@ -1,0 +1,24 @@
+[Unit]
+Description=AlphaLoop v2.2 4-Exchange Live BBO, Funding & 1h Candle Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alphaloop
+Group=alphaloop
+WorkingDirectory=/opt/alphaloop
+EnvironmentFile=-/opt/alphaloop/.env
+ExecStart=/usr/bin/python3 -u /opt/alphaloop/scripts/run_bbo_collector.py --db /opt/alphaloop/data/market_data.sqlite --symbols PAXG,BTC,ETH,SOL,XRP,DOGE,AVAX,LINK,AAVE,UNI,SUI,HYPE,LTC,ADA,APT,ARB,ENA,NEAR,OP,PENDLE,TIA,VVV,WLD,ZEC --duration-minutes 0 --interval-sec 20 --with-live-funding --with-live-candles
+Restart=always
+RestartSec=15
+MemoryMax=384M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alphaloop/data
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

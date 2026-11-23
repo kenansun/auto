@@ -415,6 +415,7 @@ class HotConfigWatcher:
         self.kill_switch = kill_switch
         self._lock = threading.RLock()
         self._fingerprints: dict[str, tuple[int, str]] = {}  # filename -> (mtime_ns, sha256)
+        self._corrupt_seen: dict[str, tuple[int, int]] = {}  # filename -> (mtime_ns, st_size)
         self._file_to_sid: dict[str, str] = {}               # filename -> strategy_id
         self._loaded: dict[str, tuple[StrategyConfig, str]] = {}  # strategy_id -> (cfg, config_sha)
 
@@ -430,6 +431,7 @@ class HotConfigWatcher:
         events: list[dict[str, Any]] = []
         with self._lock:
             if not self.active_dir.exists():
+                self._corrupt_seen.clear()
                 for fname in list(self._fingerprints.keys()):
                     old_sid = self._evict_file_locked(fname)
                     self.audit.append("CONFIG_REMOVED", {"file": fname, "strategy_id": old_sid or ""})
@@ -440,6 +442,8 @@ class HotConfigWatcher:
             current_names = {p.name for p in current_paths}
 
             # Evict deleted files so stale configs never linger in memory
+            for fname in sorted(set(self._corrupt_seen.keys()) - current_names):
+                self._corrupt_seen.pop(fname, None)
             for fname in sorted(set(self._fingerprints.keys()) - current_names):
                 old_sid = self._evict_file_locked(fname)
                 self.audit.append("CONFIG_REMOVED", {"file": fname, "strategy_id": old_sid or ""})
@@ -447,15 +451,23 @@ class HotConfigWatcher:
 
             for path in current_paths:
                 # Reject symlinks and oversized files BEFORE reading bytes
+                sig: tuple[int, int] | None = None
                 try:
+                    st = path.lstat()
+                    sig = (st.st_mtime_ns, st.st_size)
                     if path.is_symlink():
                         raise ValueError("Symlink refused in active_configs")
-                    st = path.lstat()
                     if st.st_size > MAX_CONFIG_BYTES:
                         raise ValueError(f"Config exceeds {MAX_CONFIG_BYTES}B limit ({st.st_size}B)")
+                    if self._corrupt_seen.get(path.name) == sig:
+                        continue
                     raw = path.read_bytes()
                 except Exception as exc:
                     self._evict_file_locked(path.name)
+                    if sig is not None and self._corrupt_seen.get(path.name) == sig:
+                        continue
+                    if sig is not None:
+                        self._corrupt_seen[path.name] = sig
                     self.kill_switch.engage(
                         KillTrigger.CONFIG_CORRUPT,
                         actor="hot_config_watcher",
@@ -489,6 +501,8 @@ class HotConfigWatcher:
                     cfg_sha = computed_sha
                 except Exception as exc:
                     self._evict_file_locked(path.name)
+                    if sig is not None:
+                        self._corrupt_seen[path.name] = sig
                     self.kill_switch.engage(
                         KillTrigger.CONFIG_CORRUPT,
                         actor="hot_config_watcher",
@@ -501,6 +515,7 @@ class HotConfigWatcher:
                     events.append({"file": path.name, "status": "CORRUPT_KILL_ENGAGED", "error": str(exc)})
                     continue
 
+                self._corrupt_seen.pop(path.name, None)
                 self._fingerprints[path.name] = (st.st_mtime_ns, fsha)
                 self._file_to_sid[path.name] = cfg.strategy_id
                 self._loaded[cfg.strategy_id] = (cfg, cfg_sha)
@@ -526,6 +541,10 @@ class HotConfigWatcher:
     def get_loaded(self, strategy_id: str) -> tuple[StrategyConfig, str] | None:
         with self._lock:
             return self._loaded.get(strategy_id)
+
+    def all_loaded(self) -> dict[str, StrategyConfig]:
+        with self._lock:
+            return {sid: cfg for sid, (cfg, _sha) in self._loaded.items()}
 
 
 class ExecutionBridge:

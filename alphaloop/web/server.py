@@ -62,11 +62,15 @@ CONSOLE_HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <h1>AlphaLoop v2.1 — Strategy Factory, Portfolio Combiner, DQ-01..08 Gate &amp; Shadow Execution Bridge</h1>
+  <h1>AlphaLoop v2.2 — Strategy Factory, Portfolio Combiner, DQ-01..08 Gate &amp; Always-On Shadow Parity</h1>
   <div><span id="healthBadge" class="badge">Loading...</span> <button class="sec" id="refreshBtn" type="button">Refresh</button></div>
 </header>
 <main>
   <div class="grid" id="kpiGrid"></div>
+  <div class="card">
+    <h2>Live Shadow Parity &amp; Drift Guard (SHADOW_DRY_RUN vs Backtest)</h2>
+    <div id="shadowParityBox">Loading...</div>
+  </div>
   <div class="card">
     <h2>Multi-Pillar Portfolio Scorecard &amp; Capacity Scaling (PortfolioCombiner)</h2>
     <div id="portfolioBox">Loading...</div>
@@ -76,7 +80,7 @@ CONSOLE_HTML = """<!doctype html>
     <div id="execBox">Loading...</div>
   </div>
   <div class="card">
-    <h2>Strategy Factory v2.1 Plugins (Pluggable Alpha Registry)</h2>
+    <h2>Strategy Factory v2.2 Plugins (Pluggable Alpha Registry)</h2>
     <div id="pluginsBox">Loading...</div>
   </div>
   <div class="card">
@@ -135,11 +139,12 @@ document.getElementById('strategiesBox').addEventListener('click', function(ev){
 });
 async function refreshAll(){
   try{
-    const [h,s,c,m,t,mk,pl,dq,mr,fl,pf,ex]=await Promise.all([
+    const [h,s,c,m,t,mk,pl,dq,mr,fl,pf,ex,sp]=await Promise.all([
       getJson('/api/health'),getJson('/api/strategies'),getJson('/api/cycles'),
       getJson('/api/models'),getJson('/api/trials'),getJson('/api/market/summary'),
       getJson('/api/plugins'),getJson('/api/dq/reports'),getJson('/api/micro-runs'),
-      getJson('/api/fleet/audit'),getJson('/api/portfolio'),getJson('/api/execution/plans')
+      getJson('/api/fleet/audit'),getJson('/api/portfolio'),getJson('/api/execution/plans'),
+      getJson('/api/shadow/parity')
     ]);
     document.getElementById('healthBadge').textContent='ONLINE | '+h.status+' | '+h.service+' | '+new Date(h.ts_ms).toISOString();
     const totalFundingRows=(mk.funding||[]).reduce((a,x)=>a+x.rows,0);
@@ -150,9 +155,17 @@ async function refreshAll(){
       ['Real Funding Rows', totalFundingRows.toLocaleString()],
       ['Live BBO Ticks', totalBboRows.toLocaleString()],
       ['DQ Certificates', (dq.reports||[]).length],
+      ['Shadow Parity', sp.valid ? (sp.status||'OK') : 'IDLE'],
       ['Shadow Audit Seq', '#'+(ex.audit_head_seq??0)+' ('+(ex.audit_chain_valid?'VALID':'BROKEN')+')'],
       ['Fleet Reachable', (fl.nodes_reachable??0)+'/'+(fl.nodes_total??0)]
     ].map(([k,v])=>'<div class="card"><h2>'+esc(k)+'</h2><div style="font-size:22px;font-weight:700">'+esc(v)+'</div></div>').join('');
+
+    if(sp.valid){
+      const spRows=(sp.strategies||[]).map(x=>'<tr><td><b>'+esc(x.strategy_id)+'</b>@'+esc(x.version)+'</td><td>'+esc(x.plugin_id)+'</td><td>$'+esc(x.shadow_equity_usd)+' ('+esc(x.shadow_return_pct)+'%)</td><td>'+esc(x.backtest_return_pct)+'%</td><td class="'+(Math.abs(x.drift_bps||0)<=150?'ok':'bad')+'">'+esc(x.drift_bps)+' bp</td><td class="'+((x.spread_ratio||0)<=1.5?'ok':'warn')+'">'+esc(x.live_median_half_spread_bps)+'bp ('+esc(x.spread_ratio)+'x)</td><td>'+esc(x.plans_created)+' / '+esc(x.plans_blocked)+'</td><td class="'+(x.status==='PARITY_OK'?'ok':(x.status==='WARN_WIDE_SPREAD'?'warn':'bad'))+'">'+esc(x.status)+'</td></tr>').join('');
+      document.getElementById('shadowParityBox').innerHTML='<div style="margin-bottom:8px">Status: <b class="'+(sp.status==='PARITY_OK'?'ok':(sp.status==='DEGRADED_HALT'?'warn':'bad'))+'">'+esc(sp.status)+'</b> | BBO Age: <b>'+esc(sp.bbo_freshness_sec)+'s</b> | Live Enabled: <b>'+esc(sp.live_execution_enabled)+'</b> | Trace: <code>'+esc(sp.trace_id||'')+'</code></div><table><thead><tr><th>Strategy</th><th>Plugin</th><th>Shadow Equity</th><th>Backtest Ret</th><th>Drift</th><th>Live Spread</th><th>Plans (OK/Blk)</th><th>Parity</th></tr></thead><tbody>'+(spRows||'<tr><td colspan="8">No active SHADOW_LIVE strategies evaluated yet</td></tr>')+'</tbody></table>';
+    }else{
+      document.getElementById('shadowParityBox').innerHTML='<span class="warn">'+esc(sp.error||'Shadow daemon has not written shadow_parity_report.json yet')+'</span>';
+    }
 
     if(pf.valid){
       const scRows=(pf.scaling_projections||[]).map(x=>'<tr><td>$'+esc(x.capital_usd)+'</td><td>'+esc(x.gross_backtest_apr_pct)+'%</td><td>-'+esc(x.capacity_impact_drag_apr_pct)+'%</td><td class="'+(x.net_capacity_adjusted_apr_pct>0?'ok':'bad')+'"><b>'+esc(x.net_capacity_adjusted_apr_pct)+'%</b></td><td>$'+esc(x.est_monthly_net_usd)+'/mo</td></tr>').join('');
@@ -214,7 +227,7 @@ class ConsoleAppContext:
         self.exec_bridge = ExecutionBridge(self.data_dir / "state")
         self.backtester = FundingCarryBacktester(self.store)
         self.verifier = SixGateVerifier(self.backtester, self.ledger, registry=self.registry)
-        self.router = MultiModelRouter()
+        self.router = MultiModelRouter(budget_db_path=str(self.data_dir / "state" / "llm_budget.sqlite"))
         self.orchestrator = AgentEvolutionOrchestrator(
             state_dir=self.data_dir / "state",
             backtester=self.backtester,
@@ -244,6 +257,22 @@ class ConsoleAppContext:
         except (OSError, json.JSONDecodeError):
             return {"valid": False, "error": "UNREADABLE_PORTFOLIO_REPORT"}
 
+    def read_shadow_parity_snapshot(self) -> dict[str, Any]:
+        snap = self.data_dir / "shadow_parity_report.json"
+        if not snap.exists():
+            return {
+                "valid": False,
+                "live_execution_enabled": False,
+                "run_mode": "SHADOW_DRY_RUN",
+                "error": "NO_SHADOW_PARITY_REPORT_SAVED",
+                "strategies": [],
+            }
+        try:
+            data = json.loads(snap.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {"valid": False, "error": "INVALID_SHADOW_PARITY_REPORT"}
+        except (OSError, json.JSONDecodeError):
+            return {"valid": False, "error": "UNREADABLE_SHADOW_PARITY_REPORT"}
+
     def close(self) -> None:
         self.store.close()
         self.ledger.close()
@@ -251,6 +280,7 @@ class ConsoleAppContext:
         self.micro_store.close()
         self.exec_bridge.close()
         self.orchestrator.close()
+        self.router.close()
 
 
 def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
@@ -271,14 +301,26 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _check_loopback_host(self) -> bool:
+            bind_host = str(self.server.server_address[0])
+            if bind_host not in LOOPBACK_HOSTS:
+                return True
+            host_hdr = (self.headers.get("Host") or "").strip()
+            if not host_hdr:
+                return True
+            return bool(re.fullmatch(r"(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?", host_hdr, re.IGNORECASE))
+
         def _send_json(self, status: int, obj: Any) -> None:
-            raw = json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            raw = json.dumps(obj, sort_keys=True, ensure_ascii=False, allow_nan=False).encode("utf-8")
             self._send_bytes(status, "application/json; charset=utf-8", raw)
 
         def _read_body(self) -> tuple[bytes | None, int | None, str | None]:
             if self.headers.get("Transfer-Encoding"):
                 return None, 411, "CHUNKED_ENCODING_UNSUPPORTED"
-            raw_len = self.headers.get("Content-Length")
+            cl_all = self.headers.get_all("Content-Length") or []
+            if len(cl_all) > 1:
+                return None, 400, "DUPLICATE_CONTENT_LENGTH"
+            raw_len = cl_all[0] if cl_all else None
             if raw_len is None:
                 return b"", None, None
             try:
@@ -293,12 +335,15 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802
             try:
+                if not self._check_loopback_host():
+                    self._send_json(403, {"error": "FORBIDDEN_HOST_HEADER"})
+                    return
                 path = urlparse(self.path).path
                 if path in ("/", "/index.html"):
                     self._send_bytes(200, "text/html; charset=utf-8", CONSOLE_HTML.encode("utf-8"))
                     return
                 if path == "/api/health":
-                    self._send_json(200, {"status": "HEALTHY", "service": "alphaloop-v2.1", "ts_ms": utc_now_ms()})
+                    self._send_json(200, {"status": "HEALTHY", "service": "alphaloop-v2.2", "ts_ms": utc_now_ms()})
                     return
                 if path == "/api/plugins":
                     self._send_json(200, {"plugins": ctx.registry.list_plugins()})
@@ -317,6 +362,9 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
                     return
                 if path == "/api/portfolio":
                     self._send_json(200, ctx.read_portfolio_snapshot())
+                    return
+                if path == "/api/shadow/parity":
+                    self._send_json(200, ctx.read_shadow_parity_snapshot())
                     return
                 if path == "/api/execution/plans":
                     self._send_json(200, ctx.exec_bridge.summary())
@@ -347,6 +395,9 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             try:
+                if not self._check_loopback_host():
+                    self._send_json(403, {"error": "FORBIDDEN_HOST_HEADER"})
+                    return
                 path = urlparse(self.path).path
                 # CSRF Defense (Red-Team #11): require JSON Content-Type and loopback Origin if sent
                 ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()

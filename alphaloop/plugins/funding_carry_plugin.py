@@ -296,6 +296,26 @@ class FundingCarryPlugin(BaseStrategyPlugin):
 
         apr_a = latest_apr.get((cfg.venue_a, sym))
         apr_b = latest_apr.get((cfg.venue_b, sym))
+        if event.kind == "FUNDING" and sym in open_pos and apr_a is not None and apr_b is not None:
+            pos = open_pos[sym]
+            held_h = (event.ts_ms - int(pos.get("entry_ts_ms", event.ts_ms))) / 3_600_000.0
+            signed_spread = (apr_a - apr_b) if pos["direction"] == "SHORT_A_LONG_B" else (apr_b - apr_a)
+            if held_h >= float(cfg.min_hold_hours):
+                if signed_spread < float(cfg.exit_spread_apr_pct):
+                    low_since = pos.get("low_since_ms")
+                    if low_since is None:
+                        pos["low_since_ms"] = int(event.ts_ms)
+                        low_since = int(event.ts_ms)
+                    low_h = (int(event.ts_ms) - int(low_since)) / 3_600_000.0
+                    if low_h >= float(cfg.exit_confirm_hours):
+                        intents.append(
+                            OrderIntent(cfg.strategy_id, sym, "CLOSE", pos["notional_usd"], signed_spread, "HYSTERESIS_EXIT", event.ts_ms)
+                        )
+                        open_pos.pop(sym, None)
+                        return intents
+                else:
+                    pos["low_since_ms"] = None
+
         # Red-Team BLOCKER #3: NEVER open a carry position before BOTH venues have valid live BBO prices!
         if (
             px_a is not None
@@ -322,6 +342,7 @@ class FundingCarryPlugin(BaseStrategyPlugin):
                     "entry_px_a": px_a,
                     "entry_px_b": px_b,
                     "entry_ts_ms": event.ts_ms,
+                    "low_streak": 0,
                 }
                 intents.append(OrderIntent(cfg.strategy_id, sym, action, notional, abs(spread), "FUNDING_SPREAD_ENTRY", event.ts_ms))
         return intents
