@@ -273,6 +273,18 @@ class SixGateVerifier:
                 persist=True,
                 provenance=csv_prov,
             )
+        elif cfg.mode == "single_venue_perp" or cfg.venue_a == cfg.venue_b:
+            ref_v = str(cfg.params.get("ref_venue", "")).strip() or None
+            dq_report = self.dq_auditor.audit_single_venue_perp(
+                cfg.venue_a,
+                list(cfg.symbols),
+                start_ms=start_ms,
+                end_ms=end_ms,
+                ref_venue=ref_v,
+                dataset_name=f"{cfg.strategy_id}@{cfg.version}",
+                persist=True,
+                allow_synthetic_in_unit_test=allow_synthetic_in_unit_test,
+            )
         else:
             vb_dq = f"{cfg.venue_a}_spot" if cfg.mode == "spot_perp" else cfg.venue_b
             dq_report = self.dq_auditor.audit_funding_pair(

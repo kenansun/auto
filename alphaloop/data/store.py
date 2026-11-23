@@ -22,6 +22,7 @@ class MarketDataStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.conn = connect_wal(self.db_path)
+        self._fp_cache: dict[tuple[Any, ...], tuple[str, str, int]] = {}
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -299,29 +300,63 @@ class MarketDataStore:
         start_ms: int | None = None,
         end_ms: int | None = None,
     ) -> tuple[str, str, int]:
-        """Compute deterministic SHA-256 & provenance across BOTH funding_rates and candles_1h."""
-        h = hashlib.sha256()
-        provs: set[str] = set()
-        count = 0
-        for v in sorted(set(venues)):
-            for s in sorted(set(symbols)):
-                bars = self.load_funding(v, s, start_ms, end_ms)
-                for b in bars:
-                    provs.add(b.provenance)
-                    h.update(f"F|{b.venue}|{b.symbol}|{b.ts_ms}|{b.funding_rate:.10f}|{b.interval_hours}\n".encode())
-                    count += 1
-                cbars = self.load_candles(v, s, start_ms, end_ms)
-                for c in cbars:
-                    provs.add(c.provenance)
-                    h.update(f"C|{c.venue}|{c.symbol}|{c.ts_ms}|{c.open:.8f}|{c.high:.8f}|{c.low:.8f}|{c.close:.8f}\n".encode())
-                    count += 1
-        if not provs:
-            prov = "EMPTY_DATASET"
-        elif provs == {PROVENANCE_REAL}:
-            prov = PROVENANCE_REAL
-        else:
-            prov = "+".join(sorted(provs))
-        return h.hexdigest(), prov, count
+        """Compute deterministic SHA-256 & provenance across BOTH funding_rates and candles_1h (snapshot-consistent)."""
+        v_key = tuple(sorted(set(venues)))
+        s_key = tuple(sorted(set(symbols)))
+        with self.conn.lock:
+            for _attempt in range(3):
+                dv_row = self.conn.execute("PRAGMA data_version").fetchone()
+                data_ver = int(dv_row[0]) if dv_row else 0
+                total_ch = int(self.conn.total_changes)
+                cache_key = (v_key, s_key, start_ms, end_ms, data_ver, total_ch)
+                cached = self._fp_cache.get(cache_key)
+                if cached is not None:
+                    return cached
+
+                # Read inside a single SQLite read transaction when not already inside a write tx
+                started_read_tx = False
+                if not self.conn.in_transaction:
+                    self.conn.execute("BEGIN DEFERRED;")
+                    started_read_tx = True
+                try:
+                    h = hashlib.sha256()
+                    provs: set[str] = set()
+                    count = 0
+                    for v in v_key:
+                        for s in s_key:
+                            bars = self.load_funding(v, s, start_ms, end_ms)
+                            for b in bars:
+                                provs.add(b.provenance)
+                                h.update(f"F|{b.venue}|{b.symbol}|{b.ts_ms}|{b.funding_rate:.10f}|{b.interval_hours}\n".encode())
+                                count += 1
+                            cbars = self.load_candles(v, s, start_ms, end_ms)
+                            for c in cbars:
+                                provs.add(c.provenance)
+                                h.update(f"C|{c.venue}|{c.symbol}|{c.ts_ms}|{c.open:.8f}|{c.high:.8f}|{c.low:.8f}|{c.close:.8f}\n".encode())
+                                count += 1
+                finally:
+                    if started_read_tx and self.conn.in_transaction:
+                        self.conn.execute("COMMIT;")
+
+                dv_after_row = self.conn.execute("PRAGMA data_version").fetchone()
+                data_ver_after = int(dv_after_row[0]) if dv_after_row else 0
+                total_ch_after = int(self.conn.total_changes)
+
+                if not provs:
+                    prov = "EMPTY_DATASET"
+                elif provs == {PROVENANCE_REAL}:
+                    prov = PROVENANCE_REAL
+                else:
+                    prov = "+".join(sorted(provs))
+                res = (h.hexdigest(), prov, count)
+
+                if data_ver_after == data_ver and total_ch_after == total_ch:
+                    if len(self._fp_cache) >= 64:
+                        self._fp_cache.clear()
+                    self._fp_cache[cache_key] = res
+                    return res
+                # Concurrent external writer committed during scan; retry for an un-torn cacheable snapshot
+            return res
 
     def load_bbo_ticks(
         self,

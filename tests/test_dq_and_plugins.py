@@ -131,7 +131,7 @@ class TestDQAndPlugins(unittest.TestCase):
         """Architect P0-5 + P1-3: all 3 plugins evaluate via registry, and FUNDING_ONLY caps at MICRO_RUN_PROBE_REQUIRED."""
         reg = default_registry()
         ids = {p["plugin_id"] for p in reg.list_plugins()}
-        self.assertEqual(ids, {"funding_carry", "basis_reversion", "structural_arb"})
+        self.assertEqual(ids, {"funding_carry", "basis_reversion", "structural_arb", "trend_cta"})
 
         # Seed 2-bar persistent +35bp dislocation every 25h (survives T+1 execution lag!)
         # PLUS test that a 1-bar phantom bounce yields <= 0 basis PnL under default execution_lag_bars=1!

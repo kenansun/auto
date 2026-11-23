@@ -173,24 +173,37 @@ class MicroRunSession:
         plugin: Any,
         cfg: StrategyConfig,
     ) -> tuple[list[OrderIntent], float, float]:
-        """Replay events chronologically and compute realistic mark-to-market paper PnL & drawdown."""
+        """Replay events chronologically and compute realistic mark-to-market paper PnL & drawdown.
+
+        Returns ONLY actually executed paper intents (preventing unexecuted/dropped intents from
+        rubber-stamping COMPLETED_PASS on $0.00 PnL, Red-Team BLOCKER #3).
+        """
         state: dict[str, Any] = {}
-        intents: list[OrderIntent] = []
+        executed_intents: list[OrderIntent] = []
         latest_bbo: dict[tuple[str, str], dict[str, float]] = {}
         open_pos: dict[str, dict[str, Any]] = {}
         realized_pnl = 0.0
         peak_eq = cfg.capital_usd
         max_dd_pct = 0.0
-        fee_one_side = (cfg.fee_a_bps + cfg.fee_b_bps) / 10000.0
+        dual_fee_one_side = (cfg.fee_a_bps + cfg.fee_b_bps) / 10000.0
+        single_fee_one_side = cfg.fee_a_bps / 10000.0
 
         def _mtm_unrealized() -> float:
             unr = 0.0
             for sym, pos in open_pos.items():
                 qa = latest_bbo.get((cfg.venue_a, sym))
+                if pos.get("single_venue"):
+                    if not qa:
+                        continue
+                    if pos["action"] == "OPEN_LONG":
+                        pnl_a = ((qa["bid"] - pos["entry_a"]) / pos["entry_a"]) * pos["notional"]
+                    else:
+                        pnl_a = ((pos["entry_a"] - qa["ask"]) / pos["entry_a"]) * pos["notional"]
+                    unr += pnl_a + pos["accrued_funding"]
+                    continue
                 qb = latest_bbo.get((cfg.venue_b, sym))
                 if not qa or not qb:
                     continue
-                # Conservative mark-to-exit using bid/ask crossing
                 if pos["action"] == "OPEN_SHORT_A_LONG_B":
                     pnl_a = ((pos["entry_a"] - qa["ask"]) / pos["entry_a"]) * pos["notional"]
                     pnl_b = ((qb["bid"] - pos["entry_b"]) / pos["entry_b"]) * pos["notional"]
@@ -209,16 +222,20 @@ class MicroRunSession:
             elif ev.kind == "FUNDING" and ev.symbol in open_pos:
                 pos = open_pos[ev.symbol]
                 rate = float(ev.payload.get("funding_rate", 0.0))
-                if ev.venue == cfg.venue_a:
-                    sign = 1.0 if pos["action"] == "OPEN_SHORT_A_LONG_B" else -1.0
-                    pos["accrued_funding"] += sign * rate * pos["notional"]
-                elif ev.venue == cfg.venue_b:
-                    sign = -1.0 if pos["action"] == "OPEN_SHORT_A_LONG_B" else 1.0
-                    pos["accrued_funding"] += sign * rate * pos["notional"]
+                if pos.get("single_venue"):
+                    if ev.venue == cfg.venue_a:
+                        sign = -1.0 if pos["action"] == "OPEN_LONG" else 1.0
+                        pos["accrued_funding"] += sign * rate * pos["notional"]
+                else:
+                    if ev.venue == cfg.venue_a:
+                        sign = 1.0 if pos["action"] == "OPEN_SHORT_A_LONG_B" else -1.0
+                        pos["accrued_funding"] += sign * rate * pos["notional"]
+                    elif ev.venue == cfg.venue_b:
+                        sign = -1.0 if pos["action"] == "OPEN_SHORT_A_LONG_B" else 1.0
+                        pos["accrued_funding"] += sign * rate * pos["notional"]
 
             step_intents = plugin.on_event(ev, state, cfg)
             for intent in step_intents:
-                intents.append(intent)
                 qa = latest_bbo.get((cfg.venue_a, intent.symbol))
                 qb = latest_bbo.get((cfg.venue_b, intent.symbol))
                 if intent.action in ("OPEN_SHORT_A_LONG_B", "OPEN_LONG_A_SHORT_B"):
@@ -228,23 +245,54 @@ class MicroRunSession:
                     entry_b = qb["ask"] if intent.action == "OPEN_SHORT_A_LONG_B" else qb["bid"]
                     if entry_a > 0 and entry_b > 0:
                         notional = max(1.0, float(intent.notional_usd))
-                        realized_pnl -= notional * fee_one_side
+                        realized_pnl -= notional * dual_fee_one_side
                         open_pos[intent.symbol] = {
+                            "single_venue": False,
                             "action": intent.action,
                             "entry_a": entry_a,
                             "entry_b": entry_b,
                             "notional": notional,
                             "accrued_funding": 0.0,
                         }
-                elif intent.action == "CLOSE" and intent.symbol in open_pos and qa and qb:
-                    pos = open_pos.pop(intent.symbol)
-                    if pos["action"] == "OPEN_SHORT_A_LONG_B":
-                        pnl_a = ((pos["entry_a"] - qa["ask"]) / pos["entry_a"]) * pos["notional"]
-                        pnl_b = ((qb["bid"] - pos["entry_b"]) / pos["entry_b"]) * pos["notional"]
-                    else:
-                        pnl_a = ((qa["bid"] - pos["entry_a"]) / pos["entry_a"]) * pos["notional"]
-                        pnl_b = ((pos["entry_b"] - qb["ask"]) / pos["entry_b"]) * pos["notional"]
-                    realized_pnl += pnl_a + pnl_b + pos["accrued_funding"] - pos["notional"] * fee_one_side
+                        executed_intents.append(intent)
+                elif intent.action in ("OPEN_LONG", "OPEN_SHORT"):
+                    if intent.symbol in open_pos or not qa:
+                        continue
+                    entry_a = qa["ask"] if intent.action == "OPEN_LONG" else qa["bid"]
+                    if entry_a > 0:
+                        notional = max(1.0, float(intent.notional_usd))
+                        realized_pnl -= notional * single_fee_one_side
+                        open_pos[intent.symbol] = {
+                            "single_venue": True,
+                            "action": intent.action,
+                            "entry_a": entry_a,
+                            "entry_b": 0.0,
+                            "notional": notional,
+                            "accrued_funding": 0.0,
+                        }
+                        executed_intents.append(intent)
+                elif intent.action == "CLOSE" and intent.symbol in open_pos:
+                    pos_peek = open_pos[intent.symbol]
+                    if pos_peek.get("single_venue"):
+                        if not qa:
+                            continue
+                        pos = open_pos.pop(intent.symbol)
+                        if pos["action"] == "OPEN_LONG":
+                            pnl_a = ((qa["bid"] - pos["entry_a"]) / pos["entry_a"]) * pos["notional"]
+                        else:
+                            pnl_a = ((pos["entry_a"] - qa["ask"]) / pos["entry_a"]) * pos["notional"]
+                        realized_pnl += pnl_a + pos["accrued_funding"] - pos["notional"] * single_fee_one_side
+                        executed_intents.append(intent)
+                    elif qa and qb:
+                        pos = open_pos.pop(intent.symbol)
+                        if pos["action"] == "OPEN_SHORT_A_LONG_B":
+                            pnl_a = ((pos["entry_a"] - qa["ask"]) / pos["entry_a"]) * pos["notional"]
+                            pnl_b = ((qb["bid"] - pos["entry_b"]) / pos["entry_b"]) * pos["notional"]
+                        else:
+                            pnl_a = ((qa["bid"] - pos["entry_a"]) / pos["entry_a"]) * pos["notional"]
+                            pnl_b = ((pos["entry_b"] - qb["ask"]) / pos["entry_b"]) * pos["notional"]
+                        realized_pnl += pnl_a + pnl_b + pos["accrued_funding"] - pos["notional"] * dual_fee_one_side
+                        executed_intents.append(intent)
 
             eq = cfg.capital_usd + realized_pnl + _mtm_unrealized()
             if eq > peak_eq:
@@ -255,7 +303,7 @@ class MicroRunSession:
                     max_dd_pct = dd
 
         net_pnl = realized_pnl + _mtm_unrealized()
-        return intents, net_pnl, max_dd_pct
+        return executed_intents, net_pnl, max_dd_pct
 
     def evaluate_bbo_window(
         self,
@@ -309,11 +357,13 @@ class MicroRunSession:
                         )
                     )
         if min_ts > 0 and max_ts >= min_ts:
+            # Include causal prior 8h settlement window so short live BBO probes initialize with the latest realized funding rate
+            funding_lo = min_ts - 8 * 3600 * 1000
             for sym in cfg.symbols:
                 for v in (cfg.venue_a, cfg.venue_b):
                     if cfg.mode == "spot_perp" and v == cfg.venue_b:
                         continue
-                    for f in self.market_store.load_funding(v, sym, min_ts, max_ts):
+                    for f in self.market_store.load_funding(v, sym, funding_lo, max_ts):
                         events.append(
                             MarketEvent(
                                 kind="FUNDING",

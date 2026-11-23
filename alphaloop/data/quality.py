@@ -423,6 +423,366 @@ class DataQualityAuditor:
             self.store.save_dq_certificate(report)
         return report
 
+    def audit_single_venue_perp(
+        self,
+        venue: str,
+        symbols: list[str],
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        ref_venue: str | None = None,
+        dataset_name: str | None = None,
+        persist: bool = True,
+        allow_synthetic_in_unit_test: bool = False,
+        require_fresh_hours: float | None = None,
+        max_price_ratio_dev_pct: float = 2.5,
+    ) -> DataQualityReport:
+        """Audit a single-venue perpetual futures dataset (candles_1h + real funding_rates, DQ-01..DQ-08).
+
+        Enforces >=98% real funding-rate span coverage over the candle window so directional
+        perp strategies can never silently skip funding carry/drag accounting.
+        """
+        if self.store is None:
+            raise ValueError("MarketDataStore is required for audit_single_venue_perp")
+
+        now_ms = utc_now_ms()
+        ds_sha, prov, row_count = self.store.fingerprint_slice([venue], symbols, start_ms, end_ms)
+        checks: list[DataQualityCheck] = []
+        symbol_scores: dict[str, str] = {}
+
+        # DQ-01: Provenance & Cryptographic Fingerprint
+        prov_parts = set(prov.split("+")) if prov else set()
+        dq1_ok = (
+            row_count >= 50
+            and bool(ds_sha)
+            and (
+                (bool(prov_parts) and prov_parts.issubset(ALLOWED_REAL_PROVENANCES))
+                or allow_synthetic_in_unit_test
+            )
+        )
+        checks.append(
+            DataQualityCheck(
+                gate_id="DQ-01",
+                name="Single-Venue Perp Provenance & Fingerprint",
+                passed=dq1_ok,
+                severity="BLOCKING",
+                value=f"{prov} ({row_count} rows)",
+                threshold="REAL_EXCHANGE_API & rows>=50",
+                detail=f"sha256={ds_sha[:12]}",
+            )
+        )
+
+        candle_covs: list[float] = []
+        funding_covs: list[float] = []
+        overlap_ratios: list[float] = []
+        max_gap_ratio = 0.0
+        bad_ts_count = 0
+        non_monotonic_count = 0
+        interval_mismatches = 0
+        abs_aprs: list[float] = []
+        per_sym_unit_anomalies: list[str] = []
+        max_single_period_rate = 0.0
+        candle_corrupt = 0
+        poison_divergent_jumps = 0
+        ref_mismatches: list[str] = []
+        ref_checked_bars = 0
+        total_candle_bars = 0
+        max_frozen_hours = 0
+        max_flat_ohlc_hours = 0
+        latest_ts_seen = 0
+
+        for sym in symbols:
+            candles = self.store.load_candles(venue, sym, start_ms, end_ms)
+            fundings = self.store.load_funding(venue, sym, start_ms, end_ms)
+            ref_candles = self.store.load_candles(ref_venue, sym, start_ms, end_ms) if ref_venue else []
+            ref_map = {c.ts_ms: c for c in ref_candles}
+            sym_issues: list[str] = []
+
+            # Candles DQ
+            if len(candles) < 24:
+                sym_issues.append(f"candles_sparse({len(candles)})")
+                candle_covs.append(0.0)
+            else:
+                total_candle_bars += len(candles)
+                c_deltas: list[float] = []
+                prev_bar = None
+                prev_cts = -1
+                frozen = 0
+                flat_ohlc = 0
+                for c in candles:
+                    if c.ts_ms > latest_ts_seen:
+                        latest_ts_seen = c.ts_ms
+                    if c.ts_ms < MIN_VALID_EPOCH_MS or c.ts_ms > now_ms + 300_000:
+                        bad_ts_count += 1
+                    if prev_cts >= 0:
+                        if c.ts_ms <= prev_cts:
+                            non_monotonic_count += 1
+                        else:
+                            c_deltas.append((c.ts_ms - prev_cts) / float(HOUR_MS))
+                    prev_cts = c.ts_ms
+
+                    vals = (c.open, c.high, c.low, c.close)
+                    if any((not math.isfinite(v) or v <= 0.0) for v in vals):
+                        candle_corrupt += 1
+                        continue
+                    if c.low > min(c.open, c.close) * 1.0001 or c.high < max(c.open, c.close) * 0.9999:
+                        candle_corrupt += 1
+
+                    wick_range = (c.high - c.low) / c.open
+                    if wick_range > 0.80:
+                        r_cur = ref_map.get(c.ts_ms)
+                        if r_cur and r_cur.open > 0:
+                            if ((r_cur.high - r_cur.low) / r_cur.open) < 0.25:
+                                poison_divergent_jumps += 1
+                        else:
+                            poison_divergent_jumps += 1
+
+                    if prev_bar is not None and prev_bar.close > 0:
+                        jump = abs(c.close - prev_bar.close) / prev_bar.close
+                        if jump > 0.35:
+                            r_cur = ref_map.get(c.ts_ms)
+                            r_prev = ref_map.get(prev_bar.ts_ms)
+                            if r_cur and r_prev and r_prev.close > 0:
+                                r_jump = abs(r_cur.close - r_prev.close) / r_prev.close
+                                if r_jump < 0.10:
+                                    poison_divergent_jumps += 1
+                            elif jump > 0.65:
+                                poison_divergent_jumps += 1
+
+                        if c.open == c.high == c.low == c.close == prev_bar.close:
+                            flat_ohlc += 1
+                            if flat_ohlc > max_flat_ohlc_hours:
+                                max_flat_ohlc_hours = flat_ohlc
+                            if c.volume_usd == 0.0:
+                                frozen += 1
+                                if frozen > max_frozen_hours:
+                                    max_frozen_hours = frozen
+                            else:
+                                frozen = 0
+                        else:
+                            frozen = 0
+                            flat_ohlc = 0
+                    prev_bar = c
+
+                if c_deltas:
+                    span_start = start_ms if (start_ms is not None and start_ms < candles[0].ts_ms) else candles[0].ts_ms
+                    span_end = end_ms if (end_ms is not None and end_ms > candles[-1].ts_ms) else candles[-1].ts_ms
+                    exp_h = max(1.0, (span_end - span_start) / float(HOUR_MS) + 1.0)
+                    candle_covs.append(min(1.0, len(candles) / exp_h))
+                    max_gap_ratio = max(max_gap_ratio, max(c_deltas) / 6.0)
+
+                if ref_map:
+                    common = [c for c in candles if c.ts_ms in ref_map and ref_map[c.ts_ms].open > 0]
+                    ref_checked_bars += len(common)
+                    if len(common) >= 10:
+                        devs = [abs((c.open / ref_map[c.ts_ms].open) - 1.0) * 100.0 for c in common]
+                        med_dev = statistics.median(devs)
+                        if med_dev > max_price_ratio_dev_pct:
+                            ref_mismatches.append(f"{sym}:{med_dev:.1f}%")
+                            sym_issues.append(f"ref_price_mismatch({med_dev:.1f}%)")
+
+            # Funding DQ + Candle-to-Funding span overlap (>=98%)
+            if len(fundings) < 2:
+                sym_issues.append(f"funding_sparse({len(fundings)})")
+                funding_covs.append(0.0)
+                overlap_ratios.append(0.0)
+            else:
+                f_deltas: list[float] = []
+                sym_abs_aprs: list[float] = []
+                declared_h = statistics.median([b.interval_hours for b in fundings if b.interval_hours > 0] or [1.0])
+                prev_fts = -1
+                for b in fundings:
+                    if b.ts_ms > latest_ts_seen:
+                        latest_ts_seen = b.ts_ms
+                    if b.ts_ms < MIN_VALID_EPOCH_MS or b.ts_ms > now_ms + 300_000:
+                        bad_ts_count += 1
+                    if prev_fts >= 0:
+                        if b.ts_ms <= prev_fts:
+                            non_monotonic_count += 1
+                        else:
+                            f_deltas.append((b.ts_ms - prev_fts) / float(HOUR_MS))
+                    prev_fts = b.ts_ms
+                    if not math.isfinite(b.funding_rate) or not math.isfinite(b.interval_hours) or b.interval_hours <= 0:
+                        candle_corrupt += 1
+                    else:
+                        a_apr = abs(b.apr_pct)
+                        abs_aprs.append(a_apr)
+                        sym_abs_aprs.append(a_apr)
+                        if abs(b.funding_rate) > max_single_period_rate:
+                            max_single_period_rate = abs(b.funding_rate)
+
+                if sym_abs_aprs:
+                    s_sorted = sorted(sym_abs_aprs)
+                    s_med = statistics.median(s_sorted)
+                    s_p95 = s_sorted[int(0.95 * (len(s_sorted) - 1))]
+                    if s_med > 150.0 or s_p95 > 1500.0:
+                        per_sym_unit_anomalies.append(f"{venue}:{sym}(med={s_med:.0f}%,p95={s_p95:.0f}%)")
+                        sym_issues.append("funding_unit_anomaly")
+
+                if f_deltas:
+                    med_delta = statistics.median(f_deltas)
+                    base_h = max(declared_h, med_delta)
+                    normal_cap = max(8.0, base_h) if base_h >= 2.0 else base_h
+                    exp_intervals = sum(1.0 if d <= normal_cap + 0.05 else (d / max(0.5, base_h)) for d in f_deltas)
+                    funding_covs.append(min(1.0, len(fundings) / max(1.0, exp_intervals + 1.0)))
+                    gap_limit = max(6.0, 2.5 * base_h)
+                    max_gap_ratio = max(max_gap_ratio, max(f_deltas) / gap_limit)
+                    if abs(med_delta - declared_h) / max(declared_h, 0.1) > 0.25:
+                        interval_mismatches += 1
+                        sym_issues.append(f"funding_interval_mismatch({med_delta:.2f}h vs {declared_h:.2f}h)")
+
+                    # Overlap of funding span over candle span (allows <=1 settlement interval tolerance at edges)
+                    if len(candles) >= 24:
+                        c0, c1 = candles[0].ts_ms, candles[-1].ts_ms
+                        c_span = max(float(HOUR_MS), float(c1 - c0))
+                        edge_tol = int(normal_cap * HOUR_MS)
+                        ov_start = max(c0, fundings[0].ts_ms - edge_tol)
+                        ov_end = min(c1, fundings[-1].ts_ms + edge_tol)
+                        ov = max(0.0, float(ov_end - ov_start)) / c_span
+                        overlap_ratios.append(min(1.0, ov))
+                        if ov < 0.98:
+                            sym_issues.append(f"funding_overlap_low({ov*100:.1f}%)")
+                    else:
+                        overlap_ratios.append(0.0)
+
+            symbol_scores[sym] = "OK" if not sym_issues else ",".join(sym_issues)
+
+        all_covs = candle_covs + funding_covs
+        avg_cov = (sum(all_covs) / len(all_covs) * 100.0) if all_covs else 0.0
+        min_cov = (min(all_covs) * 100.0) if all_covs else 0.0
+        dq2_ok = bool(all_covs) and avg_cov >= 95.0 and min_cov >= 85.0 and max_gap_ratio <= 1.0
+        checks.append(
+            DataQualityCheck(
+                "DQ-02",
+                "1h Candle & Funding Bar Coverage Continuity",
+                dq2_ok,
+                "BLOCKING",
+                f"avg_cov={avg_cov:.2f}%, min_cov={min_cov:.2f}%, max_gap_ratio={max_gap_ratio:.2f}x",
+                "avg_cov>=95.0% & min_cov>=85.0% & max_gap_ratio<=1.0x",
+                f"symbols={len(symbols)}",
+            )
+        )
+
+        dq3_ok = bad_ts_count == 0 and non_monotonic_count == 0
+        checks.append(
+            DataQualityCheck(
+                "DQ-03",
+                "Timestamp Monotonicity & Clock Hygiene",
+                dq3_ok,
+                "BLOCKING",
+                f"bad_ts={bad_ts_count}, non_mono={non_monotonic_count}",
+                "bad_ts=0 & non_mono=0",
+                "Rejects CLOCK_MONOTONIC leakage (<2020) and future timestamps",
+            )
+        )
+
+        min_overlap = (min(overlap_ratios) * 100.0) if overlap_ratios else 0.0
+        avg_overlap = (sum(overlap_ratios) / len(overlap_ratios) * 100.0) if overlap_ratios else 0.0
+        dq4_ok = bool(overlap_ratios) and min_overlap >= 98.0
+        checks.append(
+            DataQualityCheck(
+                "DQ-04",
+                "Candle-to-Funding Real Overlap (>=98% No Zero-Funding Cheating)",
+                dq4_ok,
+                "BLOCKING",
+                f"min_overlap={min_overlap:.2f}%, avg_overlap={avg_overlap:.2f}%",
+                "min_overlap>=98.0%",
+                f"venue={venue}, symbols={len(symbols)}",
+            )
+        )
+
+        dq5_ok = candle_corrupt == 0 and poison_divergent_jumps == 0 and len(ref_mismatches) == 0
+        checks.append(
+            DataQualityCheck(
+                "DQ-05",
+                "OHLCV Integrity, Poison Jump & Optional Ref-Venue Sanity",
+                dq5_ok,
+                "BLOCKING",
+                f"corrupt={candle_corrupt}, poison_jumps={poison_divergent_jumps}, ref_mismatch={len(ref_mismatches)}",
+                f"all 0 & med_px_dev<={max_price_ratio_dev_pct}%",
+                f"ref={ref_venue or 'none'}, mismatches={ref_mismatches[:4]}",
+            )
+        )
+
+        sorted_aprs = sorted(abs_aprs)
+        med_apr = statistics.median(sorted_aprs) if sorted_aprs else 0.0
+        p95_apr = sorted_aprs[int(0.95 * (len(sorted_aprs) - 1))] if sorted_aprs else 0.0
+        dq6_ok = (
+            interval_mismatches == 0
+            and len(per_sym_unit_anomalies) == 0
+            and med_apr <= 150.0
+            and p95_apr <= 1500.0
+            and max_single_period_rate <= 0.05
+        )
+        checks.append(
+            DataQualityCheck(
+                "DQ-06",
+                "Funding Unit & Settlement Cadence Distribution",
+                dq6_ok,
+                "BLOCKING",
+                f"mismatches={interval_mismatches}, sym_anom={len(per_sym_unit_anomalies)}, med={med_apr:.1f}%, p95={p95_apr:.1f}%",
+                "mismatches=0 & sym_anom=0 & med<=150% & p95<=1500%",
+                f"anomalies={per_sym_unit_anomalies[:4]}",
+            )
+        )
+
+        cov_metric = (
+            round((ref_checked_bars / total_candle_bars) * 100.0, 2)
+            if (ref_venue and total_candle_bars > 0)
+            else round(avg_overlap, 2)
+        )
+        dq7_ok = avg_overlap >= 98.0
+        checks.append(
+            DataQualityCheck(
+                "DQ-07",
+                "Perp Price + Funding Completeness",
+                dq7_ok,
+                "ADVISORY",
+                f"completeness={cov_metric:.2f}% (funding_ov={avg_overlap:.2f}%)",
+                ">=98.0%",
+                f"ref_checked={ref_checked_bars}/{total_candle_bars}" if ref_venue else "single-venue perp",
+            )
+        )
+
+        age_hours = (now_ms - latest_ts_seen) / float(HOUR_MS) if latest_ts_seen > 0 else 9999.0
+        fresh_ok = True if require_fresh_hours is None else (age_hours <= require_fresh_hours)
+        dq8_ok = max_frozen_hours <= 6 and max_flat_ohlc_hours <= 12 and fresh_ok
+        fresh_thresh = "archive" if require_fresh_hours is None else f"{require_fresh_hours}h"
+        checks.append(
+            DataQualityCheck(
+                "DQ-08",
+                "Anti-Frozen OHLCV Feed & Optional Live Freshness",
+                dq8_ok,
+                "BLOCKING",
+                f"frozen_0vol={max_frozen_hours}h, flat_ohlc={max_flat_ohlc_hours}h, age_h={age_hours:.1f}",
+                f"frozen<=6h & flat<=12h & age<={fresh_thresh}",
+                "Single-venue perp OHLCV liveness",
+            )
+        )
+
+        blocking_ok = all(c.passed for c in checks if c.severity == "BLOCKING")
+        tier = "DATA_REJECTED" if not blocking_ok else "DATA_QUALIFIED_FULL"
+        vpair = f"perp:{venue}"
+        dname = dataset_name or f"single_perp:{venue}"
+        cert_id = f"DQ-{sha256_obj({'d': dname, 'sha': ds_sha, 't': now_ms})[:10]}"
+        report = DataQualityReport(
+            cert_id=cert_id,
+            created_ts_ms=now_ms,
+            dataset_name=dname,
+            venue_pair=vpair,
+            dataset_sha256=ds_sha,
+            provenance=prov,
+            row_count=row_count,
+            basis_coverage_pct=cov_metric,
+            tier=tier,
+            passed_count=sum(1 for c in checks if c.passed),
+            total_count=len(checks),
+            checks=checks,
+            symbol_scores=symbol_scores,
+        )
+        if persist:
+            self.store.save_dq_certificate(report)
+        return report
+
     def audit_bbo_ticks(
         self,
         venue_a: str,

@@ -25,6 +25,7 @@ from alphaloop.agent_loop.orchestrator import AgentEvolutionOrchestrator
 from alphaloop.core.config import HotConfigStore
 from alphaloop.core.provenance import utc_now_ms
 from alphaloop.data.store import MarketDataStore
+from alphaloop.execution.bridge import ExecutionBridge
 from alphaloop.harness.backtester import FundingCarryBacktester
 from alphaloop.harness.gates import SixGateVerifier, TrialLedger
 from alphaloop.harness.micro_runner import MicroRunSession, MicroRunStore
@@ -41,14 +42,14 @@ CONSOLE_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>AlphaLoop v2 — Strategy Factory, DQ Gate &amp; Agent Feedback Console</title>
+<title>AlphaLoop v2.1 — Strategy Factory, Portfolio, DQ Gate &amp; Shadow Execution Console</title>
 <style>
   :root{--bg:#0b0f17;--card:#131a26;--border:#233044;--text:#e6edf7;--muted:#8fa2bd;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#38bdf8;}
   *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.5}
   header{display:flex;justify-content:space-between;align-items:center;padding:14px 22px;border-bottom:1px solid var(--border);background:#0f1623}
   h1{font-size:17px;margin:0;letter-spacing:.3px} .badge{font-size:12px;padding:3px 9px;border-radius:999px;background:#1e293b;color:var(--blue)}
   main{max-width:1360px;margin:0 auto;padding:18px;display:grid;gap:16px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
   .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;overflow-x:auto}
   .card h2{font-size:13px;color:var(--muted);margin:0 0 10px;text-transform:uppercase;letter-spacing:.5px}
   table{width:100%;border-collapse:collapse;font-size:12.5px}
@@ -61,13 +62,21 @@ CONSOLE_HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <h1>AlphaLoop v2 — Strategy Factory, DQ-01..08 Gate, Fast Micro-Runs &amp; Fleet Audit</h1>
+  <h1>AlphaLoop v2.1 — Strategy Factory, Portfolio Combiner, DQ-01..08 Gate &amp; Shadow Execution Bridge</h1>
   <div><span id="healthBadge" class="badge">Loading...</span> <button class="sec" id="refreshBtn" type="button">Refresh</button></div>
 </header>
 <main>
   <div class="grid" id="kpiGrid"></div>
   <div class="card">
-    <h2>Strategy Factory v2 Plugins (Pluggable Alpha Registry)</h2>
+    <h2>Multi-Pillar Portfolio Scorecard &amp; Capacity Scaling (PortfolioCombiner)</h2>
+    <div id="portfolioBox">Loading...</div>
+  </div>
+  <div class="card">
+    <h2>Shadow Execution Bridge (SHADOW_DRY_RUN · Hash-Chained Audit · Kill Switch)</h2>
+    <div id="execBox">Loading...</div>
+  </div>
+  <div class="card">
+    <h2>Strategy Factory v2.1 Plugins (Pluggable Alpha Registry)</h2>
     <div id="pluginsBox">Loading...</div>
   </div>
   <div class="card">
@@ -87,7 +96,7 @@ CONSOLE_HTML = """<!doctype html>
     <div id="fleetBox">Loading...</div>
   </div>
   <div class="card">
-    <h2>Closed-Loop Agent Evolution Cycles (Diagnose → Propose → DQ + 6-Gate → Cross-Model Red-Team)</h2>
+    <h2>Closed-Loop Agent Evolution &amp; Version Diff (Diagnose → Propose → DQ + 6-Gate → Red-Team)</h2>
     <div id="cyclesBox">Loading...</div>
   </div>
   <div class="card">
@@ -126,10 +135,11 @@ document.getElementById('strategiesBox').addEventListener('click', function(ev){
 });
 async function refreshAll(){
   try{
-    const [h,s,c,m,t,mk,pl,dq,mr,fl]=await Promise.all([
+    const [h,s,c,m,t,mk,pl,dq,mr,fl,pf,ex]=await Promise.all([
       getJson('/api/health'),getJson('/api/strategies'),getJson('/api/cycles'),
       getJson('/api/models'),getJson('/api/trials'),getJson('/api/market/summary'),
-      getJson('/api/plugins'),getJson('/api/dq/reports'),getJson('/api/micro-runs'),getJson('/api/fleet/audit')
+      getJson('/api/plugins'),getJson('/api/dq/reports'),getJson('/api/micro-runs'),
+      getJson('/api/fleet/audit'),getJson('/api/portfolio'),getJson('/api/execution/plans')
     ]);
     document.getElementById('healthBadge').textContent='ONLINE | '+h.status+' | '+h.service+' | '+new Date(h.ts_ms).toISOString();
     const totalFundingRows=(mk.funding||[]).reduce((a,x)=>a+x.rows,0);
@@ -140,9 +150,20 @@ async function refreshAll(){
       ['Real Funding Rows', totalFundingRows.toLocaleString()],
       ['Live BBO Ticks', totalBboRows.toLocaleString()],
       ['DQ Certificates', (dq.reports||[]).length],
-      ['Fast Micro-Runs', (mr.runs||[]).length],
+      ['Shadow Audit Seq', '#'+(ex.audit_head_seq??0)+' ('+(ex.audit_chain_valid?'VALID':'BROKEN')+')'],
       ['Fleet Reachable', (fl.nodes_reachable??0)+'/'+(fl.nodes_total??0)]
-    ].map(([k,v])=>'<div class="card"><h2>'+esc(k)+'</h2><div style="font-size:24px;font-weight:700">'+esc(v)+'</div></div>').join('');
+    ].map(([k,v])=>'<div class="card"><h2>'+esc(k)+'</h2><div style="font-size:22px;font-weight:700">'+esc(v)+'</div></div>').join('');
+
+    if(pf.valid){
+      const scRows=(pf.scaling_projections||[]).map(x=>'<tr><td>$'+esc(x.capital_usd)+'</td><td>'+esc(x.gross_backtest_apr_pct)+'%</td><td>-'+esc(x.capacity_impact_drag_apr_pct)+'%</td><td class="'+(x.net_capacity_adjusted_apr_pct>0?'ok':'bad')+'"><b>'+esc(x.net_capacity_adjusted_apr_pct)+'%</b></td><td>$'+esc(x.est_monthly_net_usd)+'/mo</td></tr>').join('');
+      document.getElementById('portfolioBox').innerHTML='<div style="margin-bottom:8px">Mode: <b>'+esc(pf.weighting_mode)+'</b> | Overlap: <b>'+esc(pf.overlap_days)+'d</b> | APR: <b class="'+(pf.annualized_apr_pct>0?'ok':'bad')+'">'+esc(pf.annualized_apr_pct)+'%</b> | Sharpe: <b>'+esc(pf.sharpe_ratio)+'</b> | MaxDD: <b>'+esc(pf.max_drawdown_pct)+'%</b> | OOS Ret: <b>'+esc(pf.oos_retention)+'x</b></div><table><thead><tr><th>Capital</th><th>Backtest APR</th><th>Capacity Drag</th><th>Net Adjusted APR</th><th>Est Monthly</th></tr></thead><tbody>'+scRows+'</tbody></table>';
+    }else{
+      document.getElementById('portfolioBox').innerHTML='<span class="warn">'+esc(pf.error||'No portfolio report saved yet')+'</span>';
+    }
+
+    const ks=ex.kill_switch||{};
+    const exRows=(ex.recent_plans||[]).slice(0,12).map(x=>'<tr><td><code>'+esc(x.plan_id)+'</code></td><td>'+esc(x.strategy_id)+'@'+esc(x.version)+'</td><td>'+esc(x.symbol)+'</td><td>'+esc(x.action)+'</td><td>$'+esc(x.notional_usd)+'</td><td class="'+(x.status==='PLANNED_SHADOW'?'ok':'bad')+'">'+esc(x.status)+'</td><td>'+esc(x.block_reason||'—')+'</td></tr>').join('');
+    document.getElementById('execBox').innerHTML='<div style="margin-bottom:8px">Mode: <span class="badge">'+esc(ex.run_mode)+'</span> | Live Enabled: <b>'+esc(ex.live_execution_enabled)+'</b> | Kill Switch: <b class="'+(ks.engaged?'bad':'ok')+'">'+(ks.engaged?'ENGAGED ('+esc(ks.trigger)+')':'CLEAR')+'</b> | Audit Chain: <b class="'+(ex.audit_chain_valid?'ok':'bad')+'">'+esc(ex.audit_chain_detail)+' ('+esc(ex.audit_chain_length)+' events)</b></div><table><thead><tr><th>Plan ID</th><th>Strategy</th><th>Symbol</th><th>Action</th><th>Notional</th><th>Status</th><th>Block Reason</th></tr></thead><tbody>'+(exRows||'<tr><td colspan="7">No shadow execution plans recorded yet</td></tr>')+'</tbody></table>';
 
     const plRows=(pl.plugins||[]).map(x=>'<tr><td><b>'+esc(x.plugin_id)+'</b></td><td>'+esc(x.display_name)+'</td><td>'+esc(x.strategy_family)+'</td><td>'+esc(Object.keys(x.mutable_param_bounds||{}).join(', '))+'</td><td>'+esc(x.description)+'</td></tr>').join('');
     document.getElementById('pluginsBox').innerHTML='<table><thead><tr><th>Plugin ID</th><th>Name</th><th>Family</th><th>Mutable Params</th><th>Description</th></tr></thead><tbody>'+(plRows||'<tr><td colspan="5">No plugins</td></tr>')+'</tbody></table>';
@@ -159,8 +180,8 @@ async function refreshAll(){
     const flRows=(fl.nodes||[]).map(x=>'<tr><td><b>'+esc(x.label)+'</b></td><td><code>'+esc(x.ip)+'</code></td><td class="'+(x.reachable?'ok':'bad')+'">'+(x.reachable?'OK':'DOWN')+'</td><td>'+esc(x.root_disk_pct)+'% ('+esc(x.root_disk_free_gb)+'GB free)</td><td>'+esc(x.mem_used_pct)+'% ('+esc(x.mem_avail_mb)+'MB avail)</td><td>'+esc((x.alerts||[]).map(a=>a.severity+':'+a.code).join(', ')||'NONE')+'</td></tr>').join('');
     document.getElementById('fleetBox').innerHTML='<table><thead><tr><th>Node</th><th>IP</th><th>SSH</th><th>Root Disk</th><th>RAM</th><th>Alerts</th></tr></thead><tbody>'+(flRows||'<tr><td colspan="6">No fleet snapshot found</td></tr>')+'</tbody></table>';
 
-    const cRows=(c.cycles||[]).map(x=>'<tr><td><code>'+esc(x.cycle_id)+'</code></td><td>'+esc(x.strategy_id)+' ('+esc(x.from_version)+'→'+esc(x.to_version)+')</td><td>'+esc(x.feedback.anomaly_type)+'</td><td>'+esc(x.baseline_metrics.annualized_apr_pct)+'% → <b>'+esc(x.candidate_metrics.annualized_apr_pct)+'%</b></td><td class="'+(x.gate_verdict.overall_pass?'ok':'bad')+'">'+esc(x.gate_verdict.passed_count)+'/'+esc(x.gate_verdict.total_count)+'</td><td>'+esc(x.red_team_verdict.decision)+'</td><td><span class="badge">'+esc(x.promotion_stage||(x.promoted_shadow?'SHADOW_LIVE':'HELD'))+'</span></td></tr>').join('');
-    document.getElementById('cyclesBox').innerHTML='<table><thead><tr><th>Cycle</th><th>Strategy</th><th>Anomaly</th><th>APR Shift</th><th>6-Gate</th><th>Red-Team</th><th>Stage</th></tr></thead><tbody>'+(cRows||'<tr><td colspan="7">No cycles yet</td></tr>')+'</tbody></table>';
+    const cRows=(c.cycles||[]).map(x=>{const df=x.diff_scorecard||{};return '<tr><td><code>'+esc(x.cycle_id)+'</code></td><td>'+esc(x.strategy_id)+' ('+esc(x.from_version)+'→'+esc(x.to_version)+')</td><td>'+esc(x.feedback.anomaly_type)+'</td><td>'+esc(x.baseline_metrics.annualized_apr_pct)+'% → <b>'+esc(x.candidate_metrics.annualized_apr_pct)+'%</b> ('+(df.apr_delta_pct>=0?'+':'')+esc(df.apr_delta_pct??0)+'%)</td><td>'+esc(df.sharpe_delta??0)+' / '+esc(df.max_dd_delta_pct??0)+'%</td><td class="'+(x.gate_verdict.overall_pass?'ok':'bad')+'">'+esc(x.gate_verdict.passed_count)+'/'+esc(x.gate_verdict.total_count)+'</td><td>'+esc(x.red_team_verdict.decision)+'</td><td><span class="badge">'+esc(x.promotion_stage||(x.promoted_shadow?'SHADOW_LIVE':'HELD'))+'</span></td></tr>';}).join('');
+    document.getElementById('cyclesBox').innerHTML='<table><thead><tr><th>Cycle</th><th>Strategy</th><th>Anomaly</th><th>APR Shift</th><th>ΔSharpe / ΔDD</th><th>6-Gate</th><th>Red-Team</th><th>Stage</th></tr></thead><tbody>'+(cRows||'<tr><td colspan="8">No cycles yet</td></tr>')+'</tbody></table>';
 
     const mRows=(m.routes||[]).map(x=>'<tr><td><b>'+esc(x.role)+'</b></td><td>'+esc(x.family)+' / '+esc(x.model_id)+'</td><td>'+esc(x.pricing_usd_1m)+'</td><td>'+(x.configured?'<span class="ok">KEY SET</span>':'<span class="warn">FALLBACK</span>')+'</td><td>'+esc(x.rationale)+'</td></tr>').join('');
     document.getElementById('modelsBox').innerHTML='<table><thead><tr><th>Role</th><th>Model</th><th>Price (In/Out 1M)</th><th>API Status</th><th>Rationale</th></tr></thead><tbody>'+mRows+'</tbody></table>';
@@ -179,7 +200,7 @@ refreshAll();
 
 
 class ConsoleAppContext:
-    """Shared dependency container for AlphaLoop v2 HTTP server."""
+    """Shared dependency container for AlphaLoop v2.1 HTTP server."""
 
     def __init__(self, data_dir: str | Path) -> None:
         self.data_dir = Path(data_dir)
@@ -190,6 +211,7 @@ class ConsoleAppContext:
         self.config_store = HotConfigStore(self.data_dir / "state")
         self.micro_store = MicroRunStore(self.data_dir / "state" / "micro_runs.sqlite")
         self.micro_session = MicroRunSession(self.store, self.micro_store, self.registry)
+        self.exec_bridge = ExecutionBridge(self.data_dir / "state")
         self.backtester = FundingCarryBacktester(self.store)
         self.verifier = SixGateVerifier(self.backtester, self.ledger, registry=self.registry)
         self.router = MultiModelRouter()
@@ -212,11 +234,22 @@ class ConsoleAppContext:
         except (OSError, json.JSONDecodeError):
             return {"nodes_total": 0, "nodes_reachable": 0, "nodes": [], "error": "UNREADABLE_SNAPSHOT"}
 
+    def read_portfolio_snapshot(self) -> dict[str, Any]:
+        snap = self.data_dir / "portfolio_report.json"
+        if not snap.exists():
+            return {"valid": False, "error": "NO_PORTFOLIO_REPORT_SAVED", "scaling_projections": []}
+        try:
+            data = json.loads(snap.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {"valid": False, "error": "INVALID_PORTFOLIO_REPORT"}
+        except (OSError, json.JSONDecodeError):
+            return {"valid": False, "error": "UNREADABLE_PORTFOLIO_REPORT"}
+
     def close(self) -> None:
         self.store.close()
         self.ledger.close()
         self.config_store.close()
         self.micro_store.close()
+        self.exec_bridge.close()
         self.orchestrator.close()
 
 
@@ -265,7 +298,7 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
                     self._send_bytes(200, "text/html; charset=utf-8", CONSOLE_HTML.encode("utf-8"))
                     return
                 if path == "/api/health":
-                    self._send_json(200, {"status": "HEALTHY", "service": "alphaloop-v2", "ts_ms": utc_now_ms()})
+                    self._send_json(200, {"status": "HEALTHY", "service": "alphaloop-v2.1", "ts_ms": utc_now_ms()})
                     return
                 if path == "/api/plugins":
                     self._send_json(200, {"plugins": ctx.registry.list_plugins()})
@@ -281,6 +314,12 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
                     return
                 if path == "/api/fleet/audit":
                     self._send_json(200, ctx.read_fleet_snapshot())
+                    return
+                if path == "/api/portfolio":
+                    self._send_json(200, ctx.read_portfolio_snapshot())
+                    return
+                if path == "/api/execution/plans":
+                    self._send_json(200, ctx.exec_bridge.summary())
                     return
                 if path == "/api/trials":
                     self._send_json(200, {"trials": ctx.ledger.recent_trials(limit=50)})

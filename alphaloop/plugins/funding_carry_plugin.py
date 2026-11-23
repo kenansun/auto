@@ -99,9 +99,25 @@ class FundingCarryPlugin(BaseStrategyPlugin):
         d["version"] = next_version
         d["status"] = "BACKTESTED"
         d["plugin_id"] = self.plugin_id
+        params = dict(d.get("params") or {})
+        param_bounds: dict[str, tuple[float, float]] = {
+            "protective_margin_exit_pct": (0.35, 0.75),
+            "vol_target_ann_pct": (60.0, 220.0),
+            "min_symbol_leverage": (1.0, 2.5),
+            "vol_lookback_hours": (48.0, 240.0),
+        }
         for key, val in changes.items():
             if key == "use_atb_buggy_rules" and isinstance(val, bool):
                 d[key] = val
+            elif key == "vol_target_leverage_enabled" and isinstance(val, bool):
+                params[key] = val
+            elif key in param_bounds and isinstance(val, (int, float)) and not isinstance(val, bool):
+                fval = float(val)
+                if not math.isfinite(fval):
+                    continue
+                lo, hi = param_bounds[key]
+                clamped = max(lo, min(hi, fval))
+                params[key] = int(round(clamped)) if key == "vol_lookback_hours" else round(clamped, 3)
             elif key in FUNDING_CARRY_BOUNDS and isinstance(val, (int, float)) and not isinstance(val, bool):
                 fval = float(val)
                 if not math.isfinite(fval):
@@ -112,6 +128,14 @@ class FundingCarryPlugin(BaseStrategyPlugin):
                     d[key] = int(round(clamped))
                 else:
                     d[key] = round(clamped, 3)
+        # Preserve physical storm-exit floor (immutable to Agent)
+        if "protective_exit_slip_bps" in params:
+            raw_s = params["protective_exit_slip_bps"]
+            if isinstance(raw_s, bool) or not isinstance(raw_s, (int, float)) or not math.isfinite(float(raw_s)):
+                params["protective_exit_slip_bps"] = 5.0
+            else:
+                params["protective_exit_slip_bps"] = max(5.0, float(raw_s))
+        d["params"] = params
         # Invariant 1: Prevent >100% capital over-allocation when max_positions increases (Red-Team #5.3)
         d["per_position_weight"] = round(min(float(d["per_position_weight"]), 1.0 / max(1, int(d["max_positions"]))), 4)
         # Invariant 2: entry hurdle must stay >= 4% APR above exit hurdle (prevents ATB H6 bug)
@@ -163,14 +187,22 @@ class FundingCarryPlugin(BaseStrategyPlugin):
         metrics: BacktestMetrics,
     ) -> tuple[dict[str, Any], str, str, str]:
         if feedback.anomaly_type == "MARGIN_LIQUIDATION":
+            p = cfg.params or {}
+            cur_prot = float(p.get("protective_margin_exit_pct", 0.65) or 0.65)
+            cur_vt = float(p.get("vol_target_ann_pct", 130.0) or 130.0)
+            next_prot = max(0.40, round(cur_prot - 0.10, 2))
+            next_vt = max(80.0, round(cur_vt - 20.0, 1))
             changes = {
-                "stop_loss_basis_bps": max(80.0, round(cfg.stop_loss_basis_bps * 0.65, 1)),
-                "max_basis_entry_bps": max(15.0, round(cfg.max_basis_entry_bps * 0.7, 1)),
+                "vol_target_leverage_enabled": True,
+                "vol_target_ann_pct": next_vt,
+                "min_symbol_leverage": 1.5,
+                "protective_margin_exit_pct": next_prot,
+                "stop_loss_basis_bps": max(80.0, round(cfg.stop_loss_basis_bps * 0.75, 1)),
             }
             return (
                 changes,
-                "Tighten basis entry/stop guards after per-leg margin liquidation event.",
-                "Reduces adverse leg divergence exposure before single-venue collateral approaches maintenance margin.",
+                f"Enable/tighten causal 7d volatility-tiered leverage (target {next_vt:.0f}%) and {next_prot:.0%} protective margin exit after liquidation.",
+                "Caps leverage on high-volatility altcoins and atomically closes both legs before maintenance margin liquidation.",
                 "Reject immediately if any liquidation_count > 0 remains.",
             )
         if cfg.use_atb_buggy_rules or feedback.anomaly_type == "CHURN_EXCESS":
@@ -264,22 +296,31 @@ class FundingCarryPlugin(BaseStrategyPlugin):
 
         apr_a = latest_apr.get((cfg.venue_a, sym))
         apr_b = latest_apr.get((cfg.venue_b, sym))
-        if apr_a is not None and apr_b is not None and sym not in open_pos and len(open_pos) < cfg.max_positions:
+        # Red-Team BLOCKER #3: NEVER open a carry position before BOTH venues have valid live BBO prices!
+        if (
+            px_a is not None
+            and px_b is not None
+            and px_a > 0.0
+            and px_b > 0.0
+            and apr_a is not None
+            and apr_b is not None
+            and sym not in open_pos
+            and len(open_pos) < cfg.max_positions
+        ):
             spread = apr_a - apr_b
             if abs(spread) >= cfg.entry_spread_apr_pct:
                 direction = "SHORT_A_LONG_B" if spread > 0 else "LONG_A_SHORT_B"
                 action = "OPEN_SHORT_A_LONG_B" if spread > 0 else "OPEN_LONG_A_SHORT_B"
                 notional = cfg.capital_usd * cfg.per_position_weight * (cfg.leverage / 2.0)
-                if px_a and px_b:
-                    raw_basis = ((px_a - px_b) / px_b) * 10000.0
-                    adverse = -raw_basis if spread > 0 else raw_basis
-                    if adverse > cfg.max_basis_entry_bps:
-                        return intents
+                raw_basis = ((px_a - px_b) / px_b) * 10000.0
+                adverse = -raw_basis if spread > 0 else raw_basis
+                if adverse > cfg.max_basis_entry_bps:
+                    return intents
                 open_pos[sym] = {
                     "direction": direction,
                     "notional_usd": notional,
-                    "entry_px_a": px_a or 0.0,
-                    "entry_px_b": px_b or 0.0,
+                    "entry_px_a": px_a,
+                    "entry_px_b": px_b,
                     "entry_ts_ms": event.ts_ms,
                 }
                 intents.append(OrderIntent(cfg.strategy_id, sym, action, notional, abs(spread), "FUNDING_SPREAD_ENTRY", event.ts_ms))

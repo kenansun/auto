@@ -115,7 +115,8 @@ class HyperliquidCollector:
         end_ms = utc_now_ms()
         cursor = end_ms - days * 86400 * 1000
         seen: dict[int, FundingRateBar] = {}
-        for _ in range(12):  # 12 * 500h = 250 days max safety bound
+        max_pages = min(40, max(12, int((days * 24) / 480) + 3))
+        for _ in range(max_pages):
             rows = _http_json(
                 self.INFO_URL,
                 method="POST",
@@ -148,23 +149,30 @@ class HyperliquidCollector:
         end_ms = utc_now_ms()
         cur_hour_ms = (end_ms // HOUR_MS) * HOUR_MS
         start_ms = end_ms - days * 86400 * 1000
-        rows = _http_json(
-            self.INFO_URL,
-            method="POST",
-            payload={
-                "type": "candleSnapshot",
-                "req": {"coin": symbol, "interval": "1h", "startTime": start_ms, "endTime": end_ms},
-            },
-        )
-        bars: list[PriceBar] = []
-        for r in rows:
-            t_hour = (int(r["t"]) // HOUR_MS) * HOUR_MS
-            if t_hour >= cur_hour_ms:
-                continue  # Exclude in-progress unclosed current-hour bar
-            close = float(r["c"])
-            vol_base = float(r["v"])
-            bars.append(
-                PriceBar(
+        seen: dict[int, PriceBar] = {}
+        cursor_end = end_ms
+        max_pages = min(6, max(1, int((days * 24) / 4500) + 1))
+        for _ in range(max_pages):
+            rows = _http_json(
+                self.INFO_URL,
+                method="POST",
+                payload={
+                    "type": "candleSnapshot",
+                    "req": {"coin": symbol, "interval": "1h", "startTime": start_ms, "endTime": cursor_end},
+                },
+            )
+            if not rows:
+                break
+            min_t = cursor_end
+            for r in rows:
+                t_hour = (int(r["t"]) // HOUR_MS) * HOUR_MS
+                if t_hour < min_t:
+                    min_t = t_hour
+                if t_hour >= cur_hour_ms:
+                    continue  # Exclude in-progress unclosed current-hour bar
+                close = float(r["c"])
+                vol_base = float(r["v"])
+                seen[t_hour] = PriceBar(
                     venue="hyperliquid",
                     symbol=symbol,
                     ts_ms=t_hour,
@@ -175,9 +183,11 @@ class HyperliquidCollector:
                     volume_usd=vol_base * close,
                     provenance=PROVENANCE_REAL,
                 )
-            )
-        bars.sort(key=lambda x: x.ts_ms)
-        return bars
+            if len(rows) < 4900 or min_t <= start_ms + HOUR_MS or min_t >= cursor_end:
+                break
+            cursor_end = min_t - HOUR_MS
+            time.sleep(0.08)
+        return sorted(seen.values(), key=lambda x: x.ts_ms)
 
 
 class LighterCollector:
@@ -219,7 +229,8 @@ class LighterCollector:
         seen: dict[int, FundingRateBar] = {}
 
         cursor_end = end_sec
-        for _ in range(6):  # up to 6 * 750h = 187 days
+        max_pages = min(20, max(6, int((days * 24) / 700) + 2))
+        for _ in range(max_pages):
             url = (
                 f"{self.BASE_URL}/fundings?market_id={mid}&resolution=1h"
                 f"&start_timestamp={target_start_sec}&end_timestamp={cursor_end}&count_back=750"
@@ -247,7 +258,7 @@ class LighterCollector:
                 )
                 if ts_sec < min_ts:
                     min_ts = ts_sec
-            if len(rows) < 700 or min_ts <= target_start_sec + 3600:
+            if len(rows) < 700 or min_ts <= target_start_sec + 3600 or min_ts >= cursor_end:
                 break
             cursor_end = min_ts - 3600
             time.sleep(0.10)
@@ -264,7 +275,8 @@ class OKXCollector:
         cutoff_ms = utc_now_ms() - days * 86400 * 1000
         raw_rows: list[tuple[int, float]] = []
         after: str | None = None
-        for _ in range(10):  # up to 1000 periods
+        max_pages = min(20, max(10, int(days / 15) + 2))
+        for _ in range(max_pages):
             url = f"{self.BASE_URL}/public/funding-rate-history?instId={inst_id}&limit=100"
             if after:
                 url += f"&after={after}"
@@ -307,7 +319,8 @@ class OKXCollector:
         cutoff_ms = utc_now_ms() - days * 86400 * 1000
         seen: dict[int, PriceBar] = {}
         after: str | None = None
-        for _ in range(25):  # 25 * 100h = ~104 days
+        max_pages = min(100, max(25, int((days * 24) / 95) + 3))
+        for _ in range(max_pages):
             url = f"{self.BASE_URL}/market/history-candles?instId={inst_id}&bar=1H&limit=100"
             if after:
                 url += f"&after={after}"
@@ -344,23 +357,31 @@ class OKXCollector:
 
 
 class GateCollector:
-    """Gate.io USDT Futures public collector (4h/8h funding + 1h candles)."""
+    """Gate.io USDT Futures public collector (4h/8h funding up to 180d + 1h candles up to 365d)."""
 
     BASE_URL = "https://api.gateio.ws/api/v4/futures/usdt"
+    MAX_FUNDING_LOOKBACK_DAYS = 179
+    MAX_CANDLE_LOOKBACK_DAYS = 365
 
     def fetch_funding_history(self, symbol: str, days: int = 90) -> list[FundingRateBar]:
         contract = f"{symbol}_USDT"
         now_sec = int(time.time())
-        cutoff_sec = now_sec - days * 86400
+        eff_days = min(int(days), self.MAX_FUNDING_LOOKBACK_DAYS)
+        cutoff_sec = now_sec - eff_days * 86400
         raw_rows: list[tuple[int, float]] = []
         cursor_to = now_sec
-        for _ in range(6):
-            url = f"{self.BASE_URL}/funding_rate?contract={contract}&limit=200&from={cutoff_sec}&to={cursor_to}"
+        step_sec = 85 * 86400  # Stay safely within Gate's per-request limit (<=1000 bars)
+        while cursor_to > cutoff_sec:
+            cursor_from = max(cutoff_sec, cursor_to - step_sec)
+            url = (
+                f"{self.BASE_URL}/funding_rate?contract={contract}&limit=1000"
+                f"&from={cursor_from}&to={cursor_to}"
+            )
             try:
                 rows = _http_json(url)
             except urllib.error.HTTPError as exc:
                 if exc.code in (400, 404):
-                    return []
+                    break
                 raise
             if not rows:
                 break
@@ -372,9 +393,12 @@ class GateCollector:
                     raw_rows.append((ts_ms, float(r["r"])))
                 if t_sec < min_t:
                     min_t = t_sec
-            if len(rows) < 180 or min_t <= cutoff_sec + 3600:
+            if cursor_from <= cutoff_sec or min_t <= cutoff_sec + 3600:
                 break
-            cursor_to = min_t - 1
+            if len(rows) >= 950 and min_t < cursor_to:
+                cursor_to = min_t - 1
+            else:
+                cursor_to = cursor_from - 1
             time.sleep(0.08)
 
         if not raw_rows:
@@ -397,12 +421,13 @@ class GateCollector:
         contract = f"{symbol}_USDT"
         now_sec = int(time.time())
         cur_hour_ms = ((now_sec * 1000) // HOUR_MS) * HOUR_MS
-        cutoff_sec = now_sec - days * 86400
+        eff_days = min(int(days), self.MAX_CANDLE_LOOKBACK_DAYS)
+        cutoff_sec = now_sec - eff_days * 86400
         seen: dict[int, PriceBar] = {}
-        cursor_from = cutoff_sec
-        step_sec = 900 * 3600  # 900 hours per batch
-        while cursor_from < now_sec:
-            cursor_to = min(now_sec, cursor_from + step_sec)
+        cursor_to = now_sec
+        step_sec = 900 * 3600  # 900 hours per batch (reverse-chronological so newly listed coins keep recent bars)
+        while cursor_to > cutoff_sec:
+            cursor_from = max(cutoff_sec, cursor_to - step_sec)
             url = f"{self.BASE_URL}/candlesticks?contract={contract}&interval=1h&from={cursor_from}&to={cursor_to}"
             try:
                 rows = _http_json(url)
@@ -410,6 +435,8 @@ class GateCollector:
                 if exc.code in (400, 404):
                     break
                 raise
+            if not rows:
+                break
             for r in rows:
                 ts_ms = (int(r["t"]) * 1000 // HOUR_MS) * HOUR_MS
                 if ts_ms >= cur_hour_ms:
@@ -427,8 +454,8 @@ class GateCollector:
                     volume_usd=vol_usd,
                     provenance=PROVENANCE_REAL,
                 )
-            if cursor_to >= now_sec:
+            if cursor_from <= cutoff_sec:
                 break
-            cursor_from = cursor_to  # Overlap boundary safely (deduplicated via seen[ts_ms])
+            cursor_to = cursor_from  # Overlap boundary safely (deduplicated via seen[ts_ms])
             time.sleep(0.08)
         return sorted(seen.values(), key=lambda x: x.ts_ms)

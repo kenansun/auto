@@ -112,10 +112,20 @@ def cmd_dq_audit(args: argparse.Namespace) -> int:
     elif args.bbo:
         rep, summary = auditor.audit_bbo_ticks(args.venue_a, args.venue_b, symbols, max_stale_sec=None)
         print(json.dumps({"report": rep.to_dict(), "bbo_summary": summary}, indent=2, ensure_ascii=False))
+    elif args.single_perp:
+        rep = auditor.audit_single_venue_perp(args.venue_a, symbols, ref_venue=args.ref_venue or None)
+        print(json.dumps(rep.to_dict(), indent=2, ensure_ascii=False))
     else:
         rep = auditor.audit_funding_pair(args.venue_a, args.venue_b, symbols)
         print(json.dumps(rep.to_dict(), indent=2, ensure_ascii=False))
     store.close()
+    return 0
+
+
+def cmd_exec_status(args: argparse.Namespace) -> int:
+    ctx = ConsoleAppContext(args.data_dir)
+    print(json.dumps(ctx.exec_bridge.summary(), indent=2, ensure_ascii=False))
+    ctx.close()
     return 0
 
 
@@ -148,7 +158,7 @@ def cmd_fleet_audit(args: argparse.Namespace) -> int:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     srv, ctx = create_server(args.data_dir, host=args.host, port=args.port)
-    print(f"AlphaLoop v2 Console serving on http://{args.host}:{args.port} (data_dir={args.data_dir})")
+    print(f"AlphaLoop v2.1 Console serving on http://{args.host}:{args.port} (data_dir={args.data_dir})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -195,7 +205,7 @@ def cmd_agent_cycle(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    p = argparse.ArgumentParser(prog="alphaloop", description="AlphaLoop v2 Strategy Factory & R&D Platform")
+    p = argparse.ArgumentParser(prog="alphaloop", description="AlphaLoop v2.1 Strategy Factory & R&D Platform")
     p.add_argument("--data-dir", default="data", help="Directory for SQLite databases and active configs")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -211,17 +221,22 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--top", type=int, default=20)
     ps.set_defaults(func=cmd_scan)
 
-    pdq = sub.add_parser("dq-audit", help="Run DQ-01..DQ-08 certification on funding/BBO/CSV datasets")
+    pdq = sub.add_parser("dq-audit", help="Run DQ-01..DQ-08 certification on funding/BBO/CSV/single-perp datasets")
     pdq.add_argument("--venue-a", default="hyperliquid")
     pdq.add_argument("--venue-b", default="okx")
     pdq.add_argument("--symbols", default="")
     pdq.add_argument("--bbo", action="store_true", help="Audit live captured BBO ticks")
+    pdq.add_argument("--single-perp", action="store_true", help="Audit single-venue perp candles + funding")
+    pdq.add_argument("--ref-venue", default="", help="Optional reference venue for cross-venue price sanity")
     pdq.add_argument("--csv", default="", help="Audit a local/server-captured CSV file")
     pdq.add_argument("--ts-col", default="ts_ms")
     pdq.add_argument("--price-cols", default="")
     pdq.set_defaults(func=cmd_dq_audit)
 
-    ppl = sub.add_parser("plugins", help="List registered Strategy Factory v2 plugins")
+    pex = sub.add_parser("exec-status", help="Inspect Shadow Execution Bridge audit chain & kill switch status")
+    pex.set_defaults(func=cmd_exec_status)
+
+    ppl = sub.add_parser("plugins", help="List registered Strategy Factory v2.1 plugins")
     ppl.set_defaults(func=cmd_plugins)
 
     pmr = sub.add_parser("micro-run", help="Evaluate captured BBO window via Fast Micro-Run state machine")
@@ -234,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
     pfl.add_argument("--ssh-key", default=os.environ.get("ALPHALOOP_SSH_KEY") or str(Path.home() / ".ssh" / "id_ed25519"))
     pfl.set_defaults(func=cmd_fleet_audit)
 
-    pv = sub.add_parser("serve", help="Run local Strategy R&D Web Console v2")
+    pv = sub.add_parser("serve", help="Run local Strategy R&D Web Console v2.1")
     pv.add_argument("--host", default="127.0.0.1")
     pv.add_argument("--port", type=int, default=8796)
     pv.set_defaults(func=cmd_serve)

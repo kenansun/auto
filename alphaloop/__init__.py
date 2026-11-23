@@ -1,3 +1,3 @@
-"""AlphaLoop v2 — Quantitative Strategy Factory, DQ Certification & Multi-Model Agent R&D Platform."""
+"""AlphaLoop v2.1 — Quantitative Strategy Factory, DQ Certification, Portfolio & Shadow Execution Platform."""
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"

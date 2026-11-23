@@ -228,11 +228,69 @@ class FundingCarryBacktester:
         eff_weight = min(cfg.per_position_weight, 1.0 / max(1, cfg.max_positions))
         slot_capital = cfg.capital_usd * eff_weight
         if is_spot_perp:
-            notional_per_leg = slot_capital * (cfg.leverage / (1.0 + cfg.leverage))
+            base_notional_per_leg = slot_capital * (cfg.leverage / (1.0 + cfg.leverage))
             slot_margin_per_leg = max(1e-6, slot_capital / (1.0 + cfg.leverage))
         else:
-            notional_per_leg = slot_capital * (cfg.leverage / 2.0)
+            base_notional_per_leg = slot_capital * (cfg.leverage / 2.0)
             slot_margin_per_leg = max(1e-6, slot_capital * 0.5)
+
+        def _p_float(key: str, default: float) -> float:
+            raw = cfg.params.get(key, default)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                return default
+            fv = float(raw)
+            return fv if math.isfinite(fv) else default
+
+        def _p_int(key: str, default: int) -> int:
+            raw = cfg.params.get(key, default)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                return default
+            fv = float(raw)
+            return int(round(fv)) if math.isfinite(fv) else default
+
+        # Phase 2 Module A: Optional causal volatility-tiered leverage & protective margin exit (cfg.params)
+        vol_tier_enabled = bool(cfg.params.get("vol_target_leverage_enabled", False))
+        vol_lookback_h = max(24, min(336, _p_int("vol_lookback_hours", 168)))
+        vol_target_ann_pct = max(40.0, min(300.0, _p_float("vol_target_ann_pct", 120.0)))
+        min_sym_lev = max(1.0, min(cfg.leverage, _p_float("min_symbol_leverage", 1.5)))
+        raw_prot_pct = _p_float("protective_margin_exit_pct", 0.0)
+        protective_exit_pct = raw_prot_pct if (0.0 < raw_prot_pct < 0.90) else 0.0
+        # Enforce physical storm-exit floor >= 5.0bp/leg so protective exits cannot assume calm maker fills
+        protective_exit_slip_bps = max(5.0, _p_float("protective_exit_slip_bps", 5.0))
+
+        # Precompute strictly causal 1h log-returns per timestamp (prefer venue_a, fallback venue_b per bar; no full-window len check)
+        hourly_log_rets: dict[str, dict[int, float]] = {}
+        if vol_tier_enabled:
+            for sym in symbols:
+                rets_map: dict[int, float] = {}
+                for ts_bar, bar in candles_b[sym].items():
+                    if bar.open > 0 and bar.close > 0:
+                        rets_map[ts_bar] = math.log(bar.close / bar.open)
+                for ts_bar, bar in candles_a[sym].items():
+                    if bar.open > 0 and bar.close > 0:
+                        rets_map[ts_bar] = math.log(bar.close / bar.open)
+                hourly_log_rets[sym] = rets_map
+
+        def causal_symbol_leverage(sym: str, decision_ts: int) -> float:
+            """Compute strictly causal leverage using ONLY closed 1h bars [decision_ts - lb, decision_ts - 1h]."""
+            if not vol_tier_enabled:
+                return cfg.leverage
+            rmap = hourly_log_rets.get(sym, {})
+            rets: list[float] = []
+            # Bar stamped at t closes at t + 1h, so strictly t <= decision_ts - HOUR_MS is closed at decision_ts
+            for k in range(1, vol_lookback_h + 1):
+                r_val = rmap.get(decision_ts - k * HOUR_MS)
+                if r_val is not None:
+                    rets.append(r_val)
+            if len(rets) < 24:
+                return min_sym_lev  # Fail-safe conservative leverage when volatility history is thin
+            mean_r = sum(rets) / len(rets)
+            var_r = sum((x - mean_r) ** 2 for x in rets) / max(1, len(rets) - 1)
+            ann_vol_pct = math.sqrt(max(0.0, var_r)) * math.sqrt(8760.0) * 100.0
+            if ann_vol_pct <= 1e-6:
+                return min_sym_lev
+            target_lev = vol_target_ann_pct / ann_vol_pct
+            return max(min_sym_lev, min(cfg.leverage, target_lev))
 
         eff_fee_a = cfg.fee_a_bps
         eff_fee_b = cfg.fee_b_bps
@@ -245,6 +303,15 @@ class FundingCarryBacktester:
         slip_bps = cfg.slippage_per_leg_bps + extra_slippage_bps_per_leg
         one_way_fee_bps = eff_fee_a + eff_fee_b
         one_way_slip_bps = 2.0 * slip_bps
+
+        # Extra taker + storm-slippage surcharge paid on exit when protective margin exit fires
+        taker_exit_a = max(eff_fee_a, TAKER_FEE_BPS.get(cfg.venue_a, eff_fee_a))
+        taker_exit_b = max(eff_fee_b, TAKER_FEE_BPS.get(cfg.venue_b, eff_fee_b))
+        protective_exit_extra_bps = (
+            max(0.0, taker_exit_a - eff_fee_a)
+            + max(0.0, taker_exit_b - eff_fee_b)
+            + 2.0 * max(0.0, protective_exit_slip_bps - slip_bps)
+        )
 
         open_pos: dict[str, _OpenPosition] = {}
         anchor_px: dict[str, tuple[float | None, float | None]] = {}
@@ -289,7 +356,7 @@ class FundingCarryBacktester:
                     else:
                         pos.low_streak_settlements = 0
 
-            # 2) Check per-leg margin safety (P1-1 + Red-Team #3 proxy for missing-candle leg) & exits
+            # 2) Check per-leg margin safety (P1-1 + Red-Team #3 + Phase 2 Protective Exit) & exits
             to_close: list[tuple[str, str]] = []
             prev_bar_ts = ts - HOUR_MS
             for sym, pos in open_pos.items():
@@ -317,16 +384,26 @@ class FundingCarryBacktester:
                         mv_b = (1.0 - (eff_bar_b.low / eff_anc_b)) if is_short_a else ((eff_bar_b.high / eff_anc_b) - 1.0)
                         adverse_leg_move = max(adverse_leg_move, mv_b)
 
+                    # leg_lev uses fixed slot_margin_per_leg so vol-tiered lower notional keeps unused margin as buffer
                     leg_lev = pos.notional_usd / slot_margin_per_leg
                     margin_consumed = adverse_leg_move * leg_lev
+                    # Precedence: 1) >=0.90 liquidation ALWAYS checked first (single-bar jump still liquidates)
                     if margin_consumed >= 0.90:
                         liquidation_count += 1
-                        # Red-Team #3: realize maintenance-margin liquidation penalty + unhedged exit slip
                         extra_rebal_usd[sym] = extra_rebal_usd.get(sym, 0.0) + max(
                             slot_margin_per_leg * 0.90, pos.notional_usd * 0.05
                         )
                         to_close.append((sym, "MARGIN_LIQUIDATION"))
                         continue
+                    # 2) Protective margin exit in [protective_exit_pct, 0.90) takes precedence over 0.65 rebalance
+                    #    when configured <= 0.65; exits at ts open with TAKER_TAKER + >=5bp/leg storm slip + 24h cooldown
+                    elif protective_exit_pct > 0.0 and margin_consumed >= protective_exit_pct:
+                        extra_rebal_usd[sym] = extra_rebal_usd.get(sym, 0.0) + (
+                            pos.notional_usd * (protective_exit_extra_bps / 10000.0)
+                        )
+                        to_close.append((sym, "MARGIN_PROTECT_EXIT"))
+                        continue
+                    # 3) Legacy forced collateral rebalance at 0.65 (only reachable when protective_exit_pct == 0 or >0.65)
                     elif margin_consumed >= 0.65:
                         forced_rebalance_count += 1
                         extra_rebal_usd[sym] = extra_rebal_usd.get(sym, 0.0) + max(1.0, slot_margin_per_leg * 0.001)
@@ -363,7 +440,7 @@ class FundingCarryBacktester:
                 pos = open_pos.pop(sym)
                 anchor_px.pop(sym, None)
                 forced_cost = extra_rebal_usd.pop(sym, 0.0)
-                if reason in ("MARGIN_LIQUIDATION", "BASIS_STOP"):
+                if reason in ("MARGIN_LIQUIDATION", "MARGIN_PROTECT_EXIT", "BASIS_STOP"):
                     cooldown_until[sym] = ts + 24 * HOUR_MS
                 trade_seq += 1
                 tr, priced = self._finalize_trade(
@@ -411,11 +488,16 @@ class FundingCarryBacktester:
                         adverse_entry = -raw_basis_bps if direction in ("SHORT_A_LONG_B", "SHORT_A_LONG_SPOT") else raw_basis_bps
                         if adverse_entry > cfg.max_basis_entry_bps:
                             continue
+                    eff_lev = causal_symbol_leverage(sym, ts)
+                    if is_spot_perp:
+                        pos_notional = slot_capital * (eff_lev / (1.0 + eff_lev)) if vol_tier_enabled else base_notional_per_leg
+                    else:
+                        pos_notional = (slot_margin_per_leg * eff_lev) if vol_tier_enabled else base_notional_per_leg
                     open_pos[sym] = _OpenPosition(
                         symbol=sym,
                         direction=direction,
                         entry_ts_ms=ts,
-                        notional_usd=notional_per_leg,
+                        notional_usd=pos_notional,
                         entry_spread_apr_pct=spread_apr,
                         entry_px_a=px_a,
                         entry_px_b=px_b,

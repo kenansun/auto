@@ -18,6 +18,7 @@ data/*.sqlite-shm
 data/state/
 data/fleet_audit/
 data/research_run/
-data/research_results.json
+data/phase2_run/
+data/*.json
 config/fleet_roles.json
 .DS_Store
