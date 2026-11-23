@@ -1,12 +1,14 @@
-"""Closed-Loop 4-Role Agent Strategy Evolution Orchestrator (RD-Agent Pattern).
+"""Closed-Loop Plugin-Agnostic Agent Strategy Evolution Orchestrator (AlphaLoop v2).
 
-Pipeline:
-  1. TelemetryMonitor compresses live/paper/backtest results into a compact FeedbackEvent.
-  2. QuantHypothesisAgent (DeepSeek Reasoner / fallback) proposes a single bounded config mutation.
-  3. SixGateVerifier deterministically evaluates candidate on REAL exchange history (no LLM self-grading).
-  4. RedTeamCriticAgent (Cross-family Claude Opus / GPT-6.1 / fallback) audits compact diff + 6-Gate report.
-  5. HotConfigStore atomically stages SHADOW_LIVE config via rename(2) ONLY if all 6 gates PASS
-     AND Red-Team approves. LIVE money deployment remains strictly human-gated.
+Upgrades (Architect P0-5, P1-3, P1-5):
+  - 100% strategy-agnostic via PluginRegistry (works on funding_carry, basis_reversion, structural_arb, etc.).
+  - Resets per-round LLM budget cleanly before each cycle (P1-5).
+  - Enforces Architect P1-3 DQ Promotion Cap:
+      * DATA_QUALIFIED_FULL (or verified live BBO FULL cert for the venue pair) -> SHADOW_LIVE.
+      * DATA_QUALIFIED_FUNDING_ONLY -> CAPPED at MICRO_RUN_PROBE_REQUIRED (cannot auto-stage SHADOW_LIVE).
+      * DATA_REJECTED -> blocked at G1.
+  - Supports multi-round autonomous improvement sprints (`run_multi_round_sprint`) with convergence stop.
+  - LIVE capital promotion remains strictly human-gated via HotConfigStore.
 """
 
 from __future__ import annotations
@@ -31,39 +33,28 @@ from alphaloop.core.models import (
 from alphaloop.core.provenance import sha256_obj, utc_now_ms
 from alphaloop.harness.backtester import FundingCarryBacktester
 from alphaloop.harness.gates import SixGateVerifier
-from alphaloop.harness.telemetry import TelemetryMonitor
+from alphaloop.harness.micro_runner import MicroRunSession, MicroRunStore
+from alphaloop.plugins import BaseStrategyPlugin, PluginRegistry, default_registry
 
 logger = logging.getLogger(__name__)
 
 PROPOSER_SYSTEM_PROMPT = (
-    "You are a quantitative strategy researcher. Given compact telemetry diagnostics and current "
-    "StrategyConfig, output a single JSON object with keys: hypothesis (str), economic_rationale (str), "
-    "param_changes (dict of allowed numeric/bool fields), kill_criteria (str). "
+    "You are a quantitative strategy researcher. Given compact telemetry diagnostics, plugin metadata, "
+    "and current StrategyConfig, output a single JSON object with keys: hypothesis (str), "
+    "economic_rationale (str), param_changes (dict of allowed numeric/bool fields), kill_criteria (str). "
     "Focus on fixing the exact diagnosed failure mode without overfitting."
 )
 
 RED_TEAM_SYSTEM_PROMPT = (
     "You are an adversarial quantitative risk auditor. Inspect ONLY the proposed param_changes, "
-    "baseline vs candidate metrics, and 6-Gate verification verdict. Return a single JSON object with keys: "
-    "decision ('APPROVE_SHADOW' | 'REVISE' | 'REJECT'), findings (list of {severity, item, detail}), summary (str). "
-    "NEVER approve if any machine gate failed or if costs/concentration remain unsafe."
+    "baseline vs candidate metrics, DQ tier, and 6-Gate verification verdict. Return a single JSON object "
+    "with keys: decision ('APPROVE_SHADOW' | 'REVISE' | 'REJECT'), findings (list of {severity, item, detail}), "
+    "summary (str). NEVER approve if any machine gate failed, liquidation_count > 0, or DQ is DATA_REJECTED."
 )
-
-# Bounded mutation whitelist prevents an LLM from modifying capital/safety/venue invariants
-MUTABLE_PARAM_BOUNDS: dict[str, tuple[float, float]] = {
-    "entry_spread_apr_pct": (4.0, 60.0),
-    "exit_spread_apr_pct": (0.0, 20.0),
-    "lookback_hours": (8.0, 240.0),
-    "exit_confirm_hours": (4.0, 96.0),
-    "min_hold_hours": (8.0, 240.0),
-    "max_basis_entry_bps": (10.0, 100.0),
-    "stop_loss_basis_bps": (80.0, 400.0),
-    "max_positions": (1.0, 10.0),
-}
 
 
 class AgentEvolutionOrchestrator:
-    """Runs and persists end-to-end closed-loop Agent strategy iteration cycles."""
+    """Runs and persists plugin-agnostic closed-loop Agent strategy evolution cycles."""
 
     def __init__(
         self,
@@ -72,13 +63,16 @@ class AgentEvolutionOrchestrator:
         verifier: SixGateVerifier,
         config_store: HotConfigStore,
         router: MultiModelRouter | None = None,
+        registry: PluginRegistry | None = None,
+        micro_store: MicroRunStore | None = None,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.backtester = backtester
         self.verifier = verifier
         self.config_store = config_store
         self.router = router or MultiModelRouter()
-        self.telemetry = TelemetryMonitor()
+        self.registry = registry or verifier.registry or default_registry()
+        self.micro_store = micro_store
         self.conn = connect_wal(self.state_dir / "agent_cycles.sqlite")
         self._init_schema()
 
@@ -106,6 +100,27 @@ class AgentEvolutionOrchestrator:
                 """
             )
 
+    def _has_verified_micro_run_lift(self, cand_cfg: StrategyConfig, max_age_ms: int = 7 * 86400 * 1000) -> bool:
+        """Return True ONLY if a fresh COMPLETED_PASS MicroRun exists AND covers 100% of cand_cfg.symbols."""
+        if self.micro_store is None:
+            return False
+        passed_mr = self.micro_store.latest_passed_run(
+            cand_cfg.strategy_id, version=cand_cfg.version, max_age_ms=max_age_ms
+        )
+        if passed_mr is None or passed_mr.dq_tier != "DATA_QUALIFIED_FULL":
+            return False
+        observed_syms = set(passed_mr.details.get("symbols_observed") or [])
+        req_syms = set(cand_cfg.symbols)
+        if not req_syms or not req_syms.issubset(observed_syms):
+            return False
+        bbo_cert = self.backtester.store.latest_dq_certificate(f"bbo:{cand_cfg.venue_a}<->{cand_cfg.venue_b}")
+        if not bbo_cert or bbo_cert.get("tier") != "DATA_QUALIFIED_FULL":
+            return False
+        if (utc_now_ms() - int(bbo_cert.get("created_ts_ms", 0))) > max_age_ms:
+            return False
+        cert_syms = set((bbo_cert.get("symbol_scores") or {}).keys())
+        return req_syms.issubset(cert_syms)
+
     def run_cycle(
         self,
         current_cfg: StrategyConfig,
@@ -114,55 +129,84 @@ class AgentEvolutionOrchestrator:
         end_ms: int | None = None,
         allow_synthetic_in_unit_test: bool = False,
     ) -> dict[str, Any]:
-        """Execute 1 complete closed-loop iteration: Telemetry -> Propose -> 6-Gate -> Red-Team -> Hot-Stage."""
+        """Execute 1 complete plugin-agnostic closed-loop iteration."""
         now = utc_now_ms()
-        base_res = self.backtester.run(current_cfg, start_ms=start_ms, end_ms=end_ms)
-        feedback = self.telemetry.diagnose(current_cfg, base_res.metrics)
+        self.router.reset_round_budget()
+        store = self.backtester.store
+        plugin = self.registry.resolve_for_config(current_cfg)
 
-        # Step 2: Invoke Quant Hypothesis Proposer
-        proposal = self._propose_mutation(current_cfg, feedback, base_res.metrics)
+        # Step 1: Evaluate baseline & diagnose structured anomaly via plugin
+        base_res = plugin.evaluate(store, current_cfg, start_ms=start_ms, end_ms=end_ms)
+        feedback = plugin.diagnose_telemetry(current_cfg, base_res.metrics)
 
-        # Apply strictly bounded parameter changes
-        cand_cfg = self._apply_bounded_changes(current_cfg, next_version, proposal.param_changes)
+        # Step 2: Invoke Quant Hypothesis Proposer & clamp strictly via plugin invariants
+        proposal = self._propose_mutation(plugin, current_cfg, feedback, base_res.metrics)
+        cand_cfg = plugin.validate_and_clamp(current_cfg, next_version, proposal.param_changes)
 
-        # Step 3: Deterministic 6-Gate Machine Verification (ZERO LLM self-grading)
+        # Step 3: Deterministic DQ + 6-Gate Machine Verification (ZERO LLM self-grading)
         verdict, cand_res, extras = self.verifier.verify(
             cand_cfg,
             start_ms=start_ms,
             end_ms=end_ms,
             allow_synthetic_in_unit_test=allow_synthetic_in_unit_test,
+            plugin=plugin,
         )
 
         # Step 4: Adversarial Cross-Model Red-Team Audit
         proposer_family = proposal.model_used.split("/")[0]
-        red_team = self._run_red_team(current_cfg, cand_cfg, base_res.metrics, cand_res.metrics, verdict, proposer_family)
+        red_team = self._run_red_team(
+            current_cfg, cand_cfg, base_res.metrics, cand_res.metrics, verdict, proposer_family
+        )
 
-        # Step 5: Atomic Hot-Config Staging (SHADOW_LIVE max; LIVE strictly human-gated)
+        # Step 5: Atomic Hot-Config Staging with Hardened Architect P1-3 DQ Promotion Cap (Red-Team #5.1)
         promoted = False
+        promotion_stage = "HELD"
         staged_sha = None
         if verdict.overall_pass and red_team.decision == "APPROVE_SHADOW":
-            staged_cfg = dataclasses.replace(cand_cfg, status="SHADOW_LIVE")
-            staged_sha = self.config_store.register_version(
-                staged_cfg,
-                actor=f"alphaloop:{proposal.model_used}+rt:{red_team.model_used}",
-                reason=f"Auto-staged SHADOW_LIVE after {verdict.passed_count}/{verdict.total_count} gates + RedTeam APPROVE_SHADOW",
-            )
-            promoted = True
+            has_verified_micro_lift = self._has_verified_micro_run_lift(cand_cfg)
+            if verdict.dq_tier == "DATA_QUALIFIED_FULL" or has_verified_micro_lift:
+                staged_cfg = dataclasses.replace(cand_cfg, status="SHADOW_LIVE")
+                staged_sha = self.config_store.register_version(
+                    staged_cfg,
+                    actor=f"alphaloop:{proposal.model_used}+rt:{red_team.model_used}",
+                    reason=(
+                        f"Auto-staged SHADOW_LIVE ({verdict.passed_count}/{verdict.total_count} gates, "
+                        f"DQ={verdict.dq_tier}, micro_run_lift={has_verified_micro_lift}, RedTeam=APPROVE_SHADOW)"
+                    ),
+                )
+                promoted = True
+                promotion_stage = "SHADOW_LIVE"
+            else:
+                # Architect P1-3: FUNDING_ONLY MUST pass full-symbol COMPLETED_PASS MicroRun before SHADOW_LIVE!
+                probe_cfg = dataclasses.replace(cand_cfg, status="MICRO_RUN_PROBE_REQUIRED")
+                staged_sha = self.config_store.register_version(
+                    probe_cfg,
+                    actor=f"alphaloop:{proposal.model_used}+rt:{red_team.model_used}",
+                    reason=(
+                        f"Capped at MICRO_RUN_PROBE_REQUIRED (DQ={verdict.dq_tier}: requires full-symbol COMPLETED_PASS MicroRun)"
+                    ),
+                )
+                promoted = False
+                promotion_stage = "MICRO_RUN_PROBE_REQUIRED"
         else:
-            rejected_cfg = dataclasses.replace(cand_cfg, status="BACKTESTED")
             logger.info(
-                "Candidate %s@%s NOT promoted (gates=%d/%d, red_team=%s)",
-                rejected_cfg.strategy_id,
-                rejected_cfg.version,
+                "Candidate %s@%s NOT promoted (gates=%d/%d, dq=%s, red_team=%s)",
+                cand_cfg.strategy_id,
+                cand_cfg.version,
                 verdict.passed_count,
                 verdict.total_count,
+                verdict.dq_tier,
                 red_team.decision,
             )
 
+        diff_scorecard = MicroRunSession.compare_versions(
+            base_res.metrics.to_dict(), cand_res.metrics.to_dict()
+        )
         cycle_id = f"CYC-{sha256_obj({'s': current_cfg.strategy_id, 'v': next_version, 't': now})[:10]}"
         record = {
             "cycle_id": cycle_id,
             "ts_ms": now,
+            "plugin_id": plugin.plugin_id,
             "strategy_id": current_cfg.strategy_id,
             "from_version": current_cfg.version,
             "to_version": next_version,
@@ -170,14 +214,18 @@ class AgentEvolutionOrchestrator:
             "proposal": proposal.to_dict(),
             "baseline_metrics": base_res.metrics.to_dict(),
             "candidate_metrics": cand_res.metrics.to_dict(),
+            "diff_scorecard": diff_scorecard,
+            "dq_report": extras["dq_report"],
             "gate_verdict": verdict.to_dict(),
             "red_team_verdict": red_team.to_dict(),
             "promoted_shadow": promoted,
+            "promotion_stage": promotion_stage,
             "staged_config_sha256": staged_sha,
             "plateau_grid": extras["plateau_grid"],
             "is_metrics": extras["is_metrics"],
             "oos_metrics": extras["oos_metrics"],
             "stress_metrics": extras["stress_metrics"],
+            "taker_hedge_metrics": extras["taker_hedge_metrics"],
             "candidate_config": cand_cfg.to_dict(),
         }
 
@@ -210,21 +258,66 @@ class AgentEvolutionOrchestrator:
             )
         return record
 
+    def run_multi_round_sprint(
+        self,
+        seed_cfg: StrategyConfig,
+        max_rounds: int = 3,
+        version_prefix: str = "v-sprint",
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        allow_synthetic_in_unit_test: bool = False,
+    ) -> dict[str, Any]:
+        """Run up to `max_rounds` bounded evolution iterations with early convergence stop."""
+        rounds: list[dict[str, Any]] = []
+        cur_cfg = seed_cfg
+        non_improve_streak = 0
+        stop_reason = "MAX_ROUNDS_REACHED"
+
+        for r_idx in range(1, max(1, max_rounds) + 1):
+            rec = self.run_cycle(
+                cur_cfg,
+                next_version=f"{version_prefix}-r{r_idx}",
+                start_ms=start_ms,
+                end_ms=end_ms,
+                allow_synthetic_in_unit_test=allow_synthetic_in_unit_test,
+            )
+            rounds.append(rec)
+            if rec["gate_verdict"]["overall_pass"] and rec["red_team_verdict"]["decision"] == "APPROVE_SHADOW":
+                stop_reason = f"CONVERGED_AT_ROUND_{r_idx}({rec['promotion_stage']})"
+                cur_cfg = StrategyConfig.from_dict(rec["candidate_config"])
+                break
+            if rec["diff_scorecard"]["improved"]:
+                cur_cfg = StrategyConfig.from_dict(rec["candidate_config"])
+                non_improve_streak = 0
+            else:
+                non_improve_streak += 1
+                if non_improve_streak >= 2:
+                    stop_reason = f"EARLY_STOP_NO_IMPROVEMENT_AFTER_ROUND_{r_idx}"
+                    break
+
+        return {
+            "strategy_id": seed_cfg.strategy_id,
+            "plugin_id": seed_cfg.plugin_id,
+            "rounds_executed": len(rounds),
+            "stop_reason": stop_reason,
+            "final_version": cur_cfg.version,
+            "final_promotion_stage": rounds[-1]["promotion_stage"] if rounds else "NONE",
+            "rounds": rounds,
+        }
+
     def _propose_mutation(
-        self, cfg: StrategyConfig, feedback: FeedbackEvent, metrics: BacktestMetrics
+        self,
+        plugin: BaseStrategyPlugin,
+        cfg: StrategyConfig,
+        feedback: FeedbackEvent,
+        metrics: BacktestMetrics,
     ) -> AgentProposal:
         now = utc_now_ms()
         payload = {
+            "plugin": plugin.metadata(),
             "feedback": feedback.to_dict(),
-            "current_config": {
-                k: getattr(cfg, k)
-                for k in (
-                    "venue_a", "venue_b", "mode", "entry_spread_apr_pct", "exit_spread_apr_pct",
-                    "lookback_hours", "exit_confirm_hours", "min_hold_hours", "max_positions",
-                    "fee_a_bps", "fee_b_bps", "use_atb_buggy_rules",
-                )
-            },
-            "allowed_bounds": MUTABLE_PARAM_BOUNDS,
+            "current_config": cfg.to_dict(),
+            "allowed_bounds": plugin.mutable_param_bounds(),
         }
         llm_out, model_used = self.router.invoke_json("QUANT_HYPOTHESIS", PROPOSER_SYSTEM_PROMPT, payload)
         if llm_out and isinstance(llm_out.get("param_changes"), dict):
@@ -239,51 +332,7 @@ class AgentEvolutionOrchestrator:
                 kill_criteria=str(llm_out.get("kill_criteria", "Any G1-G6 failure")),
             )
 
-        # Transparent deterministic quant fallback driven directly by telemetry diagnosis
-        changes: dict[str, Any] = {}
-        if cfg.use_atb_buggy_rules or feedback.anomaly_type == "CHURN_EXCESS":
-            changes = {
-                "use_atb_buggy_rules": False,
-                "entry_spread_apr_pct": 6.0,
-                "exit_spread_apr_pct": 0.5,
-                "lookback_hours": 120,
-                "min_hold_hours": 96,
-                "exit_confirm_hours": 36,
-            }
-            hyp = (
-                "Eliminate inverted hysteresis fee churn (ATB H6 failure mode) by disabling buggy "
-                "3-settlement exit, smoothing signal over 120h (5d) structural window, holding positive "
-                "carry down to 0.5% exit threshold with 96h min-hold + 36h exit confirmation."
-            )
-            econ = (
-                "Captures structural Perp-DEX (Hyperliquid/Lighter) baseline premium over CEXs (Gate/OKX) "
-                "while amortizing 4-leg round-trip costs across 15-20d average holds, cutting cost/gross below 35%."
-            )
-        elif feedback.anomaly_type == "BASIS_SHOCK":
-            changes = {
-                "max_basis_entry_bps": max(15.0, round(cfg.max_basis_entry_bps * 0.6, 1)),
-                "stop_loss_basis_bps": max(100.0, round(cfg.stop_loss_basis_bps * 0.75, 1)),
-                "lookback_hours": min(72, cfg.lookback_hours + 12),
-            }
-            hyp = "Tighten entry basis dislocation guard and basis stop-loss to cap adverse mark-price divergence."
-            econ = "Prevents entering stretched premiums right before mean-reversion hurts the short-perp leg."
-        elif feedback.anomaly_type == "EDGE_DECAY":
-            changes = {
-                "entry_spread_apr_pct": max(12.0, round(cfg.entry_spread_apr_pct * 0.85, 1)),
-                "exit_spread_apr_pct": max(2.0, round(cfg.exit_spread_apr_pct * 0.75, 1)),
-                "lookback_hours": 48,
-                "min_hold_hours": 48,
-            }
-            hyp = "Smooth trailing signal to 48h and moderate entry hurdle to capture persistent mid-tier carry spreads."
-            econ = "Captures longer-lived Hyperliquid baseline vs lower-funding venue spreads while keeping turnover low."
-        else:
-            changes = {
-                "lookback_hours": min(72, cfg.lookback_hours + 12),
-                "min_hold_hours": min(72, cfg.min_hold_hours + 12),
-            }
-            hyp = "Incremental turnover reduction on healthy carry engine to improve Sharpe and cost efficiency."
-            econ = "Longer smoothing window filters brief 1h funding spikes without sacrificing structural spread carry."
-
+        changes, hyp, econ, kill = plugin.fallback_proposal(cfg, feedback, metrics)
         return AgentProposal(
             proposal_id=f"PROP-{sha256_obj({'t': now, 'c': changes})[:8]}",
             ts_ms=now,
@@ -292,29 +341,8 @@ class AgentEvolutionOrchestrator:
             hypothesis=hyp,
             economic_rationale=econ,
             param_changes=changes,
-            kill_criteria="Reject immediately if STRESS net PnL <= 0, OOS retention < 40%, or plateau < 75%.",
+            kill_criteria=kill,
         )
-
-    def _apply_bounded_changes(
-        self, cfg: StrategyConfig, next_version: str, changes: dict[str, Any]
-    ) -> StrategyConfig:
-        d = cfg.to_dict()
-        d["version"] = next_version
-        d["status"] = "BACKTESTED"
-        for key, val in changes.items():
-            if key == "use_atb_buggy_rules" and isinstance(val, bool):
-                d[key] = val
-            elif key in MUTABLE_PARAM_BOUNDS and isinstance(val, (int, float)):
-                lo, hi = MUTABLE_PARAM_BOUNDS[key]
-                clamped = max(lo, min(hi, float(val)))
-                if isinstance(getattr(cfg, key), int):
-                    d[key] = int(round(clamped))
-                else:
-                    d[key] = round(clamped, 3)
-        # Invariant: entry hurdle must stay at least 4% APR above exit hurdle
-        if d["exit_spread_apr_pct"] >= d["entry_spread_apr_pct"] - 4.0:
-            d["exit_spread_apr_pct"] = max(0.5, round(d["entry_spread_apr_pct"] - 6.0, 2))
-        return StrategyConfig.from_dict(d)
 
     def _run_red_team(
         self,
@@ -334,8 +362,22 @@ class AgentEvolutionOrchestrator:
         }
         payload = {
             "param_diff": compact_diff,
-            "baseline": {"apr_pct": base_m.annualized_apr_pct, "sharpe": base_m.sharpe_ratio, "net_usd": base_m.net_pnl_usd, "fee_ratio": base_m.fee_to_gross_ratio},
-            "candidate": {"apr_pct": cand_m.annualized_apr_pct, "sharpe": cand_m.sharpe_ratio, "net_usd": cand_m.net_pnl_usd, "fee_ratio": cand_m.fee_to_gross_ratio, "max_dd_pct": cand_m.max_drawdown_pct},
+            "baseline": {
+                "apr_pct": base_m.annualized_apr_pct,
+                "sharpe": base_m.sharpe_ratio,
+                "net_usd": base_m.net_pnl_usd,
+                "fee_ratio": base_m.fee_to_gross_ratio,
+                "liquidations": base_m.liquidation_count,
+            },
+            "candidate": {
+                "apr_pct": cand_m.annualized_apr_pct,
+                "sharpe": cand_m.sharpe_ratio,
+                "net_usd": cand_m.net_pnl_usd,
+                "fee_ratio": cand_m.fee_to_gross_ratio,
+                "max_dd_pct": cand_m.max_drawdown_pct,
+                "liquidations": cand_m.liquidation_count,
+            },
+            "dq_tier": verdict.dq_tier,
             "six_gate_verdict": verdict.to_dict(),
         }
         llm_out, model_used = self.router.invoke_json(
@@ -343,8 +385,7 @@ class AgentEvolutionOrchestrator:
         )
         if llm_out and llm_out.get("decision") in ("APPROVE_SHADOW", "REVISE", "REJECT"):
             decision = str(llm_out["decision"])
-            # Hard mechanical veto: LLM CANNOT override failed machine gates!
-            if not verdict.overall_pass and decision == "APPROVE_SHADOW":
+            if (not verdict.overall_pass or cand_m.liquidation_count > 0) and decision == "APPROVE_SHADOW":
                 decision = "REJECT"
             return RedTeamVerdict(
                 verdict_id=f"RT-{sha256_obj({'t': now, 'd': decision})[:8]}",
@@ -364,11 +405,23 @@ class AgentEvolutionOrchestrator:
                     "item": f"{chk.gate_id}:{chk.name}",
                     "detail": f"Observed {chk.value} vs required {chk.threshold} ({chk.detail})",
                 })
+        if cand_m.liquidation_count > 0:
+            findings.append({
+                "severity": "BLOCKER",
+                "item": "MARGIN_LIQUIDATION",
+                "detail": f"Candidate suffered {cand_m.liquidation_count} single-leg margin liquidation(s).",
+            })
+        if verdict.dq_tier == "DATA_QUALIFIED_FUNDING_ONLY":
+            findings.append({
+                "severity": "MAJOR",
+                "item": "FUNDING_ONLY_DQ_CAP",
+                "detail": "Dataset lacks dual-venue 1h basis coverage; capped at MICRO_RUN_PROBE_REQUIRED until live BBO FULL cert.",
+            })
         if cand_m.fee_to_gross_ratio > 0.50:
             findings.append({
                 "severity": "MAJOR",
                 "item": "COST_DRAG",
-                "detail": f"Costs consume {cand_m.fee_to_gross_ratio:.1%} of gross funding.",
+                "detail": f"Costs consume {cand_m.fee_to_gross_ratio:.1%} of gross alpha.",
             })
         if cand_m.net_pnl_usd <= base_m.net_pnl_usd and base_m.net_pnl_usd > 0:
             findings.append({
@@ -382,8 +435,8 @@ class AgentEvolutionOrchestrator:
             decision = "APPROVE_SHADOW"
             summary = (
                 f"All 6 deterministic gates passed (APR={cand_m.annualized_apr_pct:+.1f}%, "
-                f"Sharpe={cand_m.sharpe_ratio:.2f}, MaxDD={cand_m.max_drawdown_pct:.2f}%). "
-                f"Cleared for SHADOW_LIVE hot-reload; real capital still requires human sign-off."
+                f"Sharpe={cand_m.sharpe_ratio:.2f}, MaxDD={cand_m.max_drawdown_pct:.2f}%, DQ={verdict.dq_tier}). "
+                f"Real capital deployment remains strictly human-gated."
             )
         elif len(blockers) <= 2 and cand_m.net_pnl_usd > base_m.net_pnl_usd:
             decision = "REVISE"
@@ -402,10 +455,10 @@ class AgentEvolutionOrchestrator:
         )
 
     def recent_cycles(self, limit: int = 20) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
+        rows = self.conn.fetch_all(
             "SELECT payload_json FROM agent_cycles ORDER BY ts_ms DESC LIMIT ?",
             (limit,),
-        ).fetchall()
+        )
         return [json.loads(r["payload_json"]) for r in rows]
 
     def close(self) -> None:

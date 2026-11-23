@@ -144,7 +144,7 @@ class TestBacktesterAndGates(unittest.TestCase):
         g1 = next(c for c in verdict.checks if c.gate_id == "G1")
         self.assertFalse(g1.passed)
         self.assertFalse(verdict.overall_pass)
-        self.assertEqual(self.ledger.count_family_trials("unit-prov"), 1)
+        self.assertEqual(self.ledger.count_family_trials("funding_carry:hyperliquid<->gate"), 1)
 
     def test_atb_buggy_rules_reproduce_fee_churn_loss(self) -> None:
         """ATB H6 inverted hysteresis (enter >= 10.95% APR, exit < 54.75% APR x3) loses money on positive carry."""
@@ -174,6 +174,186 @@ class TestBacktesterAndGates(unittest.TestCase):
         self.assertGreater(res_bug.metrics.gross_funding_usd, 0.0)
         self.assertLess(res_bug.metrics.net_pnl_usd, 0.0)
         self.assertGreater(res_bug.metrics.trade_count, 50)
+
+    def test_zero_candle_close_lookahead_at_decision_hour(self) -> None:
+        """Architect P0-1: mutating c.close on decision bar t must have ZERO effect on entry decision or entry price."""
+        start = (1_700_000_000_000 // HOUR_MS) * HOUR_MS
+        hours = 60
+
+        def _run_with_close_shock(shock_mult: float) -> tuple[int, float, float]:
+            store = MarketDataStore(self.root / f"lh_{shock_mult}.sqlite")
+            fa, fb, ca, cb = [], [], [], []
+            for h in range(hours):
+                ts = start + h * HOUR_MS
+                fa.append(FundingRateBar("hyperliquid", "SOL", ts, 0.0004, 1.0, PROVENANCE_REAL))
+                fb.append(FundingRateBar("gate", "SOL", ts, 0.0, 1.0, PROVENANCE_REAL))
+                # Entry happens at h == 24; shock c.close at h == 24 massively while keeping c.open identical!
+                cl_a = 100.0 * shock_mult if h == 24 else 100.0
+                hi_a = max(100.0, cl_a)
+                lo_a = min(100.0, cl_a)
+                ca.append(PriceBar("hyperliquid", "SOL", ts, 100.0, hi_a, lo_a, cl_a, 1e6, PROVENANCE_REAL))
+                cb.append(PriceBar("gate", "SOL", ts, 100.0, 100.0, 100.0, 100.0, 1e6, PROVENANCE_REAL))
+            store.upsert_funding(fa)
+            store.upsert_funding(fb)
+            store.upsert_candles(ca)
+            store.upsert_candles(cb)
+            cfg = StrategyConfig(
+                strategy_id="t-open-only",
+                version="v1",
+                family="unit",
+                status="DRAFT",
+                venue_a="hyperliquid",
+                venue_b="gate",
+                mode="perp_perp",
+                symbols=["SOL"],
+                capital_usd=1000.0,
+                leverage=2.0,
+                max_positions=1,
+                per_position_weight=1.0,
+                entry_spread_apr_pct=15.0,
+                exit_spread_apr_pct=2.0,
+                lookback_hours=24,
+                max_basis_entry_bps=30.0,
+                stop_loss_basis_bps=250.0,
+                fee_a_bps=0.0,
+                fee_b_bps=0.0,
+                slippage_per_leg_bps=0.0,
+                rebalance_drag_bps_per_month=0.0,
+            )
+            res = FundingCarryBacktester(store).run(cfg, start_ms=start, end_ms=start + (hours - 1) * HOUR_MS)
+            store.close()
+            self.assertEqual(res.metrics.trade_count, 1)
+            return res.trades[0].entry_ts_ms, res.trades[0].basis_pnl_usd, res.trades[0].net_pnl_usd
+
+        e1, b1, n1 = _run_with_close_shock(1.0)
+        e2, b2, n2 = _run_with_close_shock(1.10)
+        self.assertEqual(e1, e2)
+        self.assertAlmostEqual(b1, b2, places=6)
+        self.assertAlmostEqual(n1, n2, places=6)
+
+    def test_margin_liquidation_trigger_and_g2_rejection(self) -> None:
+        """Architect P1-1: 48% adverse rally at 5.0x per-leg leverage MUST trigger MARGIN_LIQUIDATION, realize loss & fail G2."""
+        start = (1_700_000_000_000 // HOUR_MS) * HOUR_MS
+        hours = 80
+        fa, fb, ca, cb = [], [], [], []
+        for h in range(hours):
+            ts = start + h * HOUR_MS
+            fa.append(FundingRateBar("hyperliquid", "WLD", ts, 0.0005, 1.0, PROVENANCE_REAL))
+            fb.append(FundingRateBar("gate", "WLD", ts, 0.0, 1.0, PROVENANCE_REAL))
+            px = 100.0 if h < 30 else 145.0
+            hi = 148.0 if h == 30 else px
+            ca.append(PriceBar("hyperliquid", "WLD", ts, px, hi, px, px, 1e6, PROVENANCE_REAL))
+            cb.append(PriceBar("gate", "WLD", ts, px, hi, px, px, 1e6, PROVENANCE_REAL))
+        self.store.upsert_funding(fa)
+        self.store.upsert_funding(fb)
+        self.store.upsert_candles(ca)
+        self.store.upsert_candles(cb)
+
+        cfg = StrategyConfig(
+            strategy_id="t-liq",
+            version="v1",
+            family="unit-liq",
+            status="DRAFT",
+            venue_a="hyperliquid",
+            venue_b="gate",
+            mode="perp_perp",
+            symbols=["WLD"],
+            capital_usd=1000.0,
+            leverage=5.0,
+            max_positions=1,
+            per_position_weight=1.0,
+            entry_spread_apr_pct=15.0,
+            exit_spread_apr_pct=2.0,
+            lookback_hours=24,
+        )
+        res = self.bt.run(cfg, start_ms=start, end_ms=start + (hours - 1) * HOUR_MS)
+        self.assertGreaterEqual(res.metrics.liquidation_count, 1)
+        liq_trades = [t for t in res.trades if t.exit_reason == "MARGIN_LIQUIDATION"]
+        self.assertTrue(liq_trades)
+        # Red-Team #3: liquidation must incur real realized penalty (not $0!)
+        self.assertLess(liq_trades[0].net_pnl_usd, -100.0)
+        verdict, _, _ = self.verifier.verify(cfg, start_ms=start, end_ms=start + (hours - 1) * HOUR_MS)
+        g2 = next(c for c in verdict.checks if c.gate_id == "G2")
+        self.assertFalse(g2.passed)
+
+    def test_missing_candle_short_leg_liquidation_proxy_and_cooldown(self) -> None:
+        """Red-Team #3 BLOCKER: when Lighter (venue_a) has ZERO candles, Gate (venue_b) +30% rally MUST liquidate short_a at 4x."""
+        start = (1_700_000_000_000 // HOUR_MS) * HOUR_MS
+        hours = 100
+        fa, fb, cb = [], [], []
+        for h in range(hours):
+            ts = start + h * HOUR_MS
+            fa.append(FundingRateBar("lighter", "ENA", ts, 0.0005, 1.0, PROVENANCE_REAL))
+            fb.append(FundingRateBar("gate", "ENA", ts, 0.0, 1.0, PROVENANCE_REAL))
+            px = 1.00 if h < 30 else 1.30
+            hi = 1.32 if h == 30 else px * 1.005
+            lo = px * 0.995
+            cb.append(PriceBar("gate", "ENA", ts, px, hi, lo, px, 1e6, PROVENANCE_REAL))
+        self.store.upsert_funding(fa)
+        self.store.upsert_funding(fb)
+        # Intentionally upsert ONLY venue_b candles (simulating Lighter funding-only!)
+        self.store.upsert_candles(cb)
+
+        cfg = StrategyConfig(
+            strategy_id="t-lt-proxy-liq",
+            version="v1",
+            family="lt-proxy",
+            status="DRAFT",
+            venue_a="lighter",
+            venue_b="gate",
+            mode="perp_perp",
+            symbols=["ENA"],
+            capital_usd=1000.0,
+            leverage=4.0,  # 22.5% trigger -> +32% rally MUST liquidate short_a via venue_b proxy!
+            max_positions=1,
+            per_position_weight=1.0,
+            entry_spread_apr_pct=15.0,
+            exit_spread_apr_pct=2.0,
+            lookback_hours=24,
+        )
+        res = self.bt.run(cfg, start_ms=start, end_ms=start + (hours - 1) * HOUR_MS)
+        self.assertGreaterEqual(res.metrics.liquidation_count, 1)
+        self.assertEqual(res.trades[0].exit_reason, "MARGIN_LIQUIDATION")
+        self.assertLess(res.trades[0].net_pnl_usd, -100.0)
+        # Cooldown prevents immediate re-entry within 24h of liquidation!
+        if len(res.trades) >= 2:
+            self.assertGreaterEqual(res.trades[1].entry_ts_ms - res.trades[0].exit_ts_ms, 24 * HOUR_MS)
+
+    def test_dsr_family_rename_and_version_bump_cannot_bypass_trial_counter(self) -> None:
+        """Red-Team #10: renaming family/version/notes cannot reset trial #1 or bypass DSR dedup."""
+        start = (1_700_000_000_000 // HOUR_MS) * HOUR_MS
+        hours = 720
+        fa, fb, ca, cb = [], [], [], []
+        for h in range(hours):
+            ts = start + h * HOUR_MS
+            # Alternating 60h positive (+43.8% APR) / 60h negative (-8.8% APR) waves -> 6 trades & passes DQ-06!
+            active = (h % 120) < 60
+            fa.append(FundingRateBar("hyperliquid", "BTC", ts, (0.00005 if active else -0.00001), 1.0, PROVENANCE_REAL))
+            fb.append(FundingRateBar("gate", "BTC", ts, 0.0, 1.0, PROVENANCE_REAL))
+            px = 100.0 + (h % 5) * 0.2
+            ca.append(PriceBar("hyperliquid", "BTC", ts, px, px * 1.003, px * 0.997, px, 1e6, PROVENANCE_REAL))
+            cb.append(PriceBar("gate", "BTC", ts, px, px * 1.003, px * 0.997, px, 1e6, PROVENANCE_REAL))
+        self.store.upsert_funding(fa)
+        self.store.upsert_funding(fb)
+        self.store.upsert_candles(ca)
+        self.store.upsert_candles(cb)
+
+        cfg1 = StrategyConfig(
+            strategy_id="s1", version="v1", family="fake_fam_1", status="DRAFT",
+            venue_a="hyperliquid", venue_b="gate", mode="perp_perp", symbols=["BTC"],
+            entry_spread_apr_pct=10.0, exit_spread_apr_pct=2.0, min_hold_hours=12, exit_confirm_hours=4, lookback_hours=12,
+        )
+        # Same economic params, renamed family/version/notes -> MUST deduplicate (still trial #1)
+        cfg2 = StrategyConfig.from_dict({**cfg1.to_dict(), "strategy_id": "s2", "version": "v9", "family": "fake_fam_2", "notes": "renamed"})
+        # Different economic param with renamed family -> MUST increment to trial #2 under canonical family!
+        cfg3 = StrategyConfig.from_dict({**cfg1.to_dict(), "strategy_id": "s3", "version": "v3", "family": "fake_fam_3", "entry_spread_apr_pct": 12.0})
+
+        v1, _, _ = self.verifier.verify(cfg1, start_ms=start, end_ms=start + (hours - 1) * HOUR_MS)
+        v2, _, _ = self.verifier.verify(cfg2, start_ms=start, end_ms=start + (hours - 1) * HOUR_MS)
+        v3, _, _ = self.verifier.verify(cfg3, start_ms=start, end_ms=start + (hours - 1) * HOUR_MS)
+        self.assertEqual(v1.trial_number, 1)
+        self.assertEqual(v2.trial_number, 1)
+        self.assertEqual(v3.trial_number, 2)
 
 
 if __name__ == "__main__":

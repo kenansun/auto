@@ -1,0 +1,62 @@
+{
+  "schema_version": "2.0",
+  "updated_utc": "2026-11-23T00:00:00Z",
+  "policy": "Copy to config/fleet_roles.json (gitignored) and populate real node IPs. Strictly read-only allowlisted SSH probes only.",
+  "ssh_readonly_user": "agent-ro",
+  "nodes": [
+    {
+      "node_id": "node_micro_run",
+      "label": "Node 1 — Fast Micro-Run & BBO Collector",
+      "ip": "198.51.100.11",
+      "overlay_ip": "10.0.0.11",
+      "primary_role": "FAST_MICRO_RUN_AND_BBO_COLLECTOR",
+      "disk_warn_pct": 80,
+      "mem_warn_pct": 85
+    },
+    {
+      "node_id": "node_backtest",
+      "label": "Node 2 — Backtest & Data Backfill Worker",
+      "ip": "198.51.100.12",
+      "overlay_ip": "10.0.0.12",
+      "primary_role": "BACKTEST_AND_DATA_BACKFILL_WORKER",
+      "disk_warn_pct": 80,
+      "mem_warn_pct": 85
+    },
+    {
+      "node_id": "node_intel",
+      "label": "Node 3 — Macro Intel & Cold Backup Depot",
+      "ip": "198.51.100.13",
+      "overlay_ip": "10.0.0.13",
+      "primary_role": "MACRO_INTEL_AND_BACKUP_DEPOT",
+      "disk_warn_pct": 80,
+      "mem_warn_pct": 85
+    },
+    {
+      "node_id": "node_control",
+      "label": "Node 4 — Control Plane & Watchdog Hub",
+      "ip": "198.51.100.14",
+      "overlay_ip": "10.0.0.14",
+      "primary_role": "CONTROL_PLANE_AND_WATCHDOG_HUB",
+      "disk_warn_pct": 80,
+      "mem_warn_pct": 85
+    },
+    {
+      "node_id": "node_live_isolated",
+      "label": "Node 5 — Isolated Live Execution Box",
+      "ip": "198.51.100.15",
+      "overlay_ip": "10.0.0.15",
+      "primary_role": "ISOLATED_LIVE_EXECUTION_BOX",
+      "disk_warn_pct": 75,
+      "mem_warn_pct": 85
+    }
+  ],
+  "csv_targets": [
+    {
+      "name": "example_spreads_csv",
+      "node_id": "node_micro_run",
+      "remote_path": "/opt/research_app/spreads.csv",
+      "ts_col": "ts_ms",
+      "price_cols": ["bid", "ask", "mid"]
+    }
+  ]
+}

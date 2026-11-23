@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,6 +58,14 @@ class TestHotConfigAndAgentLoop(unittest.TestCase):
         cfg_live = StrategyConfig.from_dict({**cfg_v1.to_dict(), "version": "v2.0", "status": "CANARY_APPROVED"})
         with self.assertRaises(PermissionError):
             self.cfg_store.register_version(cfg_live, actor="agent", reason="unauthorized live attempt")
+        # Empty-suffix forged token MUST ALSO raise PermissionError (Red-Team #5.2)
+        with self.assertRaises(PermissionError):
+            self.cfg_store.register_version(cfg_live, actor="agent", reason="forged", human_approval_token="HUMAN_APPROVED:")
+
+        # Path traversal in strategy_id MUST raise ValueError (Red-Team #5.2)
+        bad_id_cfg = StrategyConfig.from_dict({**cfg_v1.to_dict(), "strategy_id": "../escape"})
+        with self.assertRaises(ValueError):
+            self.cfg_store.register_version(bad_id_cfg, actor="agent", reason="path traversal")
 
         # With explicit human token -> succeeds, and rollback restores v1.0 cleanly
         self.cfg_store.register_version(
@@ -67,6 +76,15 @@ class TestHotConfigAndAgentLoop(unittest.TestCase):
         rolled = self.cfg_store.rollback("carry_alpha", "v1.0", actor="owner", reason="revert test")
         self.assertEqual(rolled.version, "v1.0")
         self.assertEqual(self.cfg_store.read_active("carry_alpha").version, "v1.0")
+
+        # Red-Team #5.2: Rolling back TO a CANARY_APPROVED version without token MUST raise PermissionError!
+        with self.assertRaises(PermissionError):
+            self.cfg_store.rollback("carry_alpha", "v2.0", actor="agent", reason="bypass live via rollback")
+        # With valid token -> allowed
+        rolled_live = self.cfg_store.rollback(
+            "carry_alpha", "v2.0", actor="owner", reason="re-approve", human_approval_token="HUMAN_APPROVED:OWNER-002"
+        )
+        self.assertEqual(rolled_live.version, "v2.0")
 
     def test_cross_family_red_team_independence(self) -> None:
         rt_for_ds = self.router.select_red_team_route("deepseek")
@@ -82,14 +100,14 @@ class TestHotConfigAndAgentLoop(unittest.TestCase):
             fa, fb, ca, cb = [], [], [], []
             for h in range(hours):
                 ts = start + h * HOUR_MS
-                # Alternating 240h active carry waves (+30% APR spread, inside ATB's 10.95%..54.75% churn trap) and 240h quiet periods (-4% APR)
                 active = (h % 480) < 240
                 r_a = (0.28 if active else -0.04) / (365.0 * 24.0)
                 r_b = (-0.02 if active else 0.0) / (365.0 * 24.0)
                 fa.append(FundingRateBar("hyperliquid", sym, ts, r_a, 1.0, PROVENANCE_REAL))
                 fb.append(FundingRateBar("gate", sym, ts, r_b, 1.0, PROVENANCE_REAL))
-                ca.append(PriceBar("hyperliquid", sym, ts, 100.0, 100.0, 100.0, 100.0, 1e6, PROVENANCE_REAL))
-                cb.append(PriceBar("gate", sym, ts, 100.0, 100.0, 100.0, 100.0, 1e6, PROVENANCE_REAL))
+                px = 100.0 + 2.0 * math.sin(h / 18.0)
+                ca.append(PriceBar("hyperliquid", sym, ts, px, px * 1.003, px * 0.997, px, 1e6, PROVENANCE_REAL))
+                cb.append(PriceBar("gate", sym, ts, px, px * 1.003, px * 0.997, px, 1e6, PROVENANCE_REAL))
             self.store.upsert_funding(fa)
             self.store.upsert_funding(fb)
             self.store.upsert_candles(ca)
@@ -138,11 +156,11 @@ class TestHotConfigAndAgentLoop(unittest.TestCase):
         fa, fb, ca, cb = [], [], [], []
         for h in range(hours):
             ts = start + h * HOUR_MS
-            # Zero spread -> fees guarantee negative net PnL
             fa.append(FundingRateBar("hyperliquid", "DOGE", ts, 0.0, 1.0, PROVENANCE_REAL))
             fb.append(FundingRateBar("gate", "DOGE", ts, 0.0, 1.0, PROVENANCE_REAL))
-            ca.append(PriceBar("hyperliquid", "DOGE", ts, 0.1, 0.1, 0.1, 0.1, 1e6, PROVENANCE_REAL))
-            cb.append(PriceBar("gate", "DOGE", ts, 0.1, 0.1, 0.1, 0.1, 1e6, PROVENANCE_REAL))
+            px = 0.1 + 0.002 * math.sin(h / 10.0)
+            ca.append(PriceBar("hyperliquid", "DOGE", ts, px, px * 1.003, px * 0.997, px, 1e6, PROVENANCE_REAL))
+            cb.append(PriceBar("gate", "DOGE", ts, px, px * 1.003, px * 0.997, px, 1e6, PROVENANCE_REAL))
         self.store.upsert_funding(fa)
         self.store.upsert_funding(fb)
         self.store.upsert_candles(ca)

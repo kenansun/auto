@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import sys
-import time
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,8 @@ from alphaloop.data.collectors import GateCollector, HyperliquidCollector, Light
 from alphaloop.data.store import MarketDataStore
 from alphaloop.harness.backtester import FundingCarryBacktester
 from alphaloop.harness.gates import SixGateVerifier, TrialLedger
+from alphaloop.harness.micro_runner import MicroRunSession, MicroRunStore
+from alphaloop.plugins import BasisReversionPlugin, StructuralArbPlugin
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("research")
@@ -34,13 +38,28 @@ UNIVERSE = [
 ]
 
 
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=".research.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        raise
+
+
 def fetch_dataset(store: MarketDataStore, days: int = 90) -> dict[str, dict[str, int]]:
     hl = HyperliquidCollector()
     lt = LighterCollector()
     okx = OKXCollector()
     gate = GateCollector()
 
-    # Check which symbols already have HL funding cached
     cached_syms = {
         r["symbol"]
         for r in store.conn.execute(
@@ -49,13 +68,11 @@ def fetch_dataset(store: MarketDataStore, days: int = 90) -> dict[str, dict[str,
     }
     missing = [s for s in UNIVERSE if s not in cached_syms]
     if not missing:
-        existing = store.summary_stats()
         logger.info("All %d symbols cached in %s; skipping fetch.", len(UNIVERSE), store.db_path)
         return {"cached_symbols": {"count": len(cached_syms)}}
 
     logger.info("Resuming fetch: %d cached, %d remaining (%s)", len(cached_syms), len(missing), ",".join(missing))
 
-    # Save live universe snapshots for provenance
     try:
         hl_live = hl.fetch_live_universe()
         store.save_live_snapshot("hyperliquid", hl_live)
@@ -108,26 +125,23 @@ def run_experiments(data_dir: Path) -> dict:
     fetch_report = fetch_dataset(store, days=90)
     db_summary = store.summary_stats()
 
-    # Fresh ledger & state for clean reproducible research run
-    for fn in ("trial_ledger.sqlite",):
-        p = data_dir / fn
-        if p.exists():
-            p.unlink()
-    state_dir = data_dir / "state"
-    if state_dir.exists():
-        for child in state_dir.rglob("*.sqlite*"):
-            child.unlink()
-        for child in state_dir.rglob("*.json"):
-            child.unlink()
+    # Isolate batch research ledger/state under data/research_run/ (NEVER wipe production trial_ledger.sqlite!)
+    run_dir = data_dir / "research_run"
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    state_dir = run_dir / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
 
-    ledger = TrialLedger(data_dir / "trial_ledger.sqlite")
+    ledger = TrialLedger(run_dir / "trial_ledger.sqlite")
     config_store = HotConfigStore(state_dir)
+    micro_store = MicroRunStore(state_dir / "micro_runs.sqlite")
     backtester = FundingCarryBacktester(store)
     verifier = SixGateVerifier(backtester, ledger)
     router = MultiModelRouter()
-    orchestrator = AgentEvolutionOrchestrator(state_dir, backtester, verifier, config_store, router)
+    orchestrator = AgentEvolutionOrchestrator(
+        state_dir, backtester, verifier, config_store, router, micro_store=micro_store
+    )
 
-    # Determine common overlapping 90d time window across venues
     hl_btc = store.load_funding("hyperliquid", "BTC")
     lt_btc = store.load_funding("lighter", "BTC")
     okx_btc = store.load_funding("okx", "BTC")
@@ -152,7 +166,6 @@ def run_experiments(data_dir: Path) -> dict:
         (common_end - common_start) / (86400 * 1000),
     )
 
-    # Filter symbols that actually have sufficient real history on each pair
     def valid_syms(va: str, vb: str | None) -> list[str]:
         out = []
         for s in UNIVERSE:
@@ -240,7 +253,7 @@ def run_experiments(data_dir: Path) -> dict:
             mode="perp_perp",
             symbols=syms_hl_lt,
             capital_usd=3000.0,
-            leverage=4.0,
+            leverage=2.0,
             max_positions=8,
             per_position_weight=0.125,
             entry_spread_apr_pct=8.0,
@@ -255,10 +268,62 @@ def run_experiments(data_dir: Path) -> dict:
             allow_bidirectional=True,
             notes="Negative control: both HL & Lighter carry +10.5-10.95% baseline so spread cancels out",
         ),
-        # EXP 4A (WINNER #1): Structural DEX-vs-CEX Lighter (0% fee) <-> Gate (2bp maker) @ 4x safe DN leverage
+        # EXP 4D (SAFE 2.0x/leg): Lighter (0% fee) <-> Gate (2bp maker) @ 2.0x per-leg leverage
+        StrategyConfig(
+            strategy_id="exp4d_lt_gate_safe_2x",
+            version="v2.3",
+            family="dex_cex_lt_gate_safe",
+            status="DRAFT",
+            venue_a="lighter",
+            venue_b="gate",
+            mode="perp_perp",
+            symbols=syms_lt_gate,
+            capital_usd=3000.0,
+            leverage=2.0,
+            max_positions=8,
+            per_position_weight=0.125,
+            entry_spread_apr_pct=6.0,
+            exit_spread_apr_pct=0.5,
+            lookback_hours=120,
+            exit_confirm_hours=36,
+            min_hold_hours=96,
+            fee_a_bps=0.0,
+            fee_b_bps=2.0,
+            slippage_per_leg_bps=1.5,
+            rebalance_drag_bps_per_month=3.0,
+            allow_bidirectional=True,
+            notes="Safe 2.0x per-leg isolated leverage (45% adverse buffer): Lighter 0% + Gate 2bp maker",
+        ),
+        # EXP 4E (MODERATE 3.0x/leg): Lighter <-> Gate @ 3.0x per-leg leverage
+        StrategyConfig(
+            strategy_id="exp4e_lt_gate_safe_3x",
+            version="v2.3",
+            family="dex_cex_lt_gate_3x",
+            status="DRAFT",
+            venue_a="lighter",
+            venue_b="gate",
+            mode="perp_perp",
+            symbols=syms_lt_gate,
+            capital_usd=3000.0,
+            leverage=3.0,
+            max_positions=8,
+            per_position_weight=0.125,
+            entry_spread_apr_pct=6.0,
+            exit_spread_apr_pct=0.5,
+            lookback_hours=120,
+            exit_confirm_hours=36,
+            min_hold_hours=96,
+            fee_a_bps=0.0,
+            fee_b_bps=2.0,
+            slippage_per_leg_bps=1.5,
+            rebalance_drag_bps_per_month=3.0,
+            allow_bidirectional=True,
+            notes="3.0x per-leg isolated leverage (30% adverse buffer): Lighter 0% + Gate 2bp maker",
+        ),
+        # EXP 4A (HIGH-LEVERAGE STRESS 4.0x/leg): Exposes real altcoin volatility margin liquidation risk
         StrategyConfig(
             strategy_id="exp4a_lt_gate_maker_4x",
-            version="v2.2",
+            version="v2.3",
             family="dex_cex_lt_gate",
             status="DRAFT",
             venue_a="lighter",
@@ -279,12 +344,12 @@ def run_experiments(data_dir: Path) -> dict:
             slippage_per_leg_bps=1.5,
             rebalance_drag_bps_per_month=3.0,
             allow_bidirectional=True,
-            notes="Structural DEX-vs-CEX Perp-Perp: Lighter 0% fee + Gate 2bp maker, 8-slot diversified",
+            notes="4.0x per-leg isolated leverage stress test (22.5% liquidation trigger; tests real altcoin moves)",
         ),
-        # EXP 4B (WINNER #2): Lighter <-> Gate @ 5x DN leverage (2.5x/leg)
+        # EXP 4B (HIGH-LEVERAGE STRESS 5.0x/leg)
         StrategyConfig(
             strategy_id="exp4b_lt_gate_maker_5x",
-            version="v2.2",
+            version="v2.3",
             family="dex_cex_lt_gate_5x",
             status="DRAFT",
             venue_a="lighter",
@@ -305,46 +370,20 @@ def run_experiments(data_dir: Path) -> dict:
             slippage_per_leg_bps=1.5,
             rebalance_drag_bps_per_month=3.0,
             allow_bidirectional=True,
-            notes="Structural DEX-vs-CEX Perp-Perp: Lighter 0% + Gate 2bp maker @ 5x DN leverage (2.5x/leg)",
+            notes="5.0x per-leg isolated leverage stress test (18% liquidation trigger)",
         ),
-        # EXP 4C: Lighter <-> Gate FULL TAKER Stress Test (0bp + 5bp + 2.5bp/leg slip)
+        # EXP 5B (SAFE 2.0x/leg): Lighter (0% fee) <-> OKX (2bp maker) @ 2.0x per-leg leverage
         StrategyConfig(
-            strategy_id="exp4c_lt_gate_taker_4x",
-            version="v2.2",
-            family="dex_cex_lt_gate_taker",
-            status="DRAFT",
-            venue_a="lighter",
-            venue_b="gate",
-            mode="perp_perp",
-            symbols=syms_lt_gate,
-            capital_usd=3000.0,
-            leverage=4.0,
-            max_positions=8,
-            per_position_weight=0.125,
-            entry_spread_apr_pct=8.0,
-            exit_spread_apr_pct=0.5,
-            lookback_hours=120,
-            exit_confirm_hours=36,
-            min_hold_hours=120,
-            fee_a_bps=0.0,
-            fee_b_bps=5.0,
-            slippage_per_leg_bps=2.5,
-            rebalance_drag_bps_per_month=3.0,
-            allow_bidirectional=True,
-            notes="Full taker stress test on Lighter <-> Gate",
-        ),
-        # EXP 5 (WINNER #3): Structural DEX-vs-CEX Lighter (0% fee) <-> OKX (2bp maker) @ 4x safe DN leverage
-        StrategyConfig(
-            strategy_id="exp5_lt_okx_maker_4x",
-            version="v2.2",
-            family="dex_cex_lt_okx",
+            strategy_id="exp5b_lt_okx_safe_2x",
+            version="v2.3",
+            family="dex_cex_lt_okx_safe",
             status="DRAFT",
             venue_a="lighter",
             venue_b="okx",
             mode="perp_perp",
             symbols=syms_lt_okx,
             capital_usd=3000.0,
-            leverage=4.0,
+            leverage=2.0,
             max_positions=8,
             per_position_weight=0.125,
             entry_spread_apr_pct=6.0,
@@ -357,12 +396,12 @@ def run_experiments(data_dir: Path) -> dict:
             slippage_per_leg_bps=1.5,
             rebalance_drag_bps_per_month=3.0,
             allow_bidirectional=True,
-            notes="Structural DEX-vs-CEX Perp-Perp: Lighter 0% + OKX 2bp maker, 0.60x OOS retention",
+            notes="Safe 2.0x per-leg isolated leverage: Lighter 0% + OKX 2bp maker",
         ),
-        # EXP 6A: Dual-Candle Real Basis Verification — Hyperliquid <-> Gate (96% real dual 1h candles!)
+        # EXP 6A (SAFE 2.0x/leg): Dual-Candle Real Basis Verification — Hyperliquid <-> Gate
         StrategyConfig(
-            strategy_id="exp6a_hl_gate_maker_4x_realbasis",
-            version="v2.2",
+            strategy_id="exp6a_hl_gate_safe_2x_realbasis",
+            version="v2.3",
             family="dex_cex_hl_gate",
             status="DRAFT",
             venue_a="hyperliquid",
@@ -370,7 +409,7 @@ def run_experiments(data_dir: Path) -> dict:
             mode="perp_perp",
             symbols=syms_hl_gate,
             capital_usd=3000.0,
-            leverage=4.0,
+            leverage=2.0,
             max_positions=8,
             per_position_weight=0.125,
             entry_spread_apr_pct=6.0,
@@ -383,12 +422,12 @@ def run_experiments(data_dir: Path) -> dict:
             slippage_per_leg_bps=1.5,
             rebalance_drag_bps_per_month=3.0,
             allow_bidirectional=True,
-            notes="100% real dual-venue 1h basis accounting verification: HL <-> Gate",
+            notes="100% real dual-venue 1h basis accounting verification at safe 2.0x/leg: HL <-> Gate",
         ),
-        # EXP 6B: Dual-Candle Real Basis Verification — Hyperliquid <-> OKX (100% real dual 1h candles!)
+        # EXP 6B (SAFE 2.0x/leg): Dual-Candle Real Basis Verification — Hyperliquid <-> OKX
         StrategyConfig(
-            strategy_id="exp6b_hl_okx_maker_4x_realbasis",
-            version="v2.2",
+            strategy_id="exp6b_hl_okx_safe_2x_realbasis",
+            version="v2.3",
             family="dex_cex_hl_okx",
             status="DRAFT",
             venue_a="hyperliquid",
@@ -396,7 +435,7 @@ def run_experiments(data_dir: Path) -> dict:
             mode="perp_perp",
             symbols=syms_hl_okx,
             capital_usd=3000.0,
-            leverage=4.0,
+            leverage=2.0,
             max_positions=8,
             per_position_weight=0.125,
             entry_spread_apr_pct=6.0,
@@ -409,7 +448,7 @@ def run_experiments(data_dir: Path) -> dict:
             slippage_per_leg_bps=1.5,
             rebalance_drag_bps_per_month=3.0,
             allow_bidirectional=True,
-            notes="100% real dual-venue 1h basis accounting verification: HL <-> OKX",
+            notes="100% real dual-venue 1h basis accounting verification at safe 2.0x/leg: HL <-> OKX",
         ),
     ]
 
@@ -435,7 +474,9 @@ def run_experiments(data_dir: Path) -> dict:
             "basis_coverage_pct": res.basis_coverage_pct,
             "warnings": res.warnings,
             "verdict": verdict.to_dict(),
+            "dq_report": extras["dq_report"],
             "stress_metrics": extras["stress_metrics"],
+            "taker_hedge_metrics": extras["taker_hedge_metrics"],
             "is_metrics": extras["is_metrics"],
             "oos_metrics": extras["oos_metrics"],
             "plateau_grid": extras["plateau_grid"],
@@ -443,7 +484,7 @@ def run_experiments(data_dir: Path) -> dict:
             "sample_trades": [t.to_dict() for t in res.trades[:12]],
         }
         logger.info(
-            "%-32s | trades=%3d | gross=$%+7.2f | basis=$%+6.2f | cost=$%6.2f | NET=$%+7.2f | APR=%+6.2f%% | Sharpe=%5.2f | DD=%4.2f%% | 6-Gate=%d/6 %s",
+            "%-32s | trades=%3d | gross=$%+7.2f | basis=$%+6.2f | cost=$%6.2f | NET=$%+7.2f | APR=%+6.2f%% | Sharpe=%5.2f | DD=%4.2f%% | Liq=%d | 6-Gate=%d/6 %s",
             cfg.strategy_id,
             m.trade_count,
             m.gross_funding_usd,
@@ -453,11 +494,12 @@ def run_experiments(data_dir: Path) -> dict:
             m.annualized_apr_pct,
             m.sharpe_ratio,
             m.max_drawdown_pct,
+            m.liquidation_count,
             verdict.passed_count,
             "PASS" if verdict.overall_pass else "FAIL",
         )
 
-    # EXP 7: Closed-Loop Agent Evolution Demo on REAL 90-day Lighter <-> Gate data!
+    # EXP 7: Closed-Loop Agent Evolution Demo on REAL 90-day Lighter <-> Gate data (safe 2.0x/leg)
     buggy_seed = StrategyConfig(
         strategy_id="lt_gate_prod_candidate",
         version="v0.1-churn",
@@ -468,7 +510,7 @@ def run_experiments(data_dir: Path) -> dict:
         mode="perp_perp",
         symbols=syms_lt_gate,
         capital_usd=3000.0,
-        leverage=4.0,
+        leverage=2.0,
         max_positions=8,
         per_position_weight=0.125,
         entry_spread_apr_pct=10.0,
@@ -487,21 +529,20 @@ def run_experiments(data_dir: Path) -> dict:
     config_store.register_version(buggy_seed, actor="seed", reason="Initial buggy seed for live closed-loop Agent demo")
     agent_cycle_1 = orchestrator.run_cycle(buggy_seed, next_version="v0.2-agent", start_ms=common_start, end_ms=common_end)
     logger.info(
-        "AGENT CYCLE 1 (REAL 90D): anomaly=%s | APR %+.1f%% -> %+.2f%% | gates=%d/%d | red_team=%s | promoted_shadow=%s",
+        "AGENT CYCLE 1 (REAL 90D): anomaly=%s | APR %+.1f%% -> %+.2f%% | gates=%d/%d | red_team=%s | stage=%s",
         agent_cycle_1["feedback"]["anomaly_type"],
         agent_cycle_1["baseline_metrics"]["annualized_apr_pct"],
         agent_cycle_1["candidate_metrics"]["annualized_apr_pct"],
         agent_cycle_1["gate_verdict"]["passed_count"],
         agent_cycle_1["gate_verdict"]["total_count"],
         agent_cycle_1["red_team_verdict"]["decision"],
-        agent_cycle_1["promoted_shadow"],
+        agent_cycle_1["promotion_stage"],
     )
 
-    # Blended Custody-Diversified 3-Pair Portfolio (50% LT-Gate 5x + 25% LT-OKX 4x + 25% HL-OKX 4x)
-    # Caps single-venue custody exposure to <= 37.5% while blending real dual-basis stability
-    c_ltg = dict(curves_by_id["exp4b_lt_gate_maker_5x"])
-    c_lto = dict(curves_by_id["exp5_lt_okx_maker_4x"])
-    c_hlo = dict(curves_by_id["exp6b_hl_okx_maker_4x_realbasis"])
+    # Blended Custody-Diversified 3-Pair Safe 2.0x/leg Portfolio (50% LT-Gate 2x + 25% LT-OKX 2x + 25% HL-OKX 2x)
+    c_ltg = dict(curves_by_id["exp4d_lt_gate_safe_2x"])
+    c_lto = dict(curves_by_id["exp5b_lt_okx_safe_2x"])
+    c_hlo = dict(curves_by_id["exp6b_hl_okx_safe_2x_realbasis"])
     common_ts_blend = sorted(set(c_ltg) & set(c_lto) & set(c_hlo))
     blend_curve = [(ts, 0.50 * c_ltg[ts] + 0.25 * c_lto[ts] + 0.25 * c_hlo[ts]) for ts in common_ts_blend]
     b_start, b_end = blend_curve[0][1], blend_curve[-1][1]
@@ -517,9 +558,9 @@ def run_experiments(data_dir: Path) -> dict:
             b_mdd = dd
     sp = int(len(blend_curve) * 0.70)
     b_is_apr = ((blend_curve[sp - 1][1] / blend_curve[0][1]) - 1.0) * 100.0 * (365.0 / ((blend_curve[sp - 1][0] - blend_curve[0][0]) / (86400 * 1000)))
-    b_oos_apr = ((blend_curve[-1][1] / blend_curve[sp][1]) - 1.0) * 100.0 * (365.0 / ((blend_curve[-1][0] - blend_curve[sp][0]) / (86400 * 1000)))
+    b_oos_apr = ((blend_curve[-1][1] / blend_curve[sp - 1][1]) - 1.0) * 100.0 * (365.0 / ((blend_curve[-1][0] - blend_curve[sp - 1][0]) / (86400 * 1000)))
     blended_portfolio = {
-        "weights": {"exp4b_lt_gate_maker_5x": 0.50, "exp5_lt_okx_maker_4x": 0.25, "exp6b_hl_okx_maker_4x_realbasis": 0.25},
+        "weights": {"exp4d_lt_gate_safe_2x": 0.50, "exp5b_lt_okx_safe_2x": 0.25, "exp6b_hl_okx_safe_2x_realbasis": 0.25},
         "net_pnl_usd_on_3k": round(b_end - b_start, 2),
         "annualized_apr_pct": round(b_apr, 2),
         "is_apr_pct": round(b_is_apr, 2),
@@ -528,12 +569,80 @@ def run_experiments(data_dir: Path) -> dict:
         "daily_equity": daily_series(blend_curve),
     }
     logger.info(
-        "BLENDED 3-PAIR CUSTODY-SAFE PORTFOLIO: APR=%+.2f%% (IS %+.1f%% / OOS %+.1f%%) | MaxDD=%.3f%% | Net on $3k=$%+.2f",
+        "BLENDED 3-PAIR SAFE-2X PORTFOLIO: APR=%+.2f%% (IS %+.1f%% / OOS %+.1f%%) | MaxDD=%.3f%% | Net on $3k=$%+.2f",
         b_apr, b_is_apr, b_oos_apr, b_mdd, b_end - b_start,
     )
 
-    # Capital scaling simulation on primary 6/6-PASS winner (exp4b_lt_gate_maker_5x) + conservative 4x (exp4a_lt_gate_maker_4x)
-    best_id = "exp4b_lt_gate_maker_5x"
+    # EXP 8 & 9: Evaluate Strategy Factory v2 Heterogeneous Plugins with Red-Team-hardened T+1 execution lag!
+    br_plug = BasisReversionPlugin()
+    sa_plug = StructuralArbPlugin()
+    v2_plugin_cfgs = [
+        br_plug.default_config(
+            strategy_id="exp8a_basis_reversion_hl_okx",
+            version="v2.0-t1lag",
+            symbols=syms_hl_okx,
+            venue_a="hyperliquid",
+            venue_b="okx",
+            params={"entry_zscore": 2.4, "exit_zscore": 0.25, "min_basis_bps": 14.0, "z_lookback_hours": 48, "max_hold_hours": 36, "stop_basis_bps": 120.0, "execution_lag_bars": 1},
+        ),
+        br_plug.default_config(
+            strategy_id="exp8b_basis_reversion_hl_gate",
+            version="v2.0-t1lag",
+            symbols=syms_hl_gate,
+            venue_a="hyperliquid",
+            venue_b="gate",
+            params={"entry_zscore": 2.4, "exit_zscore": 0.25, "min_basis_bps": 14.0, "z_lookback_hours": 48, "max_hold_hours": 36, "stop_basis_bps": 120.0, "execution_lag_bars": 1},
+        ),
+        sa_plug.default_config(
+            strategy_id="exp9_structural_arb_hl_okx",
+            version="v2.0-causal",
+            symbols=syms_hl_okx,
+            venue_a="hyperliquid",
+            venue_b="okx",
+            params={"min_edge_bps": 22.0, "confirm_decay_bps": 4.0, "rebalance_cost_bps": 6.0, "gas_usd_per_tx": 0.40, "revert_rate_pct": 8.0, "notional_per_trade_usd": 500.0},
+        ),
+    ]
+    for cfg in v2_plugin_cfgs:
+        verdict, res, extras = verifier.verify(cfg, start_ms=common_start, end_ms=common_end)
+        m = res.metrics
+        experiment_outputs[cfg.strategy_id] = {
+            "config": cfg.to_dict(),
+            "metrics": m.to_dict(),
+            "basis_coverage_pct": res.basis_coverage_pct,
+            "warnings": res.warnings,
+            "verdict": verdict.to_dict(),
+            "dq_report": extras["dq_report"],
+            "stress_metrics": extras["stress_metrics"],
+            "taker_hedge_metrics": extras["taker_hedge_metrics"],
+            "is_metrics": extras["is_metrics"],
+            "oos_metrics": extras["oos_metrics"],
+            "plateau_grid": extras["plateau_grid"],
+            "daily_equity": daily_series(res.equity_curve),
+            "sample_trades": [t.to_dict() for t in res.trades[:12]],
+        }
+        logger.info(
+            "%-32s | plugin=%-15s | trades=%3d | gross=$%+7.2f | basis=$%+6.2f | cost=$%6.2f | NET=$%+7.2f | APR=%+6.2f%% | Liq=%d | 6-Gate=%d/6 %s",
+            cfg.strategy_id, cfg.plugin_id, m.trade_count, m.gross_funding_usd, m.basis_pnl_usd,
+            m.total_fees_usd + m.total_slippage_usd + m.total_rebalance_usd,
+            m.net_pnl_usd, m.annualized_apr_pct, m.liquidation_count,
+            verdict.passed_count, "PASS" if verdict.overall_pass else "FAIL",
+        )
+
+    # Fast Micro-Run Replay against real captured live BBO ticks!
+    micro_session = MicroRunSession(store, micro_store)
+    micro_run_outputs: dict[str, dict] = {}
+    for sid in ("exp4d_lt_gate_safe_2x", "exp5b_lt_okx_safe_2x", "exp6b_hl_okx_safe_2x_realbasis"):
+        c_mr = StrategyConfig.from_dict(experiment_outputs[sid]["config"])
+        rec_mr = micro_session.evaluate_bbo_window(c_mr, target_hours=24.0, max_stale_sec=None)
+        micro_run_outputs[sid] = rec_mr.to_dict()
+        logger.info(
+            "MICRO-RUN %-30s | status=%-12s | ticks=%4d | liveHalf=%.2fbp vs assumed=%.2fbp (%.2fx) | dq=%s",
+            sid, rec_mr.status, rec_mr.ticks_observed, rec_mr.realized_spread_bps_median,
+            rec_mr.assumed_slippage_bps, rec_mr.slippage_ratio, rec_mr.dq_tier,
+        )
+
+    # Capital scaling simulation on safe 2.0x/leg candidate (exp4d_lt_gate_safe_2x)
+    best_id = "exp4d_lt_gate_safe_2x"
     best_cfg = StrategyConfig.from_dict(experiment_outputs[best_id]["config"])
     capital_scaling = []
     for cap in (1000.0, 3000.0, 5000.0, 10000.0, 20000.0, 50000.0):
@@ -548,10 +657,13 @@ def run_experiments(data_dir: Path) -> dict:
             "annualized_apr_pct": r.metrics.annualized_apr_pct,
             "max_dd_pct": r.metrics.max_drawdown_pct,
             "sharpe": r.metrics.sharpe_ratio,
+            "liquidation_count": r.metrics.liquidation_count,
+            "forced_rebalance_count": r.metrics.forced_rebalance_count,
         })
 
     output = {
         "generated_utc": utc_iso(),
+        "engine_version": "alphaloop-v2.0-redteam-hardened",
         "window_start_utc": utc_iso(common_start),
         "window_end_utc": utc_iso(common_end),
         "window_days": round((common_end - common_start) / (86400 * 1000), 2),
@@ -565,6 +677,7 @@ def run_experiments(data_dir: Path) -> dict:
             "okx_spot_perp": syms_okx,
         },
         "experiments": experiment_outputs,
+        "micro_runs": micro_run_outputs,
         "blended_portfolio": blended_portfolio,
         "agent_evolution_demo": agent_cycle_1,
         "best_strategy_id": best_id,
@@ -573,12 +686,13 @@ def run_experiments(data_dir: Path) -> dict:
     }
 
     out_path = data_dir / "research_results.json"
-    out_path.write_text(json.dumps(output, indent=2, sort_keys=True), encoding="utf-8")
+    _atomic_write_json(out_path, output)
     logger.info("Saved full empirical research dossier -> %s", out_path)
 
     store.close()
     ledger.close()
     config_store.close()
+    micro_store.close()
     orchestrator.close()
     return output
 

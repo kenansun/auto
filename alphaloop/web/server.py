@@ -1,17 +1,20 @@
-"""Zero-dependency HTTP Strategy R&D Console (STD-34 & L-034 hardened).
+"""Zero-dependency HTTP Strategy R&D Console v2 (STD-34 & L-034 hardened).
 
 Security & reliability invariants:
 - Default loopback bind 127.0.0.1 (no accidental public exposure).
 - Strict Content-Length validation (rejects negative, malformed, or >1MB bodies with 400/413).
 - Explicit Content-Length & Cache-Control: no-cache on every response.
 - Client-side escapeHtml() on all dynamic strings (prevents DOM XSS).
-- Zero hardcoded fake data (STD-37).
+- Zero hardcoded fake data (STD-37); fleet panel reads latest saved read-only snapshot only.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
+import os
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -24,48 +27,67 @@ from alphaloop.core.provenance import utc_now_ms
 from alphaloop.data.store import MarketDataStore
 from alphaloop.harness.backtester import FundingCarryBacktester
 from alphaloop.harness.gates import SixGateVerifier, TrialLedger
+from alphaloop.harness.micro_runner import MicroRunSession, MicroRunStore
+from alphaloop.plugins import PluginRegistry, default_registry
 
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 1024 * 1024  # 1MB hard cap (L-034 / RB3-05)
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+LOOPBACK_ORIGIN_RE = re.compile(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$")
 
 CONSOLE_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>AlphaLoop v1 — Strategy R&amp;D &amp; Agent Feedback Console</title>
+<title>AlphaLoop v2 — Strategy Factory, DQ Gate &amp; Agent Feedback Console</title>
 <style>
   :root{--bg:#0b0f17;--card:#131a26;--border:#233044;--text:#e6edf7;--muted:#8fa2bd;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#38bdf8;}
   *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.5}
   header{display:flex;justify-content:space-between;align-items:center;padding:14px 22px;border-bottom:1px solid var(--border);background:#0f1623}
   h1{font-size:17px;margin:0;letter-spacing:.3px} .badge{font-size:12px;padding:3px 9px;border-radius:999px;background:#1e293b;color:var(--blue)}
-  main{max-width:1280px;margin:0 auto;padding:18px;display:grid;gap:16px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}
-  .card h2{font-size:14px;color:var(--muted);margin:0 0 10px;text-transform:uppercase;letter-spacing:.5px}
-  table{width:100%;border-collapse:collapse;font-size:13px}
+  main{max-width:1360px;margin:0 auto;padding:18px;display:grid;gap:16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;overflow-x:auto}
+  .card h2{font-size:13px;color:var(--muted);margin:0 0 10px;text-transform:uppercase;letter-spacing:.5px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
   th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border)}
   th{color:var(--muted);font-weight:600}
   .ok{color:var(--green);font-weight:600} .bad{color:var(--red);font-weight:600} .warn{color:var(--amber);font-weight:600}
-  button{background:var(--blue);color:#04111d;border:none;padding:7px 12px;border-radius:6px;font-weight:600;cursor:pointer;font-size:12px}
+  button{background:var(--blue);color:#04111d;border:none;padding:6px 10px;border-radius:6px;font-weight:600;cursor:pointer;font-size:12px;margin-right:4px}
   button:hover{opacity:.9} button.sec{background:#1f2d42;color:var(--text)}
-  pre{background:#090d14;border:1px solid var(--border);border-radius:8px;padding:10px;overflow:auto;font-size:12px;max-height:260px}
 </style>
 </head>
 <body>
 <header>
-  <h1>AlphaLoop v1 — Strategy R&amp;D &amp; Multi-Model Agent Feedback Platform</h1>
-  <div><span id="healthBadge" class="badge">Loading...</span> <button class="sec" onclick="refreshAll()">Refresh</button></div>
+  <h1>AlphaLoop v2 — Strategy Factory, DQ-01..08 Gate, Fast Micro-Runs &amp; Fleet Audit</h1>
+  <div><span id="healthBadge" class="badge">Loading...</span> <button class="sec" id="refreshBtn" type="button">Refresh</button></div>
 </header>
 <main>
   <div class="grid" id="kpiGrid"></div>
+  <div class="card">
+    <h2>Strategy Factory v2 Plugins (Pluggable Alpha Registry)</h2>
+    <div id="pluginsBox">Loading...</div>
+  </div>
   <div class="card">
     <h2>Active Hot-Reloadable Strategies (Atomic rename(2) Bus)</h2>
     <div id="strategiesBox">Loading...</div>
   </div>
   <div class="card">
-    <h2>Closed-Loop Agent Evolution Cycles (Diagnose → Propose → 6-Gate → Cross-Model Red-Team)</h2>
+    <h2>Data Quality Certification Ledger (DQ-01 .. DQ-08)</h2>
+    <div id="dqBox">Loading...</div>
+  </div>
+  <div class="card">
+    <h2>Fast Micro-Run Validation &amp; Dual-Layer Early-Kill Guard</h2>
+    <div id="microBox">Loading...</div>
+  </div>
+  <div class="card">
+    <h2>5-Node Prepaid Server Fleet Health (Read-Only SSH Snapshot)</h2>
+    <div id="fleetBox">Loading...</div>
+  </div>
+  <div class="card">
+    <h2>Closed-Loop Agent Evolution Cycles (Diagnose → Propose → DQ + 6-Gate → Cross-Model Red-Team)</h2>
     <div id="cyclesBox">Loading...</div>
   </div>
   <div class="card">
@@ -84,29 +106,61 @@ async function triggerCycle(sid){
   const ver='v-auto-'+Math.floor(Date.now()/1000);
   const r=await fetch('/api/agent/run-cycle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy_id:sid,next_version:ver})});
   const d=await r.json();
-  alert('Cycle '+esc(d.cycle_id||'ERR')+': gates='+(d.gate_verdict?d.gate_verdict.passed_count+'/'+d.gate_verdict.total_count:'?')+' red_team='+(d.red_team_verdict?d.red_team_verdict.decision:d.error));
+  alert('Cycle '+(d.cycle_id||'ERR')+': stage='+(d.promotion_stage||'?')+' gates='+(d.gate_verdict?d.gate_verdict.passed_count+'/'+d.gate_verdict.total_count:'?')+' red_team='+(d.red_team_verdict?d.red_team_verdict.decision:d.error));
   refreshAll();
 }
+async function triggerMicroRun(sid){
+  const r=await fetch('/api/micro-runs/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy_id:sid})});
+  const d=await r.json();
+  alert('MicroRun '+(d.run_id||'ERR')+': status='+(d.status||d.error)+' slip_ratio='+(d.slippage_ratio)+'x kill='+(d.kill_reason||'none'));
+  refreshAll();
+}
+document.getElementById('refreshBtn').addEventListener('click', refreshAll);
+document.getElementById('strategiesBox').addEventListener('click', function(ev){
+  const btn = ev.target.closest('button[data-action]');
+  if(!btn) return;
+  const sid = btn.getAttribute('data-strategy-id') || '';
+  if(!sid) return;
+  if(btn.getAttribute('data-action') === 'evolve') triggerCycle(sid);
+  if(btn.getAttribute('data-action') === 'micro') triggerMicroRun(sid);
+});
 async function refreshAll(){
   try{
-    const [h,s,c,m,t,mk]=await Promise.all([
+    const [h,s,c,m,t,mk,pl,dq,mr,fl]=await Promise.all([
       getJson('/api/health'),getJson('/api/strategies'),getJson('/api/cycles'),
-      getJson('/api/models'),getJson('/api/trials'),getJson('/api/market/summary')
+      getJson('/api/models'),getJson('/api/trials'),getJson('/api/market/summary'),
+      getJson('/api/plugins'),getJson('/api/dq/reports'),getJson('/api/micro-runs'),getJson('/api/fleet/audit')
     ]);
-    document.getElementById('healthBadge').textContent='ONLINE | '+h.status+' | ts='+new Date(h.ts_ms).toISOString();
+    document.getElementById('healthBadge').textContent='ONLINE | '+h.status+' | '+h.service+' | '+new Date(h.ts_ms).toISOString();
     const totalFundingRows=(mk.funding||[]).reduce((a,x)=>a+x.rows,0);
+    const totalBboRows=(mk.bbo_ticks||[]).reduce((a,x)=>a+x.rows,0);
     document.getElementById('kpiGrid').innerHTML=[
-      ['Registered Strategies', (s.strategies||[]).length],
+      ['Strategy Plugins', (pl.plugins||[]).length],
+      ['Active Strategies', (s.strategies||[]).length],
       ['Real Funding Rows', totalFundingRows.toLocaleString()],
-      ['Agent Evolution Cycles', (c.cycles||[]).length],
-      ['Recorded G6 Trials', (t.trials||[]).length]
-    ].map(([k,v])=>'<div class="card"><h2>'+esc(k)+'</h2><div style="font-size:26px;font-weight:700">'+esc(v)+'</div></div>').join('');
+      ['Live BBO Ticks', totalBboRows.toLocaleString()],
+      ['DQ Certificates', (dq.reports||[]).length],
+      ['Fast Micro-Runs', (mr.runs||[]).length],
+      ['Fleet Reachable', (fl.nodes_reachable??0)+'/'+(fl.nodes_total??0)]
+    ].map(([k,v])=>'<div class="card"><h2>'+esc(k)+'</h2><div style="font-size:24px;font-weight:700">'+esc(v)+'</div></div>').join('');
 
-    const sRows=(s.strategies||[]).map(x=>'<tr><td><b>'+esc(x.strategy_id)+'</b></td><td>'+esc(x.active_version)+'</td><td><span class="badge">'+esc(x.status)+'</span></td><td>'+esc(x.config.venue_a)+' / '+esc(x.config.venue_b)+'</td><td>'+esc(x.config.entry_spread_apr_pct)+'% / '+esc(x.config.exit_spread_apr_pct)+'%</td><td><code>'+esc(x.config_sha256.slice(0,12))+'</code></td><td><button onclick="triggerCycle(\\''+esc(x.strategy_id)+'\\')">Run Agent Cycle</button></td></tr>').join('');
-    document.getElementById('strategiesBox').innerHTML='<table><thead><tr><th>Strategy</th><th>Version</th><th>Status</th><th>Venues</th><th>Entry/Exit APR</th><th>SHA256</th><th>Action</th></tr></thead><tbody>'+(sRows||'<tr><td colspan="7">No strategies registered</td></tr>')+'</tbody></table>';
+    const plRows=(pl.plugins||[]).map(x=>'<tr><td><b>'+esc(x.plugin_id)+'</b></td><td>'+esc(x.display_name)+'</td><td>'+esc(x.strategy_family)+'</td><td>'+esc(Object.keys(x.mutable_param_bounds||{}).join(', '))+'</td><td>'+esc(x.description)+'</td></tr>').join('');
+    document.getElementById('pluginsBox').innerHTML='<table><thead><tr><th>Plugin ID</th><th>Name</th><th>Family</th><th>Mutable Params</th><th>Description</th></tr></thead><tbody>'+(plRows||'<tr><td colspan="5">No plugins</td></tr>')+'</tbody></table>';
 
-    const cRows=(c.cycles||[]).map(x=>'<tr><td><code>'+esc(x.cycle_id)+'</code></td><td>'+esc(x.strategy_id)+' ('+esc(x.from_version)+'→'+esc(x.to_version)+')</td><td>'+esc(x.feedback.anomaly_type)+'</td><td>'+esc(x.baseline_metrics.annualized_apr_pct)+'% → <b>'+esc(x.candidate_metrics.annualized_apr_pct)+'%</b></td><td class="'+(x.gate_verdict.overall_pass?'ok':'bad')+'">'+esc(x.gate_verdict.passed_count)+'/'+esc(x.gate_verdict.total_count)+'</td><td>'+esc(x.red_team_verdict.decision)+'</td><td>'+(x.promoted_shadow?'<span class="ok">STAGED SHADOW</span>':'<span class="warn">HELD</span>')+'</td></tr>').join('');
-    document.getElementById('cyclesBox').innerHTML='<table><thead><tr><th>Cycle</th><th>Strategy</th><th>Anomaly</th><th>APR Shift</th><th>6-Gate</th><th>Red-Team</th><th>Outcome</th></tr></thead><tbody>'+(cRows||'<tr><td colspan="7">No cycles yet</td></tr>')+'</tbody></table>';
+    const sRows=(s.strategies||[]).map(x=>'<tr><td><b>'+esc(x.strategy_id)+'</b></td><td>'+esc(x.config.plugin_id||'funding_carry')+'</td><td>'+esc(x.active_version)+'</td><td><span class="badge">'+esc(x.status)+'</span></td><td>'+esc(x.config.venue_a)+' / '+esc(x.config.venue_b)+'</td><td><code>'+esc(x.config_sha256.slice(0,12))+'</code></td><td><button type="button" data-action="evolve" data-strategy-id="'+esc(x.strategy_id)+'">Evolve</button><button type="button" class="sec" data-action="micro" data-strategy-id="'+esc(x.strategy_id)+'">MicroRun</button></td></tr>').join('');
+    document.getElementById('strategiesBox').innerHTML='<table><thead><tr><th>Strategy</th><th>Plugin</th><th>Version</th><th>Status</th><th>Venues</th><th>SHA256</th><th>Action</th></tr></thead><tbody>'+(sRows||'<tr><td colspan="7">No strategies registered</td></tr>')+'</tbody></table>';
+
+    const dqRows=(dq.reports||[]).slice(0,15).map(x=>'<tr><td><code>'+esc(x.cert_id)+'</code></td><td>'+esc(x.dataset_name)+'</td><td>'+esc(x.venue_pair)+'</td><td>'+esc(x.row_count)+'</td><td>'+esc(x.basis_coverage_pct)+'%</td><td>'+esc(x.passed_count)+'/'+esc(x.total_count)+'</td><td class="'+(x.tier==='DATA_QUALIFIED_FULL'?'ok':(x.tier==='DATA_REJECTED'?'bad':'warn'))+'">'+esc(x.tier)+'</td></tr>').join('');
+    document.getElementById('dqBox').innerHTML='<table><thead><tr><th>Cert ID</th><th>Dataset</th><th>Pair</th><th>Rows</th><th>Basis Cov</th><th>Checks</th><th>Tier</th></tr></thead><tbody>'+(dqRows||'<tr><td colspan="7">No DQ certificates yet</td></tr>')+'</tbody></table>';
+
+    const mrRows=(mr.runs||[]).slice(0,15).map(x=>'<tr><td><code>'+esc(x.run_id)+'</code></td><td>'+esc(x.strategy_id)+'@'+esc(x.version)+'</td><td>'+esc(x.plugin_id)+'</td><td class="'+(x.status==='COMPLETED_PASS'?'ok':(x.status==='KILLED_EARLY'?'bad':'warn'))+'">'+esc(x.status)+'</td><td>'+esc(x.ticks_observed)+'</td><td>'+esc(x.realized_spread_bps_median)+'bp / '+esc(x.assumed_slippage_bps)+'bp ('+esc(x.slippage_ratio)+'x)</td><td>'+esc(x.dq_tier)+'</td><td>'+esc(x.kill_reason||'—')+'</td></tr>').join('');
+    document.getElementById('microBox').innerHTML='<table><thead><tr><th>Run ID</th><th>Strategy</th><th>Plugin</th><th>Status</th><th>BBO Ticks</th><th>Live vs Assumed Slip</th><th>DQ Tier</th><th>Kill / Note</th></tr></thead><tbody>'+(mrRows||'<tr><td colspan="8">No micro-runs yet</td></tr>')+'</tbody></table>';
+
+    const flRows=(fl.nodes||[]).map(x=>'<tr><td><b>'+esc(x.label)+'</b></td><td><code>'+esc(x.ip)+'</code></td><td class="'+(x.reachable?'ok':'bad')+'">'+(x.reachable?'OK':'DOWN')+'</td><td>'+esc(x.root_disk_pct)+'% ('+esc(x.root_disk_free_gb)+'GB free)</td><td>'+esc(x.mem_used_pct)+'% ('+esc(x.mem_avail_mb)+'MB avail)</td><td>'+esc((x.alerts||[]).map(a=>a.severity+':'+a.code).join(', ')||'NONE')+'</td></tr>').join('');
+    document.getElementById('fleetBox').innerHTML='<table><thead><tr><th>Node</th><th>IP</th><th>SSH</th><th>Root Disk</th><th>RAM</th><th>Alerts</th></tr></thead><tbody>'+(flRows||'<tr><td colspan="6">No fleet snapshot found</td></tr>')+'</tbody></table>';
+
+    const cRows=(c.cycles||[]).map(x=>'<tr><td><code>'+esc(x.cycle_id)+'</code></td><td>'+esc(x.strategy_id)+' ('+esc(x.from_version)+'→'+esc(x.to_version)+')</td><td>'+esc(x.feedback.anomaly_type)+'</td><td>'+esc(x.baseline_metrics.annualized_apr_pct)+'% → <b>'+esc(x.candidate_metrics.annualized_apr_pct)+'%</b></td><td class="'+(x.gate_verdict.overall_pass?'ok':'bad')+'">'+esc(x.gate_verdict.passed_count)+'/'+esc(x.gate_verdict.total_count)+'</td><td>'+esc(x.red_team_verdict.decision)+'</td><td><span class="badge">'+esc(x.promotion_stage||(x.promoted_shadow?'SHADOW_LIVE':'HELD'))+'</span></td></tr>').join('');
+    document.getElementById('cyclesBox').innerHTML='<table><thead><tr><th>Cycle</th><th>Strategy</th><th>Anomaly</th><th>APR Shift</th><th>6-Gate</th><th>Red-Team</th><th>Stage</th></tr></thead><tbody>'+(cRows||'<tr><td colspan="7">No cycles yet</td></tr>')+'</tbody></table>';
 
     const mRows=(m.routes||[]).map(x=>'<tr><td><b>'+esc(x.role)+'</b></td><td>'+esc(x.family)+' / '+esc(x.model_id)+'</td><td>'+esc(x.pricing_usd_1m)+'</td><td>'+(x.configured?'<span class="ok">KEY SET</span>':'<span class="warn">FALLBACK</span>')+'</td><td>'+esc(x.rationale)+'</td></tr>').join('');
     document.getElementById('modelsBox').innerHTML='<table><thead><tr><th>Role</th><th>Model</th><th>Price (In/Out 1M)</th><th>API Status</th><th>Rationale</th></tr></thead><tbody>'+mRows+'</tbody></table>';
@@ -125,16 +179,19 @@ refreshAll();
 
 
 class ConsoleAppContext:
-    """Shared dependency container for AlphaLoop HTTP server."""
+    """Shared dependency container for AlphaLoop v2 HTTP server."""
 
     def __init__(self, data_dir: str | Path) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.registry: PluginRegistry = default_registry()
         self.store = MarketDataStore(self.data_dir / "market_data.sqlite")
         self.ledger = TrialLedger(self.data_dir / "trial_ledger.sqlite")
         self.config_store = HotConfigStore(self.data_dir / "state")
+        self.micro_store = MicroRunStore(self.data_dir / "state" / "micro_runs.sqlite")
+        self.micro_session = MicroRunSession(self.store, self.micro_store, self.registry)
         self.backtester = FundingCarryBacktester(self.store)
-        self.verifier = SixGateVerifier(self.backtester, self.ledger)
+        self.verifier = SixGateVerifier(self.backtester, self.ledger, registry=self.registry)
         self.router = MultiModelRouter()
         self.orchestrator = AgentEvolutionOrchestrator(
             state_dir=self.data_dir / "state",
@@ -142,17 +199,33 @@ class ConsoleAppContext:
             verifier=self.verifier,
             config_store=self.config_store,
             router=self.router,
+            registry=self.registry,
+            micro_store=self.micro_store,
         )
+
+    def read_fleet_snapshot(self) -> dict[str, Any]:
+        snap = self.data_dir / "fleet_audit" / "fleet_snapshot.json"
+        if not snap.exists():
+            return {"nodes_total": 0, "nodes_reachable": 0, "p0_alerts": 0, "p1_alerts": 0, "nodes": []}
+        try:
+            return json.loads(snap.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"nodes_total": 0, "nodes_reachable": 0, "nodes": [], "error": "UNREADABLE_SNAPSHOT"}
 
     def close(self) -> None:
         self.store.close()
         self.ledger.close()
         self.config_store.close()
+        self.micro_store.close()
         self.orchestrator.close()
 
 
 def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
     class AlphaLoopHandler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            super().setup()
+            self.connection.settimeout(15.0)
+
         def log_message(self, fmt: str, *args: Any) -> None:
             logger.info("HTTP %s - %s", self.address_string(), fmt % args)
 
@@ -161,6 +234,7 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
 
@@ -169,6 +243,8 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
             self._send_bytes(status, "application/json; charset=utf-8", raw)
 
         def _read_body(self) -> tuple[bytes | None, int | None, str | None]:
+            if self.headers.get("Transfer-Encoding"):
+                return None, 411, "CHUNKED_ENCODING_UNSUPPORTED"
             raw_len = self.headers.get("Content-Length")
             if raw_len is None:
                 return b"", None, None
@@ -183,71 +259,171 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
             return self.rfile.read(length), None, None
 
         def do_GET(self) -> None:  # noqa: N802
-            path = urlparse(self.path).path
-            if path in ("/", "/index.html"):
-                self._send_bytes(200, "text/html; charset=utf-8", CONSOLE_HTML.encode("utf-8"))
-                return
-            if path == "/api/health":
-                self._send_json(200, {"status": "HEALTHY", "service": "alphaloop-v1", "ts_ms": utc_now_ms()})
-                return
-            if path == "/api/strategies":
-                self._send_json(200, {"strategies": ctx.config_store.list_strategies()})
-                return
-            if path == "/api/trials":
-                self._send_json(200, {"trials": ctx.ledger.recent_trials(limit=50)})
-                return
-            if path == "/api/cycles":
-                self._send_json(200, {"cycles": ctx.orchestrator.recent_cycles(limit=25)})
-                return
-            if path == "/api/models":
-                self._send_json(200, {"routes": ctx.router.routing_matrix(), "spent_usd": round(ctx.router.spent_usd, 6)})
-                return
-            if path == "/api/market/summary":
-                self._send_json(200, ctx.store.summary_stats())
-                return
-            self._send_json(404, {"error": "NOT_FOUND", "path": path})
+            try:
+                path = urlparse(self.path).path
+                if path in ("/", "/index.html"):
+                    self._send_bytes(200, "text/html; charset=utf-8", CONSOLE_HTML.encode("utf-8"))
+                    return
+                if path == "/api/health":
+                    self._send_json(200, {"status": "HEALTHY", "service": "alphaloop-v2", "ts_ms": utc_now_ms()})
+                    return
+                if path == "/api/plugins":
+                    self._send_json(200, {"plugins": ctx.registry.list_plugins()})
+                    return
+                if path == "/api/strategies":
+                    self._send_json(200, {"strategies": ctx.config_store.list_strategies()})
+                    return
+                if path == "/api/dq/reports":
+                    self._send_json(200, {"reports": ctx.store.list_dq_certificates(limit=50)})
+                    return
+                if path == "/api/micro-runs":
+                    self._send_json(200, {"runs": ctx.micro_store.list_runs(limit=50)})
+                    return
+                if path == "/api/fleet/audit":
+                    self._send_json(200, ctx.read_fleet_snapshot())
+                    return
+                if path == "/api/trials":
+                    self._send_json(200, {"trials": ctx.ledger.recent_trials(limit=50)})
+                    return
+                if path == "/api/cycles":
+                    self._send_json(200, {"cycles": ctx.orchestrator.recent_cycles(limit=25)})
+                    return
+                if path == "/api/models":
+                    self._send_json(
+                        200,
+                        {
+                            "routes": ctx.router.routing_matrix(),
+                            "round_spent_usd": round(ctx.router.round_spent_usd, 6),
+                            "spent_usd": round(ctx.router.spent_usd, 6),
+                        },
+                    )
+                    return
+                if path == "/api/market/summary":
+                    self._send_json(200, ctx.store.summary_stats())
+                    return
+                self._send_json(404, {"error": "NOT_FOUND", "path": path})
+            except Exception as exc:
+                logger.exception("Unhandled GET error on %s", self.path)
+                self._send_json(500, {"error": "INTERNAL_SERVER_ERROR", "detail": type(exc).__name__})
 
         def do_POST(self) -> None:  # noqa: N802
-            path = urlparse(self.path).path
-            body, err_code, err_msg = self._read_body()
-            if err_code is not None or body is None:
-                self._send_json(err_code or 400, {"error": err_msg})
-                return
             try:
-                payload = json.loads(body.decode("utf-8")) if body else {}
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                self._send_json(400, {"error": f"INVALID_JSON: {exc}"})
-                return
-
-            if path == "/api/agent/run-cycle":
-                sid = str(payload.get("strategy_id", "")).strip()
-                next_ver = str(payload.get("next_version", f"v-{utc_now_ms()}")).strip()
-                cfg = ctx.config_store.read_active(sid)
-                if cfg is None:
-                    self._send_json(404, {"error": f"STRATEGY_NOT_FOUND: {sid}"})
+                path = urlparse(self.path).path
+                # CSRF Defense (Red-Team #11): require JSON Content-Type and loopback Origin if sent
+                ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if ctype != "application/json":
+                    self._send_json(415, {"error": "UNSUPPORTED_MEDIA_TYPE_REQUIRE_APPLICATION_JSON"})
                     return
-                rec = ctx.orchestrator.run_cycle(cfg, next_version=next_ver)
-                self._send_json(200, rec)
-                return
+                origin = (self.headers.get("Origin") or "").strip()
+                if origin and not LOOPBACK_ORIGIN_RE.fullmatch(origin):
+                    self._send_json(403, {"error": "FORBIDDEN_ORIGIN"})
+                    return
 
-            if path == "/api/strategies/rollback":
-                sid = str(payload.get("strategy_id", "")).strip()
-                target_ver = str(payload.get("target_version", "")).strip()
-                reason = str(payload.get("reason", "Manual console rollback")).strip()
+                body, err_code, err_msg = self._read_body()
+                if err_code is not None or body is None:
+                    self._send_json(err_code or 400, {"error": err_msg})
+                    return
                 try:
-                    cfg = ctx.config_store.rollback(sid, target_ver, actor="console-operator", reason=reason)
-                except ValueError as exc:
-                    self._send_json(404, {"error": str(exc)})
+                    payload = json.loads(body.decode("utf-8")) if body else {}
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    self._send_json(400, {"error": f"INVALID_JSON: {exc}"})
                     return
-                self._send_json(200, {"rolled_back_to": cfg.version, "strategy_id": cfg.strategy_id})
-                return
+                if not isinstance(payload, dict):
+                    self._send_json(400, {"error": "JSON_OBJECT_REQUIRED"})
+                    return
 
-            self._send_json(404, {"error": "NOT_FOUND", "path": path})
+                if path == "/api/agent/run-cycle":
+                    sid = str(payload.get("strategy_id", "")).strip()
+                    next_ver = str(payload.get("next_version", f"v-{utc_now_ms()}")).strip()
+                    if not next_ver or len(next_ver) > 64 or any(ord(ch) < 32 for ch in next_ver):
+                        self._send_json(400, {"error": "INVALID_NEXT_VERSION"})
+                        return
+                    try:
+                        cfg = ctx.config_store.read_active(sid)
+                    except ValueError as exc:
+                        self._send_json(400, {"error": str(exc)})
+                        return
+                    if cfg is None:
+                        self._send_json(404, {"error": f"STRATEGY_NOT_FOUND: {sid}"})
+                        return
+                    rec = ctx.orchestrator.run_cycle(cfg, next_version=next_ver)
+                    self._send_json(200, rec)
+                    return
+
+                if path == "/api/agent/run-sprint":
+                    sid = str(payload.get("strategy_id", "")).strip()
+                    raw_rounds = payload.get("max_rounds", 3)
+                    if isinstance(raw_rounds, bool) or not isinstance(raw_rounds, int):
+                        self._send_json(400, {"error": "INVALID_MAX_ROUNDS"})
+                        return
+                    max_rounds = max(1, min(raw_rounds, 5))
+                    try:
+                        cfg = ctx.config_store.read_active(sid)
+                    except ValueError as exc:
+                        self._send_json(400, {"error": str(exc)})
+                        return
+                    if cfg is None:
+                        self._send_json(404, {"error": f"STRATEGY_NOT_FOUND: {sid}"})
+                        return
+                    sprint = ctx.orchestrator.run_multi_round_sprint(cfg, max_rounds=max_rounds)
+                    self._send_json(200, sprint)
+                    return
+
+                if path == "/api/micro-runs/evaluate":
+                    sid = str(payload.get("strategy_id", "")).strip()
+                    raw_h = payload.get("target_hours", 24.0)
+                    if isinstance(raw_h, bool) or not isinstance(raw_h, (int, float)) or not math.isfinite(float(raw_h)) or float(raw_h) <= 0.0:
+                        self._send_json(400, {"error": "INVALID_TARGET_HOURS"})
+                        return
+                    target_h = min(720.0, float(raw_h))
+                    try:
+                        cfg = ctx.config_store.read_active(sid)
+                    except ValueError as exc:
+                        self._send_json(400, {"error": str(exc)})
+                        return
+                    if cfg is None:
+                        self._send_json(404, {"error": f"STRATEGY_NOT_FOUND: {sid}"})
+                        return
+                    rec = ctx.micro_session.evaluate_bbo_window(cfg, target_hours=target_h)
+                    self._send_json(200, rec.to_dict())
+                    return
+
+                if path == "/api/strategies/rollback":
+                    sid = str(payload.get("strategy_id", "")).strip()
+                    target_ver = str(payload.get("target_version", "")).strip()
+                    reason = str(payload.get("reason", "Manual console rollback")).strip()
+                    token = payload.get("human_approval_token")
+                    token_s = str(token).strip() if token is not None else None
+                    try:
+                        cfg = ctx.config_store.rollback(
+                            sid,
+                            target_ver,
+                            actor="console-operator",
+                            reason=reason,
+                            human_approval_token=token_s or None,
+                        )
+                    except PermissionError as exc:
+                        self._send_json(403, {"error": str(exc)})
+                        return
+                    except ValueError as exc:
+                        self._send_json(404, {"error": str(exc)})
+                        return
+                    self._send_json(200, {"rolled_back_to": cfg.version, "strategy_id": cfg.strategy_id})
+                    return
+
+                self._send_json(404, {"error": "NOT_FOUND", "path": path})
+            except Exception as exc:
+                logger.exception("Unhandled POST error on %s", self.path)
+                self._send_json(500, {"error": "INTERNAL_SERVER_ERROR", "detail": type(exc).__name__})
 
     return AlphaLoopHandler
 
 
 def create_server(data_dir: str | Path, host: str = "127.0.0.1", port: int = 8796) -> tuple[ThreadingHTTPServer, ConsoleAppContext]:
+    if host not in LOOPBACK_HOSTS and os.environ.get("ALPHALOOP_ALLOW_NON_LOOPBACK") != "1":
+        raise PermissionError(
+            f"Refusing non-loopback bind host={host!r}; set ALPHALOOP_ALLOW_NON_LOOPBACK=1 to override explicitly"
+        )
     ctx = ConsoleAppContext(data_dir)
     srv = ThreadingHTTPServer((host, port), _make_handler(ctx))
     return srv, ctx

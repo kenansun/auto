@@ -1,33 +1,57 @@
-"""Atomic rename(2) Hot-Reloadable Strategy Config Store with version history & rollback."""
+"""Atomic rename(2) Hot-Reloadable Strategy Config Store with version history & rollback.
+
+Red-Team hardened (#5 & #16):
+- Validates strategy_id against `^[A-Za-z0-9_-]{1,64}$` (no path collision or empty filename).
+- Enforces strict `^HUMAN_APPROVED:[A-Za-z0-9._-]{4,64}$` token on BOTH `register_version()`
+  AND `rollback()` whenever the target status is outside `ALLOWED_AUTO_STATUSES`.
+- Append-only `strategy_versions` table (never silently overwrites existing version with different config).
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from alphaloop.core.db import connect_wal, transaction
+from alphaloop.core.db import connect_wal, get_conn_lock, transaction
 from alphaloop.core.models import StrategyConfig
 from alphaloop.core.provenance import sha256_obj, utc_now_ms
 
 logger = logging.getLogger(__name__)
 
+STRATEGY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+HUMAN_TOKEN_RE = re.compile(r"^HUMAN_APPROVED:[A-Za-z0-9._-]{4,64}$")
+
+
+def validate_strategy_id(strategy_id: str) -> str:
+    if not strategy_id or not STRATEGY_ID_RE.fullmatch(strategy_id):
+        raise ValueError(f"Invalid strategy_id {strategy_id!r}; must match {STRATEGY_ID_RE.pattern}")
+    return strategy_id
+
+
+def validate_human_token(status: str, allowed_auto: set[str], token: str | None) -> None:
+    if status not in allowed_auto:
+        if not token or not HUMAN_TOKEN_RE.fullmatch(token):
+            raise PermissionError(
+                f"Status '{status}' requires valid human_approval_token matching 'HUMAN_APPROVED:<4..64 id chars>'"
+            )
+
 
 class HotConfigStore:
-    """Versioned strategy registry + atomic POSIX rename(2) runtime config bus.
+    """Versioned strategy registry + atomic POSIX rename(2) runtime config bus."""
 
-    Guarantees:
-    - Live consumers read a single JSON file updated atomically via os.replace() (<2us),
-      preventing partial reads or torn writes.
-    - Every config transition is logged append-only in SQLite WAL with git/config SHA256.
-    - LIVE promotion requires explicit human approval token; automated loops may only
-      promote up to SHADOW_LIVE.
-    """
-
-    ALLOWED_AUTO_STATUSES = {"DRAFT", "BACKTESTED", "RED_TEAMED", "SHADOW_LIVE", "RETIRED"}
+    ALLOWED_AUTO_STATUSES = {
+        "DRAFT",
+        "BACKTESTED",
+        "RED_TEAMED",
+        "MICRO_RUN_PROBE_REQUIRED",
+        "SHADOW_LIVE",
+        "RETIRED",
+    }
 
     def __init__(self, state_dir: str | Path) -> None:
         self.state_dir = Path(state_dir)
@@ -74,112 +98,123 @@ class HotConfigStore:
         reason: str,
         human_approval_token: str | None = None,
     ) -> str:
-        """Persist a new strategy config version and atomically publish active runtime file."""
-        if cfg.status not in self.ALLOWED_AUTO_STATUSES:
-            if not human_approval_token or not human_approval_token.startswith("HUMAN_APPROVED:"):
-                raise PermissionError(
-                    f"Status '{cfg.status}' requires explicit human_approval_token='HUMAN_APPROVED:<id>'"
-                )
+        """Persist a new strategy config version (append-only) and atomically publish active runtime file."""
+        validate_strategy_id(cfg.strategy_id)
+        validate_human_token(cfg.status, self.ALLOWED_AUTO_STATUSES, human_approval_token)
 
         payload = cfg.to_dict()
         cfg_sha = sha256_obj(payload)
         now = utc_now_ms()
 
-        with transaction(self.conn):
-            self.conn.execute(
-                """
-                INSERT OR REPLACE INTO strategy_versions
-                (strategy_id, version, status, config_sha256, config_json, actor, reason, created_ts_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    cfg.strategy_id,
-                    cfg.version,
-                    cfg.status,
-                    cfg_sha,
-                    json.dumps(payload, indent=2, sort_keys=True),
-                    actor,
-                    reason,
-                    now,
-                ),
-            )
-            self.conn.execute(
-                """
-                INSERT OR REPLACE INTO active_pointers
-                (strategy_id, active_version, status, updated_ts_ms)
-                VALUES (?, ?, ?, ?)
-                """,
-                (cfg.strategy_id, cfg.version, cfg.status, now),
-            )
-
-        self._atomic_publish(cfg.strategy_id, {
-            "strategy_id": cfg.strategy_id,
-            "version": cfg.version,
-            "status": cfg.status,
-            "config_sha256": cfg_sha,
-            "updated_ts_ms": now,
-            "actor": actor,
-            "reason": reason,
-            "config": payload,
-        })
+        # Hold connection lock across BOTH DB transaction and runtime os.replace() to preserve strict ordering (HIGH-R1)
+        with get_conn_lock(self.conn):
+            with transaction(self.conn):
+                existing = self.conn.fetch_one(
+                    "SELECT config_sha256 FROM strategy_versions WHERE strategy_id=? AND version=?",
+                    (cfg.strategy_id, cfg.version),
+                )
+                if existing is not None:
+                    if existing["config_sha256"] != cfg_sha:
+                        raise ValueError(
+                            f"Append-only violation: {cfg.strategy_id}@{cfg.version} already exists with different SHA"
+                        )
+                else:
+                    self.conn.execute(
+                        """
+                        INSERT INTO strategy_versions
+                        (strategy_id, version, status, config_sha256, config_json, actor, reason, created_ts_ms)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            cfg.strategy_id,
+                            cfg.version,
+                            cfg.status,
+                            cfg_sha,
+                            json.dumps(payload, indent=2, sort_keys=True),
+                            actor,
+                            reason,
+                            now,
+                        ),
+                    )
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO active_pointers
+                    (strategy_id, active_version, status, updated_ts_ms)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (cfg.strategy_id, cfg.version, cfg.status, now),
+                )
+            self._atomic_publish_runtime(cfg, cfg_sha, now)
         logger.info("Published hot config %s@%s [%s] sha=%s", cfg.strategy_id, cfg.version, cfg.status, cfg_sha[:12])
         return cfg_sha
 
-    def _atomic_publish(self, strategy_id: str, envelope: dict[str, Any]) -> Path:
-        safe_id = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in strategy_id)
+    def _atomic_publish_runtime(self, cfg: StrategyConfig, cfg_sha: str, ts_ms: int) -> Path:
+        """Write to temp file in same directory + fsync + POSIX os.replace() (atomic rename(2))."""
+        safe_id = validate_strategy_id(cfg.strategy_id)
         target = self.runtime_dir / f"{safe_id}.json"
-        fd, tmp_path = tempfile.mkstemp(prefix=f".{safe_id}_", suffix=".tmp", dir=str(self.runtime_dir))
+        envelope = {
+            "published_ts_ms": ts_ms,
+            "config_sha256": cfg_sha,
+            "config": cfg.to_dict(),
+        }
+        raw = json.dumps(envelope, indent=2, sort_keys=True).encode("utf-8")
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{safe_id}.", suffix=".tmp", dir=str(self.runtime_dir))
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(envelope, fh, indent=2, sort_keys=True)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp_path, target)
+            os.replace(tmp_name, target)
         except Exception:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
             raise
         return target
 
     def read_active(self, strategy_id: str) -> StrategyConfig | None:
-        safe_id = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in strategy_id)
+        safe_id = validate_strategy_id(strategy_id)
         target = self.runtime_dir / f"{safe_id}.json"
         if not target.exists():
             return None
-        with open(target, "r", encoding="utf-8") as fh:
-            env = json.load(fh)
-        return StrategyConfig.from_dict(env["config"])
+        data = json.loads(target.read_text(encoding="utf-8"))
+        return StrategyConfig.from_dict(data["config"])
 
-    def rollback(self, strategy_id: str, target_version: str, actor: str, reason: str) -> StrategyConfig:
-        row = self.conn.execute(
-            "SELECT config_json FROM strategy_versions WHERE strategy_id=? AND version=?",
-            (strategy_id, target_version),
-        ).fetchone()
-        if not row:
-            raise ValueError(f"Version {strategy_id}@{target_version} not found")
-        cfg = StrategyConfig.from_dict(json.loads(row["config_json"]))
-        now = utc_now_ms()
-        cfg_sha = sha256_obj(cfg.to_dict())
-        with transaction(self.conn):
-            self.conn.execute(
-                "UPDATE active_pointers SET active_version=?, status=?, updated_ts_ms=? WHERE strategy_id=?",
-                (cfg.version, cfg.status, now, strategy_id),
+    def rollback(
+        self,
+        strategy_id: str,
+        target_version: str,
+        actor: str,
+        reason: str,
+        human_approval_token: str | None = None,
+    ) -> StrategyConfig:
+        """Atomically roll back active runtime config (enforces human token if target is LIVE/CANARY)."""
+        validate_strategy_id(strategy_id)
+        with get_conn_lock(self.conn):
+            row = self.conn.fetch_one(
+                "SELECT status, config_sha256, config_json FROM strategy_versions WHERE strategy_id=? AND version=?",
+                (strategy_id, target_version),
             )
-        self._atomic_publish(strategy_id, {
-            "strategy_id": strategy_id,
-            "version": cfg.version,
-            "status": cfg.status,
-            "config_sha256": cfg_sha,
-            "updated_ts_ms": now,
-            "actor": actor,
-            "reason": f"ROLLBACK: {reason}",
-            "config": cfg.to_dict(),
-        })
-        logger.warning("Rolled back %s -> %s (%s)", strategy_id, target_version, reason)
+            if row is None:
+                raise ValueError(f"Version {strategy_id}@{target_version} not found")
+            cfg = StrategyConfig.from_dict(json.loads(row["config_json"]))
+            validate_human_token(cfg.status, self.ALLOWED_AUTO_STATUSES, human_approval_token)
+
+            now = utc_now_ms()
+            with transaction(self.conn):
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO active_pointers
+                    (strategy_id, active_version, status, updated_ts_ms)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (strategy_id, target_version, row["status"], now),
+                )
+            self._atomic_publish_runtime(cfg, row["config_sha256"], now)
+        logger.warning("Rolled back %s -> %s by %s (%s)", strategy_id, target_version, actor, reason)
         return cfg
 
     def list_strategies(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
+        rows = self.conn.fetch_all(
             """
             SELECT p.strategy_id, p.active_version, p.status, p.updated_ts_ms,
                    v.config_sha256, v.actor, v.reason, v.config_json
@@ -188,7 +223,7 @@ class HotConfigStore:
               ON p.strategy_id = v.strategy_id AND p.active_version = v.version
             ORDER BY p.updated_ts_ms DESC
             """
-        ).fetchall()
+        )
         out = []
         for r in rows:
             out.append({
@@ -203,16 +238,14 @@ class HotConfigStore:
             })
         return out
 
-    def history(self, strategy_id: str) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
+    def version_history(self, strategy_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.fetch_all(
             """
             SELECT version, status, config_sha256, actor, reason, created_ts_ms
-            FROM strategy_versions
-            WHERE strategy_id=?
-            ORDER BY id DESC
+            FROM strategy_versions WHERE strategy_id=? ORDER BY id DESC
             """,
             (strategy_id,),
-        ).fetchall()
+        )
         return [dict(r) for r in rows]
 
     def close(self) -> None:

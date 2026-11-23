@@ -28,6 +28,9 @@ class TelemetryMonitor:
             "avg_hold_hours": metrics.avg_hold_hours,
             "gross_funding_usd": metrics.gross_funding_usd,
             "basis_pnl_usd": metrics.basis_pnl_usd,
+            "gross_alpha_usd": metrics.gross_alpha_usd,
+            "liquidation_count": metrics.liquidation_count,
+            "forced_rebalance_count": metrics.forced_rebalance_count,
             "total_costs_usd": round(metrics.total_fees_usd + metrics.total_slippage_usd + metrics.total_rebalance_usd, 4),
             "net_pnl_usd": metrics.net_pnl_usd,
             "apr_pct": metrics.annualized_apr_pct,
@@ -42,17 +45,27 @@ class TelemetryMonitor:
 
         anomaly = "HEALTHY"
         severity = "INFO"
-        summary = f"Healthy carry profile: APR={metrics.annualized_apr_pct:+.1f}%, Sharpe={metrics.sharpe_ratio:.2f}, Cost/Gross={metrics.fee_to_gross_ratio:.1%}."
+        summary = f"Healthy profile: APR={metrics.annualized_apr_pct:+.1f}%, Sharpe={metrics.sharpe_ratio:.2f}, Cost/Gross={metrics.fee_to_gross_ratio:.1%}."
+        gross_ref = metrics.gross_alpha_usd if metrics.gross_alpha_usd > 0 else metrics.gross_funding_usd
 
+        # Rule 0 (P1-1): Single-leg Margin Liquidation (highest severity P0!)
+        if metrics.liquidation_count > 0:
+            anomaly = "MARGIN_LIQUIDATION"
+            severity = "P0"
+            summary = (
+                f"{metrics.liquidation_count} single-leg margin liquidation(s) occurred "
+                f"(forced_rebalances={metrics.forced_rebalance_count}, leverage={cfg.leverage}x). "
+                f"Action needed: lower leverage or tighten stop_loss_basis_bps immediately."
+            )
         # Rule 1: Churn / Fee Overrun (catches ATB H6 exact pathology!)
-        if metrics.trade_count >= 5 and (
+        elif metrics.trade_count >= 5 and (
             metrics.fee_to_gross_ratio > 0.75
-            or (metrics.gross_funding_usd > 0 and metrics.net_pnl_usd < 0 and (metrics.total_fees_usd + metrics.total_slippage_usd) > metrics.gross_funding_usd)
+            or (gross_ref > 0 and metrics.net_pnl_usd < 0 and (metrics.total_fees_usd + metrics.total_slippage_usd) > gross_ref)
         ):
             anomaly = "CHURN_EXCESS"
             severity = "P0"
             summary = (
-                f"Fee churn destroying positive gross carry: gross=${metrics.gross_funding_usd:+.2f} "
+                f"Fee churn destroying positive gross alpha: gross=${gross_ref:+.2f} "
                 f"vs costs=${snap['total_costs_usd']:.2f} (ratio={metrics.fee_to_gross_ratio:.2f}x, "
                 f"avg_hold={metrics.avg_hold_hours:.1f}h, trades={metrics.trade_count}). "
                 f"Action needed: widen entry/exit hysteresis gap, increase min_hold_hours, or switch to lower-fee venue/maker."

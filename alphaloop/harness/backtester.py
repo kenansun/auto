@@ -52,27 +52,13 @@ class BacktestResult:
     warnings: list[str] = field(default_factory=list)
 
 
-def _rolling_apr_pct(
-    rates_by_ts: dict[int, float],
-    ts_ms: int,
-    lookback_hours: int,
-) -> float | None:
-    """Strictly causal trailing APR% over (ts_ms - lookback_hours, ts_ms]."""
-    start_ms = ts_ms - lookback_hours * HOUR_MS
-    total = 0.0
-    hits = 0
-    # Step hourly; rates_by_ts is O(1) lookup
-    cur = start_ms + HOUR_MS
-    while cur <= ts_ms:
-        val = rates_by_ts.get(cur)
-        if val is not None:
-            total += val
-            hits += 1
-        cur += HOUR_MS
-    if hits == 0:
-        return None
-    rate_per_hour = total / float(lookback_hours)
-    return rate_per_hour * 24.0 * 365.0 * 100.0
+TAKER_FEE_BPS: dict[str, float] = {
+    "hyperliquid": 4.5,
+    "lighter": 0.0,
+    "okx": 5.0,
+    "gate": 5.0,
+    "binance": 5.0,
+}
 
 
 def _basis_pnl_usd(
@@ -118,6 +104,8 @@ class FundingCarryBacktester:
         rates_b: dict[str, dict[int, float]] = {}
         prices_a: dict[str, dict[int, float]] = {}
         prices_b: dict[str, dict[int, float]] = {}
+        candles_a: dict[str, dict[int, PriceBar]] = {}
+        candles_b: dict[str, dict[int, PriceBar]] = {}
 
         all_ts_set: set[int] = set()
         for sym in symbols:
@@ -132,14 +120,19 @@ class FundingCarryBacktester:
             else:
                 rates_b[sym] = {}
 
+            # P0-1 ZERO LOOKAHEAD: Exchanges stamp 1h bar [t, t+1h) with OPEN timestamp t.
+            # At decision time t, ONLY c.open is observable (c.close is not known until t+1h!).
             ca = self.store.load_candles(cfg.venue_a, sym, start_ms, end_ms)
-            prices_a[sym] = {c.ts_ms: c.close for c in ca}
+            prices_a[sym] = {c.ts_ms: c.open for c in ca}
+            candles_a[sym] = {c.ts_ms: c for c in ca}
 
             venue_b_px = f"{cfg.venue_a}_spot" if is_spot_perp else cfg.venue_b
             cb = self.store.load_candles(venue_b_px, sym, start_ms, end_ms)
-            prices_b[sym] = {c.ts_ms: c.close for c in cb}
+            prices_b[sym] = {c.ts_ms: c.open for c in cb}
+            candles_b[sym] = {c.ts_ms: c for c in cb}
 
-        venues_for_fp = [cfg.venue_a] if is_spot_perp else [cfg.venue_a, cfg.venue_b]
+        # Include venue_b_px in fingerprint so spot_perp spot candles are tamper-evident (Red-Team #9)
+        venues_for_fp = [cfg.venue_a, f"{cfg.venue_a}_spot"] if is_spot_perp else [cfg.venue_a, cfg.venue_b]
         dataset_sha, prov, row_count = self.store.fingerprint_slice(venues_for_fp, symbols, start_ms, end_ms)
 
         if not all_ts_set or row_count == 0:
@@ -172,6 +165,7 @@ class FundingCarryBacktester:
                 best_symbol="",
                 provenance=prov,
                 dataset_sha256=dataset_sha,
+                gross_alpha_usd=0.0,
             )
             return BacktestResult(
                 config=cfg,
@@ -191,7 +185,6 @@ class FundingCarryBacktester:
             t += HOUR_MS
 
         n_steps = len(timeline)
-        # Precompute strictly causal O(1) prefix sums over timeline for each symbol & venue
         prefix_a: dict[str, list[float]] = {}
         hits_a: dict[str, list[int]] = {}
         prefix_b: dict[str, list[float]] = {}
@@ -230,29 +223,43 @@ class FundingCarryBacktester:
                 total = prefix_a[sym][hi] - prefix_a[sym][lo]
             return (total / float(lb)) * 24.0 * 365.0 * 100.0
 
-        # Determine effective notional per slot:
-        # Perp-Perp: capital allocated to slot is split 50/50 across Venue A & B margin.
-        # With leverage L (e.g., 4.0), each leg notional = slot_capital * L / 2 = 2x slot_capital.
-        slot_capital = cfg.capital_usd * cfg.per_position_weight
+        # Perp-Perp: slot capital is split 50/50 across Venue A & B margin.
+        # Effective per-leg leverage = notional_per_leg / (slot_capital * 0.5) = cfg.leverage.
+        eff_weight = min(cfg.per_position_weight, 1.0 / max(1, cfg.max_positions))
+        slot_capital = cfg.capital_usd * eff_weight
         if is_spot_perp:
             notional_per_leg = slot_capital * (cfg.leverage / (1.0 + cfg.leverage))
+            slot_margin_per_leg = max(1e-6, slot_capital / (1.0 + cfg.leverage))
         else:
             notional_per_leg = slot_capital * (cfg.leverage / 2.0)
+            slot_margin_per_leg = max(1e-6, slot_capital * 0.5)
+
+        eff_fee_a = cfg.fee_a_bps
+        eff_fee_b = cfg.fee_b_bps
+        if cfg.execution_mode == "MAKER_THEN_TAKER_HEDGE":
+            eff_fee_b = max(eff_fee_b, TAKER_FEE_BPS.get(cfg.venue_b, eff_fee_b))
+        elif cfg.execution_mode == "TAKER_TAKER":
+            eff_fee_a = max(eff_fee_a, TAKER_FEE_BPS.get(cfg.venue_a, eff_fee_a))
+            eff_fee_b = max(eff_fee_b, TAKER_FEE_BPS.get(cfg.venue_b, eff_fee_b))
 
         slip_bps = cfg.slippage_per_leg_bps + extra_slippage_bps_per_leg
-        one_way_fee_bps = cfg.fee_a_bps + cfg.fee_b_bps
-        one_way_slip_bps = 2.0 * slip_bps  # 2 legs entered or exited
+        one_way_fee_bps = eff_fee_a + eff_fee_b
+        one_way_slip_bps = 2.0 * slip_bps
 
         open_pos: dict[str, _OpenPosition] = {}
+        anchor_px: dict[str, tuple[float | None, float | None]] = {}
+        extra_rebal_usd: dict[str, float] = {}
+        cooldown_until: dict[str, int] = {}
         closed_trades: list[TradeRecord] = []
         realized_pnl_usd = 0.0
         equity_curve: list[tuple[int, float]] = []
         util_samples: list[float] = []
         basis_priced_trades = 0
         trade_seq = 0
+        liquidation_count = 0
+        forced_rebalance_count = 0
         warnings: list[str] = []
 
-        # Warmup: require full lookback_hours before first entry
         warmup_end = min_ts + cfg.lookback_hours * HOUR_MS
 
         for step_idx, ts in enumerate(timeline):
@@ -275,7 +282,6 @@ class FundingCarryBacktester:
                         step_funding += pos.notional_usd * fr_b
                 pos.gross_funding_usd += step_funding
 
-                # Track ATB buggy settlement-level exit streak if enabled
                 if cfg.use_atb_buggy_rules and fr_a is not None:
                     apr_inst = (fr_a * 24.0 * 365.0 * 100.0) if cfg.venue_a in ("hyperliquid", "lighter") else (fr_a * 3.0 * 365.0 * 100.0)
                     if abs(apr_inst) < 54.75:
@@ -283,12 +289,49 @@ class FundingCarryBacktester:
                     else:
                         pos.low_streak_settlements = 0
 
-            # 2) Check exits on open positions
+            # 2) Check per-leg margin safety (P1-1 + Red-Team #3 proxy for missing-candle leg) & exits
             to_close: list[tuple[str, str]] = []
+            prev_bar_ts = ts - HOUR_MS
             for sym, pos in open_pos.items():
                 hold_h = (ts - pos.entry_ts_ms) / HOUR_MS
                 cur_a = prices_a[sym].get(ts)
                 cur_b = prices_b[sym].get(ts)
+
+                if ts > pos.entry_ts_ms:
+                    bar_a_prev = candles_a[sym].get(prev_bar_ts)
+                    bar_b_prev = candles_b[sym].get(prev_bar_ts)
+                    anc_a, anc_b = anchor_px.get(sym, (pos.entry_px_a, pos.entry_px_b))
+                    # Red-Team #3: When one venue lacks historical candles (e.g. Lighter),
+                    # conservatively proxy missing-leg directional move from the present venue's candle!
+                    eff_bar_a = bar_a_prev or bar_b_prev
+                    eff_anc_a = anc_a if (bar_a_prev and anc_a) else anc_b
+                    eff_bar_b = bar_b_prev or bar_a_prev
+                    eff_anc_b = anc_b if (bar_b_prev and anc_b) else anc_a
+
+                    adverse_leg_move = 0.0
+                    is_short_a = pos.direction in ("SHORT_A_LONG_B", "SHORT_A_LONG_SPOT")
+                    if eff_bar_a and eff_anc_a and eff_anc_a > 0:
+                        mv_a = ((eff_bar_a.high / eff_anc_a) - 1.0) if is_short_a else (1.0 - (eff_bar_a.low / eff_anc_a))
+                        adverse_leg_move = max(adverse_leg_move, mv_a)
+                    if (not is_spot_perp) and eff_bar_b and eff_anc_b and eff_anc_b > 0:
+                        mv_b = (1.0 - (eff_bar_b.low / eff_anc_b)) if is_short_a else ((eff_bar_b.high / eff_anc_b) - 1.0)
+                        adverse_leg_move = max(adverse_leg_move, mv_b)
+
+                    leg_lev = pos.notional_usd / slot_margin_per_leg
+                    margin_consumed = adverse_leg_move * leg_lev
+                    if margin_consumed >= 0.90:
+                        liquidation_count += 1
+                        # Red-Team #3: realize maintenance-margin liquidation penalty + unhedged exit slip
+                        extra_rebal_usd[sym] = extra_rebal_usd.get(sym, 0.0) + max(
+                            slot_margin_per_leg * 0.90, pos.notional_usd * 0.05
+                        )
+                        to_close.append((sym, "MARGIN_LIQUIDATION"))
+                        continue
+                    elif margin_consumed >= 0.65:
+                        forced_rebalance_count += 1
+                        extra_rebal_usd[sym] = extra_rebal_usd.get(sym, 0.0) + max(1.0, slot_margin_per_leg * 0.001)
+                        anchor_px[sym] = (cur_a or anc_a, cur_b or anc_b)
+
                 _, basis_bps = _basis_pnl_usd(
                     pos.direction, pos.notional_usd, pos.entry_px_a, pos.entry_px_b, cur_a, cur_b
                 )
@@ -318,21 +361,25 @@ class FundingCarryBacktester:
 
             for sym, reason in to_close:
                 pos = open_pos.pop(sym)
+                anchor_px.pop(sym, None)
+                forced_cost = extra_rebal_usd.pop(sym, 0.0)
+                if reason in ("MARGIN_LIQUIDATION", "BASIS_STOP"):
+                    cooldown_until[sym] = ts + 24 * HOUR_MS
                 trade_seq += 1
                 tr, priced = self._finalize_trade(
                     trade_seq, pos, ts, reason, prices_a[sym].get(ts), prices_b[sym].get(ts),
-                    one_way_fee_bps, one_way_slip_bps, cfg.rebalance_drag_bps_per_month,
+                    one_way_fee_bps, one_way_slip_bps, cfg.rebalance_drag_bps_per_month, forced_cost,
                 )
                 if priced:
                     basis_priced_trades += 1
                 closed_trades.append(tr)
                 realized_pnl_usd += tr.net_pnl_usd
 
-            # 3) Check entries if after warmup and slots available
+            # 3) Check entries if after warmup and slots available (respecting post-stop cooldown)
             if ts >= warmup_end and len(open_pos) < cfg.max_positions:
                 candidates: list[tuple[float, str, str, float]] = []
                 for sym in symbols:
-                    if sym in open_pos:
+                    if sym in open_pos or ts < cooldown_until.get(sym, 0):
                         continue
                     apr_a = fast_rolling_apr(sym, step_idx, is_b=False)
                     apr_b = 0.0 if is_spot_perp else fast_rolling_apr(sym, step_idx, is_b=True)
@@ -373,8 +420,10 @@ class FundingCarryBacktester:
                         entry_px_a=px_a,
                         entry_px_b=px_b,
                     )
+                    anchor_px[sym] = (px_a, px_b)
+                    extra_rebal_usd[sym] = 0.0
 
-            # 4) Mark-to-market equity snapshot (smooth hourly rebalance accrual — zero final-tick cliff!)
+            # 4) Mark-to-market equity snapshot
             unrealized = 0.0
             for sym, pos in open_pos.items():
                 hold_h = max(0.0, (ts - pos.entry_ts_ms) / HOUR_MS)
@@ -385,20 +434,22 @@ class FundingCarryBacktester:
                 )
                 est_rt_cost = pos.notional_usd * (2.0 * (one_way_fee_bps + one_way_slip_bps)) / 10000.0
                 accrued_rebal = pos.notional_usd * (cfg.rebalance_drag_bps_per_month / 10000.0) * (hold_h / (30.0 * 24.0))
-                unrealized += pos.gross_funding_usd + b_pnl - est_rt_cost - accrued_rebal
+                unrealized += pos.gross_funding_usd + b_pnl - est_rt_cost - accrued_rebal - extra_rebal_usd.get(sym, 0.0)
 
             equity_curve.append((ts, cfg.capital_usd + realized_pnl_usd + unrealized))
-            util_samples.append((len(open_pos) * slot_capital) / cfg.capital_usd * 100.0)
+            util_samples.append(((len(open_pos) * slot_capital) / cfg.capital_usd * 100.0) if cfg.capital_usd > 0 else 0.0)
 
         # 5) Close remaining positions at end of window (mark-to-market settlement)
         final_ts = timeline[-1]
         for sym in list(open_pos.keys()):
             pos = open_pos.pop(sym)
+            anchor_px.pop(sym, None)
+            forced_cost = extra_rebal_usd.pop(sym, 0.0)
             trade_seq += 1
             tr, priced = self._finalize_trade(
                 trade_seq, pos, final_ts, "END_OF_WINDOW",
                 prices_a[sym].get(final_ts), prices_b[sym].get(final_ts),
-                one_way_fee_bps, one_way_slip_bps, cfg.rebalance_drag_bps_per_month,
+                one_way_fee_bps, one_way_slip_bps, cfg.rebalance_drag_bps_per_month, forced_cost,
             )
             if priced:
                 basis_priced_trades += 1
@@ -413,6 +464,8 @@ class FundingCarryBacktester:
             warnings.append(
                 f"LOW_DUAL_CANDLE_COVERAGE ({basis_cov:.1f}%): venue_b lacked 1h candles; basis PnL partially unpriced."
             )
+        if liquidation_count > 0:
+            warnings.append(f"MARGIN_LIQUIDATION_OCCURRED ({liquidation_count} events)")
 
         metrics = self._compute_metrics(
             cfg=cfg,
@@ -423,6 +476,8 @@ class FundingCarryBacktester:
             util_samples=util_samples,
             provenance=prov,
             dataset_sha=dataset_sha,
+            liquidation_count=liquidation_count,
+            forced_rebalance_count=forced_rebalance_count,
         )
         return BacktestResult(
             config=cfg,
@@ -444,6 +499,7 @@ class FundingCarryBacktester:
         one_way_fee_bps: float,
         one_way_slip_bps: float,
         rebalance_drag_bps_per_month: float,
+        extra_rebal_usd: float = 0.0,
     ) -> tuple[TradeRecord, bool]:
         hold_h = max(0.0, (exit_ts_ms - pos.entry_ts_ms) / HOUR_MS)
         priced = bool(pos.entry_px_a and pos.entry_px_b and exit_px_a and exit_px_b)
@@ -452,7 +508,7 @@ class FundingCarryBacktester:
         )
         fee_usd = pos.notional_usd * (2.0 * one_way_fee_bps) / 10000.0
         slip_usd = pos.notional_usd * (2.0 * one_way_slip_bps) / 10000.0
-        rebal_usd = pos.notional_usd * (rebalance_drag_bps_per_month / 10000.0) * (hold_h / (30.0 * 24.0))
+        rebal_usd = pos.notional_usd * (rebalance_drag_bps_per_month / 10000.0) * (hold_h / (30.0 * 24.0)) + extra_rebal_usd
         net_usd = pos.gross_funding_usd + b_pnl - fee_usd - slip_usd - rebal_usd
         tr = TradeRecord(
             trade_id=f"T-{seq:04d}",
@@ -484,10 +540,13 @@ class FundingCarryBacktester:
         util_samples: list[float],
         provenance: str,
         dataset_sha: str,
+        liquidation_count: int = 0,
+        forced_rebalance_count: int = 0,
     ) -> BacktestMetrics:
         days = max(1.0 / 24.0, (end_ms - start_ms) / (86400.0 * 1000.0))
         gross_f = sum(t.gross_funding_usd for t in trades)
         basis_p = sum(t.basis_pnl_usd for t in trades)
+        gross_alpha = gross_f + basis_p
         fees = sum(t.fee_usd for t in trades)
         slips = sum(t.slippage_usd for t in trades)
         rebals = sum(t.rebalance_usd for t in trades)
@@ -533,7 +592,8 @@ class FundingCarryBacktester:
             sharpe = 0.0
 
         calmar = (ann_apr_pct / max_dd_pct) if max_dd_pct > 0.05 else (ann_apr_pct / 0.05 if ann_apr_pct > 0 else 0.0)
-        fee_to_gross = ((fees + slips + rebals) / gross_f) if gross_f > 0 else 99.0
+        gross_denom = gross_alpha if gross_alpha > 0 else gross_f
+        fee_to_gross = ((fees + slips + rebals) / gross_denom) if gross_denom > 0 else 99.0
         avg_util = (sum(util_samples) / len(util_samples)) if util_samples else 0.0
 
         # Concentration stress: drop top 5 winning trades & drop best symbol
@@ -599,4 +659,7 @@ class FundingCarryBacktester:
             provenance=provenance,
             dataset_sha256=dataset_sha,
             by_symbol=by_sym,
+            gross_alpha_usd=round(gross_alpha, 4),
+            liquidation_count=liquidation_count,
+            forced_rebalance_count=forced_rebalance_count,
         )

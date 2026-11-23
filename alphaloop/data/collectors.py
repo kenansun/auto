@@ -8,6 +8,7 @@ Strictly STD-34 compliant:
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import random
@@ -53,7 +54,7 @@ def _http_json(
                 continue
             logger.error("HTTP %s permanent failure on %s", exc.code, url)
             raise
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, OSError, TimeoutError, json.JSONDecodeError) as exc:
             last_err = exc
             if attempt < max_retries - 1:
                 sleep_s = (0.5 * (2 ** attempt)) + random.uniform(0.05, 0.30)
@@ -145,6 +146,7 @@ class HyperliquidCollector:
 
     def fetch_candles_1h(self, symbol: str, days: int = 90) -> list[PriceBar]:
         end_ms = utc_now_ms()
+        cur_hour_ms = (end_ms // HOUR_MS) * HOUR_MS
         start_ms = end_ms - days * 86400 * 1000
         rows = _http_json(
             self.INFO_URL,
@@ -157,6 +159,8 @@ class HyperliquidCollector:
         bars: list[PriceBar] = []
         for r in rows:
             t_hour = (int(r["t"]) // HOUR_MS) * HOUR_MS
+            if t_hour >= cur_hour_ms:
+                continue  # Exclude in-progress unclosed current-hour bar
             close = float(r["c"])
             vol_base = float(r["v"])
             bars.append(
@@ -314,6 +318,10 @@ class OKXCollector:
             min_t = None
             for r in rows:
                 ts_ms = (int(r[0]) // HOUR_MS) * HOUR_MS
+                if min_t is None or ts_ms < min_t:
+                    min_t = ts_ms
+                if len(r) > 8 and str(r[8]) != "1":
+                    continue
                 if ts_ms >= cutoff_ms:
                     close = float(r[4])
                     vol_ccy = float(r[7]) if len(r) > 7 else float(r[5]) * close
@@ -328,8 +336,6 @@ class OKXCollector:
                         volume_usd=vol_ccy,
                         provenance=PROVENANCE_REAL,
                     )
-                if min_t is None or ts_ms < min_t:
-                    min_t = ts_ms
             if min_t is None or min_t <= cutoff_ms or len(rows) < 95:
                 break
             after = str(min_t)
@@ -390,6 +396,7 @@ class GateCollector:
     def fetch_candles_1h(self, symbol: str, days: int = 90) -> list[PriceBar]:
         contract = f"{symbol}_USDT"
         now_sec = int(time.time())
+        cur_hour_ms = ((now_sec * 1000) // HOUR_MS) * HOUR_MS
         cutoff_sec = now_sec - days * 86400
         seen: dict[int, PriceBar] = {}
         cursor_from = cutoff_sec
@@ -405,6 +412,8 @@ class GateCollector:
                 raise
             for r in rows:
                 ts_ms = (int(r["t"]) * 1000 // HOUR_MS) * HOUR_MS
+                if ts_ms >= cur_hour_ms:
+                    continue  # Exclude in-progress unclosed current-hour bar
                 close = float(r["c"])
                 vol_usd = float(r.get("sum") or 0.0)
                 seen[ts_ms] = PriceBar(
@@ -418,6 +427,8 @@ class GateCollector:
                     volume_usd=vol_usd,
                     provenance=PROVENANCE_REAL,
                 )
-            cursor_from = cursor_to + 3600
+            if cursor_to >= now_sec:
+                break
+            cursor_from = cursor_to  # Overlap boundary safely (deduplicated via seen[ts_ms])
             time.sleep(0.08)
         return sorted(seen.values(), key=lambda x: x.ts_ms)

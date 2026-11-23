@@ -1,6 +1,6 @@
 """Consequence-Severity Multi-Model Router with budget cap & cross-model enforcement.
 
-Upgrades cypo_trade_help/docs/notes/model_routing.md into executable code:
+Implements consequence-tiered multi-model routing as executable code:
 - Routes by role & consequence severity (NOT one-size-fits-all model).
 - Enforces cross-family Red-Team independence (Critic family != Proposer family).
 - Enforces hard USD budget cap per cycle to prevent runaway token loops.
@@ -9,9 +9,11 @@ Upgrades cypo_trade_help/docs/notes/model_routing.md into executable code:
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -87,7 +89,7 @@ DEFAULT_ROUTES: dict[str, ModelRouteSpec] = {
 
 
 class MultiModelRouter:
-    """Routes structured single-turn JSON prompts across LLM providers with cost tracking."""
+    """Thread-safe structured single-turn JSON router with per-thread round budget isolation."""
 
     def __init__(
         self,
@@ -96,8 +98,22 @@ class MultiModelRouter:
     ) -> None:
         self.routes = dict(routes or DEFAULT_ROUTES)
         self.max_cycle_budget_usd = max_cycle_budget_usd
+        self._lock = threading.Lock()
+        self._tls = threading.local()
         self.spent_usd = 0.0
         self.call_log: list[dict[str, Any]] = []
+
+    @property
+    def round_spent_usd(self) -> float:
+        return float(getattr(self._tls, "round_spent_usd", 0.0))
+
+    @round_spent_usd.setter
+    def round_spent_usd(self, value: float) -> None:
+        self._tls.round_spent_usd = float(value)
+
+    def reset_round_budget(self) -> None:
+        """Reset current thread's per-round budget counter without disturbing concurrent threads."""
+        self._tls.round_spent_usd = 0.0
 
     def select_red_team_route(self, proposer_family: str) -> ModelRouteSpec:
         """Guarantee adversarial Red-Team critic comes from a different model family."""
@@ -121,12 +137,11 @@ class MultiModelRouter:
         if not api_key:
             return None, f"deterministic-fallback(target={spec.family}/{spec.model_id},no_api_key)"
 
-        if self.spent_usd >= self.max_cycle_budget_usd:
-            logger.warning("Cycle LLM budget cap $%.2f reached; falling back locally", self.max_cycle_budget_usd)
-            return None, f"deterministic-fallback(budget_cap_reached=${self.spent_usd:.2f})"
+        if self.round_spent_usd >= self.max_cycle_budget_usd:
+            logger.warning("Round LLM budget cap $%.2f reached; falling back locally", self.max_cycle_budget_usd)
+            return None, f"deterministic-fallback(budget_cap_reached=${self.round_spent_usd:.2f})"
 
         compact_user = json.dumps(user_payload, separators=(",", ":"), ensure_ascii=True)
-        # Anti-bloat context guard (lesson #22 from cypo model_routing.md: never dump repos!)
         if len(compact_user) > 24000:
             compact_user = compact_user[:24000] + "...[TRUNCATED_FOR_COST_GUARD]"
 
@@ -138,17 +153,19 @@ class MultiModelRouter:
                 resp_text, in_tok, out_tok = self._call_openai_compat(url, spec.model_id, api_key, system_prompt, compact_user)
 
             est_cost = (in_tok * spec.input_usd_per_1m + out_tok * spec.output_usd_per_1m) / 1_000_000.0
-            self.spent_usd += est_cost
-            self.call_log.append({
-                "role": role,
-                "model": f"{spec.family}/{spec.model_id}",
-                "in_tokens": in_tok,
-                "out_tokens": out_tok,
-                "est_usd": round(est_cost, 6),
-            })
+            self.round_spent_usd = self.round_spent_usd + est_cost
+            with self._lock:
+                self.spent_usd += est_cost
+                self.call_log.append({
+                    "role": role,
+                    "model": f"{spec.family}/{spec.model_id}",
+                    "in_tokens": in_tok,
+                    "out_tokens": out_tok,
+                    "est_usd": round(est_cost, 6),
+                })
             parsed = self._extract_json(resp_text)
             return parsed, f"{spec.family}/{spec.model_id}"
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError) as exc:
+        except (urllib.error.URLError, urllib.error.HTTPError, http.client.HTTPException, OSError, TimeoutError, ValueError, KeyError) as exc:
             logger.warning("LLM call failed for %s (%s): %s — falling back deterministically", role, spec.model_id, exc)
             return None, f"deterministic-fallback(api_error={type(exc).__name__})"
 
