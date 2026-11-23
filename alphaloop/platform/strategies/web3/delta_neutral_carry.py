@@ -197,7 +197,7 @@ class Web3DeltaNeutralCarryKernel:
         carry_ema_span: int = 6,
         hold_horizon_days: float = 21.0,
         cost_floor_multiplier: float = 3.0,
-        full_4leg_rt_cost_bps: float = 34.0,
+        full_4leg_rt_cost_bps: float = 36.0,
         exit_apr_pct: float = 2.0,
         max_entry_negative_basis_bps: float = -45.0,
         basis_stop_bps: float = 350.0,
@@ -254,6 +254,49 @@ class Web3DeltaNeutralCarryKernel:
         for sym, w in executed_weights.items():
             self._executed_weights[str(sym)] = _finite_or(w, 0.0)
 
+    def export_state(self) -> dict[str, Any]:
+        """Serialize mutable causal kernel state for atomic WAL checkpointing across restarts (RB-01)."""
+        states_out: dict[str, Any] = {}
+        for coin, st in sorted(self._states.items()):
+            states_out[coin] = {
+                "tf_h": float(st.tf_h),
+                "carry_events": [list(ev) for ev in st.carry_events],
+                "carry_ema_apr": st.carry_ema_apr,
+                "ema_alpha": float(st.ema_alpha),
+                "basis_bps_hist": list(st.basis_bps_hist),
+                "bar_count": int(st.bar_count),
+                "is_active_pair": bool(st.is_active_pair),
+            }
+        return {
+            "step_count": int(self._step_count),
+            "executed_weights": dict(self._executed_weights),
+            "states": states_out,
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        """Restore mutable causal kernel state from a persisted WAL checkpoint (RB-01)."""
+        self.reset()
+        self._step_count = max(0, int(state.get("step_count", 0)))
+        for sym, w in (state.get("executed_weights") or {}).items():
+            self._executed_weights[str(sym)] = _finite_or(w, 0.0)
+        for coin, st_d in (state.get("states") or {}).items():
+            st = _DualLegCoinState(
+                float(st_d.get("tf_h", 12.0)),
+                carry_ema_span=self.carry_ema_span,
+            )
+            st.ema_alpha = float(st_d.get("ema_alpha", st.ema_alpha))
+            st.carry_ema_apr = (
+                float(st_d["carry_ema_apr"]) if st_d.get("carry_ema_apr") is not None else None
+            )
+            st.bar_count = max(0, int(st_d.get("bar_count", 0)))
+            st.is_active_pair = bool(st_d.get("is_active_pair", False))
+            for ev in st_d.get("carry_events") or []:
+                if isinstance(ev, (list, tuple)) and len(ev) == 3:
+                    st.carry_events.append((float(ev[0]), float(ev[1]), float(ev[2])))
+            for b in st_d.get("basis_bps_hist") or []:
+                st.basis_bps_hist.append(float(b))
+            self._states[str(coin)] = st
+
     def clone_fresh(self) -> Web3DeltaNeutralCarryKernel:
         return Web3DeltaNeutralCarryKernel(
             warmup_bars=self.warmup_bars,
@@ -286,7 +329,7 @@ class Web3DeltaNeutralCarryKernel:
         return 50.0
 
     def _resolve_margin_ratio(self, coin: str, ctx: dict[str, Any]) -> float:
-        raw = ctx.get("margin_ratio")
+        raw = ctx.get("margin_ratio", ctx.get("perp_margin_buffer_ratio"))
         if raw is None:
             return 1.0
         if isinstance(raw, dict):

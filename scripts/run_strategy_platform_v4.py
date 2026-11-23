@@ -73,6 +73,7 @@ from alphaloop.platform.data_foundation import (
     DataFoundationRouter,
     MacroEventRelease,
     PAXGBasisPoint,
+    default_cn_ashare_specs,
     ingest_platform_v4_real_lake,
 )
 from alphaloop.platform.factors import (
@@ -82,9 +83,11 @@ from alphaloop.platform.factors import (
     MacroRegimeTimeline,
     StreamingFactorEngine,
 )
+from alphaloop.platform.strategies.ashare import AShareETFRotationKernel
 from alphaloop.platform.strategies.gold import (
     Gold4hEventKernel,
     GoldMacroEngine,
+    GoldMinerSpreadMRKernel,
     GoldPAXGBridgeKernel,
     GoldTradFiMacroKernel,
 )
@@ -244,6 +247,127 @@ def _compute_gold_g1_signal_factor_audit(
         snaps_by_symbol={symbol: snaps},
         horizon_bars=horizon_bars,
         priors=gold_g1_priors,
+    )
+
+
+def _build_g4_spread_factor_audit(
+    gld_bars: list[CanonicalBar],
+    gdx_bars: list[CanonicalBar],
+    *,
+    lookback_days: int = 60,
+    horizon_bars: int = 10,
+    track_name: str = "track_g_gold_g4_miner_spread",
+) -> Any:
+    """Strictly causal G2 audit of G4's mean-reversion signal (-z of log(GLD/GDX)) vs forward ratio return."""
+    gld_map = {int(b.ts_event_ms) // 86_400_000: b for b in gld_bars}
+    gdx_map = {int(b.ts_event_ms) // 86_400_000: b for b in gdx_bars}
+    common_days = sorted(set(gld_map) & set(gdx_map))
+    ratio_bars: list[CanonicalBar] = []
+    snaps: list[FactorSnapshot] = []
+    log_ratios: list[float] = []
+    for day in common_days:
+        gb = gld_map[day]
+        mb = gdx_map[day]
+        if gb.close <= 0.0 or mb.close <= 0.0:
+            continue
+        ratio = float(gb.close) / float(mb.close)
+        lr = math.log(ratio)
+        log_ratios.append(lr)
+        sig_val = 0.0
+        if len(log_ratios) >= lookback_days:
+            win = log_ratios[-lookback_days:]
+            mu = math.fsum(win) / len(win)
+            var = math.fsum((x - mu) * (x - mu) for x in win) / max(1, len(win) - 1)
+            sd = math.sqrt(var) if (math.isfinite(var) and var > 0.0) else 0.0
+            if sd > 1e-9:
+                sig_val = -(lr - mu) / sd
+        rb = CanonicalBar(
+            asset_class=gb.asset_class,
+            venue=gb.venue,
+            symbol="GLD_OVER_GDX",
+            timeframe_h=24.0,
+            timeframe_sec=86_400,
+            ts_event_ms=gb.ts_event_ms,
+            ts_avail_ms=max(gb.ts_avail_ms, mb.ts_avail_ms),
+            open=ratio,
+            high=ratio,
+            low=ratio,
+            close=ratio,
+            volume_usd=min(gb.volume_usd, mb.volume_usd),
+            carry_rate_period=0.0,
+            carry_interval_h=24.0,
+            spread_bps=4.0,
+            provenance=gb.provenance,
+        )
+        ratio_bars.append(rb)
+        snaps.append(
+            FactorSnapshot(
+                symbol="GLD_OVER_GDX",
+                venue=gb.venue,
+                timeframe_h=24.0,
+                ts_event_ms=rb.ts_event_ms,
+                ts_avail_ms=rb.ts_avail_ms,
+                close=ratio,
+                atr_14=ratio * 0.01,
+                prior_high_40=ratio,
+                prior_low_40=ratio,
+                prior_high_20=ratio,
+                prior_low_20=ratio,
+                values={"g4_spread_mr_neg_z": float(sig_val)},
+            )
+        )
+    auditor = FactorDirectionAuditor()
+    return auditor.audit(
+        track_name=track_name,
+        bars_by_symbol={"GLD_OVER_GDX": ratio_bars},
+        snaps_by_symbol={"GLD_OVER_GDX": snaps},
+        horizon_bars=horizon_bars,
+        priors={"g4_spread_mr_neg_z": +1},
+    )
+
+
+def _build_a1_factor_audit(
+    bars_by_symbol: dict[str, list[CanonicalBar]],
+    *,
+    horizon_bars: int = 10,
+    track_name: str = "track_a_cn_ashare_a1",
+) -> Any:
+    """Strictly causal G2 audit of A1's risk-adjusted CN A-Share ETF momentum signal (+1 prior)."""
+    kernel = AShareETFRotationKernel(rebalance_every_bars=1)
+    by_ts: dict[int, dict[str, CanonicalBar]] = {}
+    for sym, bl in bars_by_symbol.items():
+        for b in bl:
+            by_ts.setdefault(int(b.ts_event_ms), {})[sym] = b
+    snaps_by_sym: dict[str, list[FactorSnapshot]] = {s: [] for s in bars_by_symbol}
+    for ts in sorted(by_ts):
+        frame = by_ts[ts]
+        decs = kernel.on_bar_step(ts, frame, {})
+        for sym, b in frame.items():
+            dec = decs.get(sym)
+            sc = float(dec.raw_signal) if dec is not None else 0.0
+            snaps_by_sym[sym].append(
+                FactorSnapshot(
+                    symbol=sym,
+                    venue=b.venue,
+                    timeframe_h=float(b.timeframe_h),
+                    ts_event_ms=b.ts_event_ms,
+                    ts_avail_ms=b.ts_avail_ms,
+                    close=float(b.close),
+                    atr_14=float(b.close) * 0.015,
+                    prior_high_40=float(b.high),
+                    prior_low_40=float(b.low),
+                    prior_high_20=float(b.high),
+                    prior_low_20=float(b.low),
+                    values={"a1_risk_adj_mom": sc},
+                )
+            )
+    auditor = FactorDirectionAuditor()
+    return auditor.audit(
+        track_name=track_name,
+        bars_by_symbol=bars_by_symbol,
+        snaps_by_symbol=snaps_by_sym,
+        horizon_bars=horizon_bars,
+        priors={"a1_risk_adj_mom": +1},
     )
 
 
@@ -1577,8 +1701,256 @@ def run_platform_v4_evaluation(
             baseline_grid_label="f8_s24",
         )
 
+        # G4 Gold vs Gold Miners (`GLD` / `GDX`) Causal Vol-Matched Mean-Reversion Orthogonal Sleeve (Phase C)
+        g4_specs = {"GLD": gold_specs["GLD"], "GDX": macro_specs["GDX"]}
+        g4_bars = {"GLD": gold_macro_bars_1d["GLD"], "GDX": gold_macro_bars_1d["GDX"]}
+        dq_gdx_1d = router.audit_domain_dq("gold_macro", "yahoo", "GDX", 86400, macro_specs["GDX"])
+        g4_factor_audit = _build_g4_spread_factor_audit(
+            gold_macro_bars_1d["GLD"],
+            gold_macro_bars_1d["GDX"],
+            lookback_days=60,
+            horizon_bars=10,
+            track_name="gold_track_g4_miner_spread_10d",
+        )
+        g4_risk = RiskAllocatorConfig(
+            max_positions=2,
+            target_annual_vol_pct=12.0,
+            max_portfolio_leverage=1.0,
+            max_single_weight=0.75,
+            use_correlation_idm=False,
+        )
+        g4_grid = [
+            (
+                ix,
+                iy,
+                f"lb{lb}_z{int(ze * 100)}",
+                {"lookback_days": lb, "z_enter": ze, "z_exit": 0.25, "inertia_band": 0.08},
+                (
+                    lambda _lb=lb, _ze=ze: GoldMinerSpreadMRKernel(
+                        lookback_days=_lb,
+                        z_enter=_ze,
+                        z_exit=0.25,
+                        inertia_band=0.08,
+                    )
+                ),
+            )
+            for ix, lb in enumerate((45, 60, 90))
+            for iy, ze in enumerate((0.75, 1.0, 1.25))
+        ]
+        # Strictly peer-only G4 ablations for honest G6 CSCV PBO (zero weak/unrelated fillers)
+        g4_peer_refs = [
+            acct.simulate(
+                GoldMinerSpreadMRKernel(lookback_days=30, z_enter=1.0, z_exit=0.25, inertia_band=0.08),
+                g4_specs,
+                g4_bars,
+                risk_cfg=g4_risk,
+                capital_usd=capital_usd,
+            ).period_returns,
+            acct.simulate(
+                GoldMinerSpreadMRKernel(lookback_days=120, z_enter=1.0, z_exit=0.25, inertia_band=0.08),
+                g4_specs,
+                g4_bars,
+                risk_cfg=g4_risk,
+                capital_usd=capital_usd,
+            ).period_returns,
+            acct.simulate(
+                GoldMinerSpreadMRKernel(lookback_days=60, z_enter=1.0, z_exit=0.0, inertia_band=0.0),
+                g4_specs,
+                g4_bars,
+                risk_cfg=g4_risk,
+                capital_usd=capital_usd,
+            ).period_returns,
+            acct.simulate(
+                GoldMinerSpreadMRKernel(lookback_days=60, z_enter=1.25, z_exit=0.35, inertia_band=0.12),
+                g4_specs,
+                g4_bars,
+                risk_cfg=g4_risk,
+                capital_usd=capital_usd,
+            ).period_returns,
+        ]
+        g4_sim, g4_gates, g4_detail = _evaluate_strategy_full(
+            router=router,
+            family_id="gold_track_g4_miner_spread_mr",
+            track_name="track_g_gold",
+            strategy_id="gold_g4_miner_spread_mr",
+            asset_domain="gold",
+            baseline_factory=lambda: GoldMinerSpreadMRKernel(
+                lookback_days=60,
+                z_enter=1.0,
+                z_exit=0.25,
+                inertia_band=0.08,
+            ),
+            grid_factories=g4_grid,
+            specs=g4_specs,
+            bars_by_symbol=g4_bars,
+            risk_cfg=g4_risk,
+            dq_reports=[dq_gld_1d, dq_gdx_1d],
+            factor_audit=g4_factor_audit,
+            benchmark_returns=bh_gld_1d,
+            benchmark_name="GLD_1D_BH",
+            periods_per_year=252.0,
+            capital_usd=capital_usd,
+            pbo_distinct_returns=g4_peer_refs,
+            strategy_mode="orthogonal",
+            purge_bars=5,
+            embargo_bars=5,
+            baseline_grid_label="lb60_z100",
+        )
+
         # ------------------------------------------------------------------
-        # 4. Top-Level Return-Stream Composition (PortfolioCombiner)
+        # 3b. Track A — CN A-Share Native Strategy Evaluation (Phase C, Optional if Real Lake Present)
+        # ------------------------------------------------------------------
+        a1_sim: SimulationResult | None = None
+        a1_gates: InstitutionalGateReport | None = None
+        a1_detail: dict[str, Any] | None = None
+        ashare_inventory: dict[str, int] = {}
+        ashare_dq_excluded: list[str] = []
+
+        cn_specs_all = default_cn_ashare_specs()
+        cn_bars_passed: dict[str, list[CanonicalBar]] = {}
+        cn_dq_passed: list[Any] = []
+        for sym, spec in cn_specs_all.items():
+            raw_b = router.load_bars("cn_ashare", "cn_a_share", sym, 86_400)
+            if not raw_b:
+                continue
+            if any(b.provenance != PROVENANCE_REAL for b in raw_b):
+                continue
+            dq_a = router.audit_domain_dq("cn_ashare", "cn_a_share", sym, 86_400, spec)
+            ashare_inventory[sym] = len(raw_b)
+            if dq_a.passed and len(raw_b) >= 200:
+                cn_bars_passed[sym] = raw_b
+                cn_dq_passed.append(dq_a)
+            else:
+                ashare_dq_excluded.append(sym)
+
+        if len(cn_bars_passed) >= 4 and "510300.SS" in cn_bars_passed:
+            # RB-13: align all CN A-share ETFs strictly on valid completed 510300.SS trading dates
+            # so A1 period_returns and CSI300 benchmark returns align 1:1 by timestamp with zero 1-day shift.
+            csi300_ts_set = {int(b.ts_event_ms) for b in cn_bars_passed["510300.SS"]}
+            cn_bars_aligned: dict[str, list[CanonicalBar]] = {
+                sym: [b for b in bl if int(b.ts_event_ms) in csi300_ts_set]
+                for sym, bl in cn_bars_passed.items()
+            }
+            cn_bars_passed = {sym: bl for sym, bl in cn_bars_aligned.items() if len(bl) >= 200}
+
+        if len(cn_bars_passed) >= 4 and "510300.SS" in cn_bars_passed:
+            a1_specs = {s: cn_specs_all[s] for s in cn_bars_passed}
+            a1_risk = RiskAllocatorConfig(
+                max_positions=4,
+                target_annual_vol_pct=15.0,
+                max_portfolio_leverage=1.0,
+                max_single_weight=0.60,
+            )
+            a1_factor_audit = _build_a1_factor_audit(
+                cn_bars_passed,
+                horizon_bars=10,
+                track_name="ashare_track_a1_etf_rotation_10d",
+            )
+            bh_csi300_1d = compute_buy_and_hold_returns(cn_bars_passed["510300.SS"])
+            a1_grid = [
+                (
+                    ix,
+                    iy,
+                    f"fm{fm}_reb{rb}",
+                    {"top_k": 2, "fast_mom_days": fm, "slow_mom_days": 60, "rank_hysteresis": 1, "inertia_buffer": 0.25, "rebalance_every_bars": rb},
+                    (
+                        lambda _fm=fm, _rb=rb: AShareETFRotationKernel(
+                            top_k=2,
+                            fast_mom_days=_fm,
+                            slow_mom_days=60,
+                            rank_hysteresis=1,
+                            inertia_buffer=0.25,
+                            rebalance_every_bars=_rb,
+                        )
+                    ),
+                )
+                for ix, fm in enumerate((15, 20, 25))
+                for iy, rb in enumerate((5, 10, 20))
+            ]
+            a1_peer_refs = [
+                acct.simulate(
+                    AShareETFRotationKernel(top_k=3, fast_mom_days=20, slow_mom_days=80, rebalance_every_bars=10),
+                    a1_specs,
+                    cn_bars_passed,
+                    risk_cfg=a1_risk,
+                    capital_usd=capital_usd,
+                ).period_returns,
+                acct.simulate(
+                    AShareETFRotationKernel(top_k=2, fast_mom_days=20, slow_mom_days=60, rank_hysteresis=2, rebalance_every_bars=15),
+                    a1_specs,
+                    cn_bars_passed,
+                    risk_cfg=a1_risk,
+                    capital_usd=capital_usd,
+                ).period_returns,
+                acct.simulate(
+                    AShareETFRotationKernel(top_k=1, fast_mom_days=20, slow_mom_days=60, max_single_weight=0.80, rebalance_every_bars=10),
+                    a1_specs,
+                    cn_bars_passed,
+                    risk_cfg=a1_risk,
+                    capital_usd=capital_usd,
+                ).period_returns,
+                bh_csi300_1d,
+            ]
+            a1_sim, a1_gates, a1_detail = _evaluate_strategy_full(
+                router=router,
+                family_id="ashare_track_a1_etf_rotation",
+                track_name="track_a_cn_ashare",
+                strategy_id="ashare_a1_etf_rotation",
+                asset_domain="ashare",
+                baseline_factory=lambda: AShareETFRotationKernel(
+                    top_k=2,
+                    fast_mom_days=20,
+                    slow_mom_days=60,
+                    rank_hysteresis=1,
+                    inertia_buffer=0.25,
+                    rebalance_every_bars=10,
+                ),
+                grid_factories=a1_grid,
+                specs=a1_specs,
+                bars_by_symbol=cn_bars_passed,
+                risk_cfg=a1_risk,
+                dq_reports=cn_dq_passed,
+                factor_audit=a1_factor_audit,
+                benchmark_returns=bh_csi300_1d,
+                benchmark_name="CSI300_ETF_510300_BH",
+                periods_per_year=242.0,
+                capital_usd=capital_usd,
+                pbo_distinct_returns=a1_peer_refs,
+                purge_bars=5,
+                embargo_bars=5,
+                baseline_grid_label="fm20_reb10",
+            )
+            # Transparent attribution check excluding domestic CNY Gold ETF (518880.SS)
+            cn_bars_no_gold = {s: b for s, b in cn_bars_passed.items() if s != "518880.SS"}
+            if len(cn_bars_no_gold) >= 3:
+                a1_no_gold_sim = acct.simulate(
+                    AShareETFRotationKernel(
+                        top_k=2,
+                        fast_mom_days=20,
+                        slow_mom_days=60,
+                        rank_hysteresis=1,
+                        inertia_buffer=0.25,
+                        rebalance_every_bars=10,
+                    ),
+                    {s: a1_specs[s] for s in cn_bars_no_gold},
+                    cn_bars_no_gold,
+                    risk_cfg=a1_risk,
+                    capital_usd=capital_usd,
+                )
+                a1_detail["no_gold_etf_attribution"] = {
+                    "excluded_symbol": "518880.SS",
+                    "dq_excluded_symbols": ashare_dq_excluded,
+                    "cagr_pct": round(a1_no_gold_sim.cagr_pct, 4),
+                    "sharpe_ratio": round(a1_no_gold_sim.sharpe_ratio, 4),
+                    "max_drawdown_pct": round(a1_no_gold_sim.max_drawdown_pct, 4),
+                    "trade_count": a1_no_gold_sim.trade_count,
+                    "total_cost_usd": round(a1_no_gold_sim.total_cost_usd, 4),
+                    "total_stamp_duty_usd": round(a1_no_gold_sim.total_stamp_duty_usd, 4),
+                    "net_pnl_usd": round(a1_no_gold_sim.net_pnl_usd, 4),
+                }
+
+        # ------------------------------------------------------------------
+        # 4. Top-Level Return-Stream Composition (PortfolioCombiner, OBS-05b 2.0% vol floor)
         # ------------------------------------------------------------------
         combiner = PortfolioCombiner()
         combined_active_5 = combiner.combine_sleeves(
@@ -1616,6 +1988,17 @@ def run_platform_v4_evaluation(
             target_vol_pct=15.0,
             capital_usd=capital_usd,
         )
+        combined_phase_c_four_pillar = combiner.combine_sleeves(
+            {
+                "web3_w1_xs_mom_carry": w1_sim,
+                "web3_w3_delta_neutral_carry": w3_dn_sim,
+                "gold_g1_gld_macro": g1_gld_sim,
+                "gold_g4_miner_spread_mr": g4_sim,
+            },
+            method="causal_inv_vol",
+            target_vol_pct=15.0,
+            capital_usd=capital_usd,
+        )
         combined_core = combiner.combine_sleeves(
             {
                 "web3_w1_xs_mom_carry": w1_sim,
@@ -1640,11 +2023,71 @@ def run_platform_v4_evaluation(
             target_vol_pct=15.0,
             capital_usd=capital_usd,
         )
+        portfolio_comp_dict: dict[str, Any] = {
+            "phase_c_four_pillar_w1_w3dn_g1_g4": combined_phase_c_four_pillar.to_dict(),
+            "phase_b_core_w1_w3dn_g1_gld": combined_phase_b_core.to_dict(),
+            "active_six_sleeve_with_w3dn_causal_inv_vol": combined_active_6_with_w3dn.to_dict(),
+            "active_five_sleeve_causal_inv_vol": combined_active_5.to_dict(),
+            "core_w1_plus_g1_gld": combined_w1_g1.to_dict(),
+            "six_sleeve_all_diagnostic": combined_core.to_dict(),
+        }
+        if a1_sim is not None:
+            combined_three_domain = combiner.combine_sleeves(
+                {
+                    "web3_w1_xs_mom_carry": w1_sim,
+                    "web3_w3_delta_neutral_carry": w3_dn_sim,
+                    "gold_g1_gld_macro": g1_gld_sim,
+                    "gold_g4_miner_spread_mr": g4_sim,
+                    "ashare_a1_etf_rotation": a1_sim,
+                },
+                method="causal_inv_vol",
+                target_vol_pct=15.0,
+                capital_usd=capital_usd,
+            )
+            portfolio_comp_dict["phase_c_three_domain_w1_w3dn_g1_g4_a1"] = combined_three_domain.to_dict()
 
         elapsed_sec = round(time.perf_counter() - t_start, 3)
 
+        tracks_dict: dict[str, Any] = {
+            "web3": {
+                "W1_xs_mom_carry": w1_detail,
+                "W2_adaptive_trend": w2_detail,
+                "W3_delta_neutral_carry": w3_dn_detail,
+                "W3_regime_carry": w3_detail,
+            },
+            "gold": {
+                "G1_tradfi_macro_gcf": g1_gcf_detail,
+                "G1_tradfi_macro_gld": g1_gld_detail,
+                "G2_4h_event_policy_A": g2_details["A"],
+                "G2_4h_event_policy_B": g2_details["B"],
+                "G2_4h_event_policy_C": g2_details["C"],
+                "G3_paxg_bridge": g3_detail,
+                "G4_gold_miner_spread_mr": g4_detail,
+            },
+        }
+        verdict_summary_dict: dict[str, Any] = {
+            "W1_xs_mom_carry": {"verdict": w1_gates.verdict, "passed": w1_gates.passed_gates, "total": 8},
+            "W2_adaptive_trend": {"verdict": w2_gates.verdict, "passed": w2_gates.passed_gates, "total": 8},
+            "W3_delta_neutral_carry": {"verdict": w3_dn_gates.verdict, "passed": w3_dn_gates.passed_gates, "total": 8},
+            "W3_regime_carry": {"verdict": w3_gates.verdict, "passed": w3_gates.passed_gates, "total": 8},
+            "G1_tradfi_macro_gcf": {"verdict": g1_gcf_gates.verdict, "passed": g1_gcf_gates.passed_gates, "total": 8},
+            "G1_tradfi_macro_gld": {"verdict": g1_gld_gates.verdict, "passed": g1_gld_gates.passed_gates, "total": 8},
+            "G2_4h_event_policy_A": {"verdict": g2_gates_map["A"].verdict, "passed": g2_gates_map["A"].passed_gates, "total": 8},
+            "G2_4h_event_policy_B": {"verdict": g2_gates_map["B"].verdict, "passed": g2_gates_map["B"].passed_gates, "total": 8},
+            "G2_4h_event_policy_C": {"verdict": g2_gates_map["C"].verdict, "passed": g2_gates_map["C"].passed_gates, "total": 8},
+            "G3_paxg_bridge": {"verdict": g3_gates.verdict, "passed": g3_gates.passed_gates, "total": 8},
+            "G4_gold_miner_spread_mr": {"verdict": g4_gates.verdict, "passed": g4_gates.passed_gates, "total": 8},
+        }
+        if a1_detail is not None and a1_gates is not None:
+            tracks_dict["ashare"] = {"A1_cn_ashare_etf_rotation": a1_detail}
+            verdict_summary_dict["A1_cn_ashare_etf_rotation"] = {
+                "verdict": a1_gates.verdict,
+                "passed": a1_gates.passed_gates,
+                "total": 8,
+            }
+
         report: dict[str, Any] = {
-            "platform_version": "4.1-phase-b",
+            "platform_version": "4.2-phase-c",
             "generated_at_utc": _utc_iso(),
             "elapsed_sec": elapsed_sec,
             "provenance": PROVENANCE_REAL,
@@ -1662,6 +2105,8 @@ def run_platform_v4_evaluation(
                 "gold_tips_yield_rows": len(yield_curve),
                 "gold_macro_events_rows": len(macro_events),
                 "gold_paxg_basis_rows": len(paxg_basis_pts),
+                "cn_ashare_1d_symbols": ashare_inventory,
+                "cn_ashare_dq_excluded": ashare_dq_excluded,
             },
             "isolation_invariants": {
                 "d7_web3_zero_yahoo_vix_bit_identical": bool(d7_zero_vix_bit_identical),
@@ -1669,22 +2114,7 @@ def run_platform_v4_evaluation(
                 "w3_dn_max_abs_delta_weight": round(float(w3_dn_max_abs_delta), 12),
                 "cross_domain_signal_coupling": False,
             },
-            "tracks": {
-                "web3": {
-                    "W1_xs_mom_carry": w1_detail,
-                    "W2_adaptive_trend": w2_detail,
-                    "W3_delta_neutral_carry": w3_dn_detail,
-                    "W3_regime_carry": w3_detail,
-                },
-                "gold": {
-                    "G1_tradfi_macro_gcf": g1_gcf_detail,
-                    "G1_tradfi_macro_gld": g1_gld_detail,
-                    "G2_4h_event_policy_A": g2_details["A"],
-                    "G2_4h_event_policy_B": g2_details["B"],
-                    "G2_4h_event_policy_C": g2_details["C"],
-                    "G3_paxg_bridge": g3_detail,
-                },
-            },
+            "tracks": tracks_dict,
             "g2_event_ablation_summary": {
                 pol: {
                     "cagr_pct": g2_details[pol]["baseline"]["cagr_pct"],
@@ -1696,25 +2126,8 @@ def run_platform_v4_evaluation(
                 }
                 for pol in ("A", "B", "C")
             },
-            "portfolio_composition": {
-                "phase_b_core_w1_w3dn_g1_gld": combined_phase_b_core.to_dict(),
-                "active_six_sleeve_with_w3dn_causal_inv_vol": combined_active_6_with_w3dn.to_dict(),
-                "active_five_sleeve_causal_inv_vol": combined_active_5.to_dict(),
-                "core_w1_plus_g1_gld": combined_w1_g1.to_dict(),
-                "six_sleeve_all_diagnostic": combined_core.to_dict(),
-            },
-            "verdict_summary": {
-                "W1_xs_mom_carry": {"verdict": w1_gates.verdict, "passed": w1_gates.passed_gates, "total": 8},
-                "W2_adaptive_trend": {"verdict": w2_gates.verdict, "passed": w2_gates.passed_gates, "total": 8},
-                "W3_delta_neutral_carry": {"verdict": w3_dn_gates.verdict, "passed": w3_dn_gates.passed_gates, "total": 8},
-                "W3_regime_carry": {"verdict": w3_gates.verdict, "passed": w3_gates.passed_gates, "total": 8},
-                "G1_tradfi_macro_gcf": {"verdict": g1_gcf_gates.verdict, "passed": g1_gcf_gates.passed_gates, "total": 8},
-                "G1_tradfi_macro_gld": {"verdict": g1_gld_gates.verdict, "passed": g1_gld_gates.passed_gates, "total": 8},
-                "G2_4h_event_policy_A": {"verdict": g2_gates_map["A"].verdict, "passed": g2_gates_map["A"].passed_gates, "total": 8},
-                "G2_4h_event_policy_B": {"verdict": g2_gates_map["B"].verdict, "passed": g2_gates_map["B"].passed_gates, "total": 8},
-                "G2_4h_event_policy_C": {"verdict": g2_gates_map["C"].verdict, "passed": g2_gates_map["C"].passed_gates, "total": 8},
-                "G3_paxg_bridge": {"verdict": g3_gates.verdict, "passed": g3_gates.passed_gates, "total": 8},
-            },
+            "portfolio_composition": portfolio_comp_dict,
+            "verdict_summary": verdict_summary_dict,
         }
 
         serialized = json.dumps(report, indent=2, sort_keys=True, allow_nan=False)

@@ -163,6 +163,7 @@ class PortfolioCombiner:
         rebalance_every_days: int = 5,
         rebalance_cost_bps: float = 4.0,
         min_overlap_days: int = 20,
+        min_sleeve_ann_vol_pct: float = 2.0,
         capital_usd: float | None = None,
     ) -> CombinedPortfolioResult:
         """Combine independently validated sleeve return streams with zero signal-level coupling."""
@@ -228,6 +229,12 @@ class PortfolioCombiner:
         lam = max(0.0, min(1.0, float(corr_shrinkage)))
         target_vol_frac = max(0.01, float(target_vol_pct) / 100.0)
         rebal_cost_frac = max(0.0, float(rebalance_cost_bps) / 10_000.0)
+        min_vol_pct_f = float(min_sleeve_ann_vol_pct)
+        if not math.isfinite(min_vol_pct_f) or min_vol_pct_f <= 0.0:
+            raise ValueError(
+                f"min_sleeve_ann_vol_pct must be finite and > 0, got {min_sleeve_ann_vol_pct!r}"
+            )
+        min_vol_frac = max(1e-4, min_vol_pct_f / 100.0)
 
         # 2. Strictly causal step-by-step portfolio simulation (uses ONLY returns[:i] and days[:i+1])
         eq = total_cap
@@ -258,7 +265,7 @@ class PortfolioCombiner:
                     ann_vols: dict[str, float] = {}
                     for sid in sleeve_ids:
                         sd_i = fast_var_std(hists[sid], ddof=1)[2]
-                        ann_vols[sid] = max(1e-4, sd_i * ann_scale_i)
+                        ann_vols[sid] = max(min_vol_frac, sd_i * ann_scale_i)
 
                     # Causal shrunk correlation matrix over trailing lookback
                     r_mat: dict[str, dict[str, float]] = {
@@ -277,7 +284,7 @@ class PortfolioCombiner:
                     if m_name == "equal_weight":
                         w_tilde = {sid: 1.0 / float(m_sleeves) for sid in sleeve_ids}
                     elif m_name == "causal_inv_vol":
-                        inv_v = {sid: 1.0 / max(ann_vols[sid], 1e-4) for sid in sleeve_ids}
+                        inv_v = {sid: 1.0 / max(ann_vols[sid], min_vol_frac) for sid in sleeve_ids}
                         inv_sum = math.fsum(inv_v.values())
                         w_tilde = {sid: inv_v[sid] / inv_sum for sid in sleeve_ids}
                     else:
@@ -285,7 +292,7 @@ class PortfolioCombiner:
                         raw_u: dict[str, float] = {}
                         for sid in sleeve_ids:
                             pos_corr_sum = math.fsum(max(0.0, r_mat[sid][other]) for other in sleeve_ids)
-                            raw_u[sid] = 1.0 / (max(ann_vols[sid], 1e-4) * math.sqrt(max(1.0, pos_corr_sum)))
+                            raw_u[sid] = 1.0 / (max(ann_vols[sid], min_vol_frac) * math.sqrt(max(1.0, pos_corr_sum)))
                         u_sum = math.fsum(raw_u.values())
                         w_tilde = {sid: raw_u[sid] / u_sum for sid in sleeve_ids}
 

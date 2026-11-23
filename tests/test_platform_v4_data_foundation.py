@@ -1569,7 +1569,8 @@ class TestPlatformV4DataFoundation(unittest.TestCase):
             self.assertIn("SET enable_external_access = false", executed_sqls)
             lock_idx = executed_sqls.index("SET enable_external_access = false")
             self.assertGreater(lock_idx, 0)
-            self.assertEqual(executed_sqls[lock_idx + 1], "SELECT COUNT(*) AS c FROM paxg_basis_arbitration")
+            self.assertEqual(executed_sqls[lock_idx + 1], "SET lock_configuration = true")
+            self.assertEqual(executed_sqls[lock_idx + 2], "SELECT COUNT(*) AS c FROM paxg_basis_arbitration")
 
     def test_fix8_fix9_fix10_hl_partial_trim_empty_funding_defillama_fomc_bls(self) -> None:
         now_ms = BASE_2025_MS + 96 * HOUR_MS
@@ -1835,7 +1836,8 @@ class TestPlatformV4DataFoundation(unittest.TestCase):
             self.assertTrue(any("paxg_basis_arbitration" in ddl for ddl in pre_lock_sqls))
             # Empty tables (zero rows -> 0-byte uncompressed jsonl.gz) were cleanly skipped
             self.assertFalse(any("macro_events" in ddl for ddl in pre_lock_sqls))
-            self.assertEqual(executed_sqls[lock_idx + 1], "SELECT COUNT(*) AS c FROM paxg_basis_arbitration")
+            self.assertEqual(executed_sqls[lock_idx + 1], "SET lock_configuration = true")
+            self.assertEqual(executed_sqls[lock_idx + 2], "SELECT COUNT(*) AS c FROM paxg_basis_arbitration")
 
             # 3. Incremental re-export replaces superseded dataset_manifests rows 1:1 with on-disk SHA-256
             pt2 = PAXGBasisPoint(

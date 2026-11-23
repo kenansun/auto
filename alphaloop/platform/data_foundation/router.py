@@ -92,6 +92,10 @@ _DOMAIN_ALIASES: dict[str, str] = {
     "gold_macro": "gold_macro",
     "gold": "gold_macro",
     "gold_tradfi": "gold_macro",
+    "cn_ashare": "cn_ashare",
+    "ashare": "cn_ashare",
+    "a_share": "cn_ashare",
+    "cn_a_share": "cn_ashare",
 }
 
 ASSET_CLASS_TO_DOMAIN: dict[str, str] = {
@@ -107,14 +111,122 @@ _FORBIDDEN_SQL_RE = re.compile(
     r"\b("
     r"INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|REPLACE|ATTACH|DETACH|COPY|PRAGMA|"
     r"EXPORT|IMPORT|CALL|LOAD|INSTALL|SET|RESET|FORCE|CHECKPOINT|VACUUM|"
-    r"read_csv|read_csv_auto|read_parquet|read_json|read_json_auto|"
-    r"read_ndjson|read_ndjson_auto|read_text|read_blob|"
-    r"parquet_scan|csv_scan|json_scan|glob|duckdb_secrets|getenv|httpfs|"
-    r"sqlite_scan|sqlite_attach|postgres_scan|mysql_scan|iceberg_scan|delta_scan|"
-    r"sniff_csv|query_table"
-    r")\b",
+    r"DESCRIBE|SHOW|SUMMARIZE|EXPLAIN|PIVOT|UNPIVOT|"
+    r"read_[a-z0-9_]+|[a-z0-9_]*_scan|[a-z0-9_]*_metadata|"
+    r"parquet_[a-z0-9_]+|iceberg_[a-z0-9_]+|delta_[a-z0-9_]+|sniff_[a-z0-9_]+|"
+    r"duckdb_[a-z0-9_]+|pragma_[a-z0-9_]+|sqlite_[a-z0-9_]+|"
+    r"pg_[a-z0-9_]+|test_[a-z0-9_]+|show_[a-z0-9_]+|substrait_[a-z0-9_]+|"
+    r"which_secret|secret_[a-z0-9_]+|database_size|database_list|table_info|storage_info|all_tables|"
+    r"st_read|glob|httpfs|getenv|getvariable|query_table|"
+    r"information_schema|current_setting|current_database|current_schemas?|"
+    r"current_catalog|current_user|session_user|current_role|current_query|txid_current"
+    r")\b|\b(?:version|query)\s*\(|\b(?:system|memory|temp)\s*\.",
     re.IGNORECASE,
 )
+
+_SQL_TOKEN_RE = re.compile(
+    r"""
+    '(?:''|[^'])*'           | # single-quoted string literal
+    "(?:""|[^"])*"           | # double-quoted identifier / literal
+    [A-Za-z_][A-Za-z0-9_]*   | # identifier / keyword
+    [(),.]                   | # punctuation
+    \S                         # any other non-space token
+    """,
+    re.VERBOSE,
+)
+
+_FROM_CLAUSE_END_KW: frozenset[str] = frozenset(
+    {
+        "WHERE",
+        "GROUP",
+        "ORDER",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "QUALIFY",
+        "WINDOW",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "FETCH",
+        "FOR",
+        "INTO",
+        "RETURNING",
+    }
+)
+
+
+def _assert_no_table_source_literals(cleaned_sql: str) -> None:
+    """Reject string/file-path literals anywhere inside FROM/JOIN/TABLE source lists (RB-11, RB-20).
+
+    Uses a parenthesis-depth state stack (`NONE` | `TABLE` | `JOIN_COND`) so derived
+    subqueries `(SELECT ...)` and join predicates `ON ...` / `USING (...)` NEVER wipe out
+    the enclosing `FROM` table-source state. Consequently:
+      - `FROM (SELECT 1) AS t, '/etc/passwd'` -> REJECTED
+      - `FROM web3_bars a JOIN web3_bars b ON a.symbol = b.symbol, '/etc/passwd'` -> REJECTED
+      - `FROM web3_bars a JOIN web3_bars b USING (symbol), '/etc/passwd'` -> REJECTED
+      - `FROM (SELECT 1) t, ('/etc/passwd')` & `(('/etc/passwd'))` -> REJECTED
+      - `WITH c AS (SELECT * FROM (SELECT 1) x, '/etc/passwd') SELECT * FROM c` -> REJECTED
+      - `WITH c AS (TABLE '/etc/passwd') SELECT * FROM c` -> REJECTED
+    while legitimate analytical predicates (`ON a.symbol = 'BTC'`, `ON a.symbol IN ('BTC', 'ETH')`,
+    `WHERE symbol IN ('BTC', 'ETH')`, `SELECT 'tag' AS label`) remain permitted.
+    """
+    tokens = _SQL_TOKEN_RE.findall(cleaned_sql)
+    n = len(tokens)
+    stack: list[str] = ["NONE"]
+
+    for i, tok in enumerate(tokens):
+        up = tok.upper()
+        cur = stack[-1]
+
+        if tok == "(":
+            nxt = tokens[i + 1] if (i + 1) < n else ""
+            if cur == "TABLE":
+                if nxt.startswith("'") or nxt.startswith('"'):
+                    raise ValueError(
+                        "Read-only DuckDB query forbids parenthesized file-path literal in FROM/JOIN/TABLE"
+                    )
+                if nxt.upper() in ("SELECT", "WITH"):
+                    stack.append("NONE")
+                else:
+                    # Parenthesized table expression / join / nested literal e.g. FROM (('/etc/passwd'))
+                    stack.append("TABLE")
+            else:
+                stack.append("NONE")
+            continue
+
+        if tok == ")":
+            if len(stack) <= 1:
+                raise ValueError("Read-only DuckDB query contains unbalanced parentheses")
+            stack.pop()
+            continue
+
+        if up in ("FROM", "JOIN", "TABLE"):
+            stack[-1] = "TABLE"
+            continue
+
+        if cur == "TABLE":
+            if up in ("ON", "USING"):
+                stack[-1] = "JOIN_COND"
+                continue
+            if up in _FROM_CLAUSE_END_KW:
+                stack[-1] = "NONE"
+                continue
+            if tok.startswith("'") or tok.startswith('"'):
+                raise ValueError(
+                    "Read-only DuckDB query forbids quoted file-path literals in FROM/JOIN/TABLE list"
+                )
+        elif cur == "JOIN_COND":
+            if tok == ",":
+                # Comma at same paren depth after ON/USING begins a new comma-joined table source!
+                stack[-1] = "TABLE"
+                continue
+            if up in _FROM_CLAUSE_END_KW:
+                stack[-1] = "NONE"
+                continue
+
+    if len(stack) != 1:
+        raise ValueError("Read-only DuckDB query contains unbalanced parentheses")
 
 
 def has_pyarrow() -> bool:
@@ -142,14 +254,15 @@ def validate_readonly_sql(sql: str) -> str:
     # Strip trailing semicolon only; reject embedded semicolons (multi-statement injection)
     if cleaned.endswith(";"):
         cleaned = cleaned[:-1].strip()
-    if ";" in cleaned or "--" in cleaned or "/*" in cleaned:
-        raise ValueError("Read-only DuckDB query forbids multi-statements and SQL comments")
+    if ";" in cleaned or "--" in cleaned or "/*" in cleaned or "$" in cleaned or "`" in cleaned:
+        raise ValueError("Read-only DuckDB query forbids multi-statements, comments, dollar-quotes, and backticks")
     if not re.match(r"^(SELECT|WITH)\s", cleaned, re.IGNORECASE):
         raise ValueError("Read-only DuckDB query must start with SELECT or WITH")
     if _FORBIDDEN_SQL_RE.search(cleaned):
-        raise ValueError("Read-only DuckDB query contains forbidden write/DDL/external-IO keyword")
-    if re.search(r"\b(?:FROM|JOIN)\s+['\"]", cleaned, re.IGNORECASE):
-        raise ValueError("Read-only DuckDB query forbids direct file-path literals in FROM/JOIN")
+        raise ValueError("Read-only DuckDB query contains forbidden write/DDL/external-IO/metadata keyword")
+    if re.search(r"\b(?:FROM|JOIN|TABLE)\s*\(?\s*['\"]", cleaned, re.IGNORECASE):
+        raise ValueError("Read-only DuckDB query forbids direct file-path literals in FROM/JOIN/TABLE")
+    _assert_no_table_source_literals(cleaned)
     return cleaned
 
 
@@ -1069,6 +1182,26 @@ class GoldMacroDomainStore(_SQLiteBarDomainStore):
         }
 
 
+class CNAshareDomainStore(_SQLiteBarDomainStore):
+    """Physically isolated CN A-Share SQLite WAL domain store (`domains/cn_ashare_lake.sqlite`).
+
+    Zero cross-domain coupling or lock contention with Web3 or Gold/Macro SQLite stores.
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        super().__init__(
+            domain_name="cn_ashare",
+            db_path=db_path,
+            bars_table="cn_ashare_bars",
+            pit_index_name="idx_cn_ashare_bars_pit_sec",
+        )
+
+    def export_tables(self) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "cn_ashare_bars": list(self.iter_export_rows()),
+        }
+
+
 def _atomic_write_jsonl_gz(rows: Sequence[dict[str, Any]], target: Path) -> int:
     """Write deterministic gzip-compressed JSONL (`mtime=0, filename=''`) via atomic os.replace."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1125,9 +1258,11 @@ class DataFoundationRouter:
 
         self.web3_store = Web3DomainStore(self.domains_dir / "web3_lake.sqlite")
         self.gold_macro_store = GoldMacroDomainStore(self.domains_dir / "gold_macro_lake.sqlite")
+        self.cn_ashare_store = CNAshareDomainStore(self.domains_dir / "cn_ashare_lake.sqlite")
         self._domain_stores: dict[str, DomainStoreProtocol] = {
             "web3": self.web3_store,
             "gold_macro": self.gold_macro_store,
+            "cn_ashare": self.cn_ashare_store,
         }
 
     def __enter__(self) -> DataFoundationRouter:
@@ -1297,6 +1432,9 @@ class DataFoundationRouter:
         if not isinstance(store, DomainStoreProtocol):
             raise TypeError(f"Store {type(store).__name__} does not satisfy DomainStoreProtocol")
         key = normalize_domain(store.domain_name)
+        prev = self._domain_stores.get(key)
+        if prev is not None and prev is not store:
+            prev.close()
         self._domain_stores[key] = store
 
     def get_domain_store(self, domain: str) -> DomainStoreProtocol:
@@ -1819,8 +1957,9 @@ class DataFoundationRouter:
                         con.execute(
                             f"CREATE TEMP TABLE {tname} AS SELECT * FROM read_json_auto('{escaped_path}')"
                         )
-            # Lock down external filesystem/network access before running user SQL
+            # Lock down external filesystem/network access and freeze DuckDB settings before running user SQL
             con.execute("SET enable_external_access = false")
+            con.execute("SET lock_configuration = true")
             cur = con.execute(safe_sql)
             cols = [desc[0] for desc in (cur.description or [])]
             return [dict(zip(cols, row)) for row in cur.fetchall()]

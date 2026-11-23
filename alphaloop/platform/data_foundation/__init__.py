@@ -78,8 +78,17 @@ from alphaloop.platform.data_foundation.models import (
     validate_web3_derivatives_metric,
     validate_web3_market_macro_point,
 )
+from alphaloop.platform.data_foundation.collectors_cn_ashare import (
+    CN_ASHARE_DEFENSIVE_BOND_ETFS,
+    CN_ASHARE_RISK_ETFS,
+    DEFAULT_CN_ASHARE_ETF_UNIVERSE,
+    CNAsharePublicCollector,
+    cn_ashare_close_avail_ms,
+    default_cn_ashare_specs,
+)
 from alphaloop.platform.data_foundation.router import (
     ASSET_CLASS_TO_DOMAIN,
+    CNAshareDomainStore,
     DataFoundationRouter,
     GoldMacroDomainStore,
     Web3DomainStore,
@@ -122,6 +131,7 @@ __all__ = [
     "DataFoundationRouter",
     "Web3DomainStore",
     "GoldMacroDomainStore",
+    "CNAshareDomainStore",
     "compute_paxg_basis_points",
     "has_pyarrow",
     "has_duckdb",
@@ -148,6 +158,13 @@ __all__ = [
     "bls_cpi_release_date",
     "ny_local_to_utc_ms",
     "us_federal_holidays",
+    "DEFAULT_CN_ASHARE_ETF_UNIVERSE",
+    "CN_ASHARE_RISK_ETFS",
+    "CN_ASHARE_DEFENSIVE_BOND_ETFS",
+    "CNAsharePublicCollector",
+    "cn_ashare_close_avail_ms",
+    "default_cn_ashare_specs",
+    "ingest_cn_ashare_real_lake",
     "ingest_platform_v4_real_lake",
 ]
 
@@ -530,3 +547,50 @@ def ingest_platform_v4_real_lake(
         summary["stats"] = router.summary_stats()
 
     return summary
+
+
+def ingest_cn_ashare_real_lake(
+    base_dir: Path | str,
+    *,
+    symbols: tuple[str, ...] = DEFAULT_CN_ASHARE_ETF_UNIVERSE,
+    range_str: str = "5y",
+    export_partitions: bool = True,
+) -> dict[str, Any]:
+    """Ingest real multi-year CN A-Share ETF OHLCV strictly into `domains/cn_ashare_lake.sqlite`.
+
+    Zero mutation of `web3_lake.sqlite` or `gold_macro_lake.sqlite`; writes SHA-256 dataset
+    manifest and DQ certification into `catalog.sqlite`.
+    """
+    client = RateLimitedHTTPClient(default_timeout=15.0)
+    collector = CNAsharePublicCollector(client)
+    specs = default_cn_ashare_specs(symbols, venue="cn_a_share")
+
+    summary: dict[str, Any] = {"base_dir": str(Path(base_dir).resolve()), "rows": {}, "errors": []}
+    with DataFoundationRouter(base_dir) as router:
+        for sym, spec in specs.items():
+            router.register_asset(spec, domain="cn_ashare")
+            try:
+                bars = collector.fetch_daily_bars(sym, range_str=range_str, venue="cn_a_share")
+                n = router.upsert_bars("cn_ashare", bars)
+                summary["rows"][sym] = n
+            except Exception as exc:
+                logger.warning("CN A-Share ingest failed for %s: %s", sym, exc)
+                summary["errors"].append(f"cn_ashare:{sym}:{exc}")
+
+        if export_partitions:
+            summary["export_cn_ashare"] = router.export_domain_partition("cn_ashare", fmt="auto")
+
+        dq_summary: dict[str, Any] = {}
+        for sym, spec in specs.items():
+            rep = router.audit_domain_dq("cn_ashare", "cn_a_share", sym, 86_400, spec)
+            dq_summary[f"cn_ashare:cn_a_share:{sym}:86400s"] = {
+                "passed": rep.passed,
+                "rows": rep.row_count,
+                "failed_gates": [c.gate_id for c in rep.checks if not c.passed],
+            }
+        summary["dq_audit"] = dq_summary
+        summary["total_rows"] = sum(int(v) for v in summary["rows"].values())
+        summary["stats"] = router.summary_stats()
+
+    return summary
+
