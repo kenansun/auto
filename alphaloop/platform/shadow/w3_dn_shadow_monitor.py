@@ -39,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -272,6 +272,9 @@ class ShadowMonitorConfig:
     log_max_bytes: int = 5 * 1024 * 1024
     log_backup_count: int = 3
     p16_heartbeat_url: str = ""
+    p16_heartbeat_path: Path | None = None
+    readiness_report_path: Path | None = None
+    observe_only_coins: tuple[str, ...] = ()
     service_name: str = "w3_dn_shadow_monitor"
 
 
@@ -340,6 +343,7 @@ class ShadowReadinessReport:
     alert_counts_by_code: dict[str, int]
     alert_suppressed_by_code: dict[str, int]
     blocking_reasons: list[str]
+    observe_only_coin_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -720,11 +724,32 @@ class W3DNShadowMonitor:
             raise RuntimeError(f"{PlatformErrorCode.LIVE_SWITCH_BLOCKED.value}: live execution forbidden")
 
         self.config = config
+        self._primary_coins: tuple[str, ...] = tuple(dict.fromkeys(str(c).strip().upper() for c in config.coins if str(c).strip()))
+        self._observe_only_coins: tuple[str, ...] = tuple(
+            dict.fromkeys(str(c).strip().upper() for c in config.observe_only_coins if str(c).strip())
+        )
+        if not self._primary_coins:
+            raise ValueError("ShadowMonitorConfig.coins must contain at least one primary coin")
+        overlap = set(self._primary_coins).intersection(self._observe_only_coins)
+        if overlap:
+            raise ValueError(
+                f"observe_only_coins must NOT overlap primary coins: {sorted(overlap)}"
+            )
         self.state_dir = Path(config.state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.state_dir / "w3_dn_shadow.sqlite"
         self.log_path = self.state_dir / "w3_dn_shadow.jsonl"
-        self.heartbeat_path = self.state_dir / "w3_dn_shadow_heartbeat.json"
+        self.heartbeat_path = (
+            Path(config.p16_heartbeat_path)
+            if config.p16_heartbeat_path is not None
+            else (self.state_dir / "w3_dn_shadow_heartbeat.json")
+        )
+        self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+        self.readiness_report_path: Path | None = (
+            Path(config.readiness_report_path) if config.readiness_report_path is not None else None
+        )
+        if self.readiness_report_path is not None:
+            self.readiness_report_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.provider: W3DNQuoteProvider = provider or PublicRestWaterfallQuoteProvider()
         self.kernel: Web3DeltaNeutralCarryKernel = kernel or Web3DeltaNeutralCarryKernel(
@@ -764,6 +789,7 @@ class W3DNShadowMonitor:
         self._min_perp_margin_buffer_ratio: float = 1.0
         self._observed_4leg_cost_sum: float = 0.0
         self._observed_4leg_cost_count: int = 0
+        self._observe_only_stats: dict[str, dict[str, float]] = {}
         self._last_kernel_bucket: int | None = None
         self._basis_cooldown_until_bucket: dict[str, int] = {}
         self._last_chain_hash: str = self._load_last_chain_hash()
@@ -920,6 +946,9 @@ class W3DNShadowMonitor:
             "min_perp_margin_buffer_ratio": self._min_perp_margin_buffer_ratio,
             "observed_4leg_cost_sum": self._observed_4leg_cost_sum,
             "observed_4leg_cost_count": self._observed_4leg_cost_count,
+            "observe_only_stats": {
+                c: dict(stats) for c, stats in self._observe_only_stats.items()
+            },
             "last_kernel_bucket": self._last_kernel_bucket,
             "basis_cooldown_until_bucket": dict(self._basis_cooldown_until_bucket),
             "alert_counts": dict(self._alert_counts),
@@ -958,6 +987,10 @@ class W3DNShadowMonitor:
         self._min_perp_margin_buffer_ratio = float(st.get("min_perp_margin_buffer_ratio", 1.0))
         self._observed_4leg_cost_sum = float(st.get("observed_4leg_cost_sum", 0.0))
         self._observed_4leg_cost_count = int(st.get("observed_4leg_cost_count", 0))
+        self._observe_only_stats = {
+            str(c): {str(k): float(v) for k, v in (d or {}).items()}
+            for c, d in (st.get("observe_only_stats") or {}).items()
+        }
         self._last_kernel_bucket = st.get("last_kernel_bucket")
         self._basis_cooldown_until_bucket = {
             str(k): int(v) for k, v in (st.get("basis_cooldown_until_bucket") or {}).items()
@@ -969,6 +1002,16 @@ class W3DNShadowMonitor:
         self._health_status = str(st.get("health_status", "INITIALIZING"))
         if isinstance(st.get("kernel_state"), dict):
             self.kernel.restore_state(st["kernel_state"])
+
+        # RB-D06: Fail closed if an open virtual pair position was moved out of primary coins (e.g. into observe_only_coins)
+        orphans = sorted(
+            c for c, pos in self._positions.items() if pos.is_open and c not in self._primary_coins
+        )
+        if orphans:
+            raise ValueError(
+                f"Orphaned open shadow positions not in primary coins {list(self._primary_coins)}: {orphans}. "
+                "Close open positions or start a fresh state_dir before moving coins to --observe-only-coins."
+            )
 
     def _persist_checkpoint_only(self, ts_ms: int) -> None:
         state_json = json.dumps(self._build_checkpoint_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -1119,6 +1162,25 @@ class W3DNShadowMonitor:
                 PlatformErrorCode.CROSSED_BOOK,
                 f"Perp crossed book {snap.coin}: bid={snap.perp_bid} >= ask={snap.perp_ask}",
             )
+
+        # RB-D03: strictly validate epoch timestamps against None/bool/NaN/Inf/non-positive BEFORE int()
+        for ts_name, ts_val in (
+            ("ts_observe_ms", snap.ts_observe_ms),
+            ("spot_ts_ms", snap.spot_ts_ms),
+            ("perp_ts_ms", snap.perp_ts_ms),
+        ):
+            if (
+                ts_val is None
+                or isinstance(ts_val, bool)
+                or not isinstance(ts_val, (int, float))
+                or not math.isfinite(float(ts_val))
+                or float(ts_val) <= 0.0
+            ):
+                return (
+                    False,
+                    PlatformErrorCode.NON_FINITE_DATA,
+                    f"Invalid timestamp {ts_name}={ts_val!r} for {snap.coin}",
+                )
 
         obs_ms = int(snap.ts_observe_ms)
         spot_ts = int(snap.spot_ts_ms)
@@ -1432,6 +1494,144 @@ class W3DNShadowMonitor:
             except (urllib.error.URLError, TimeoutError, ValueError) as exc:
                 logger.warning("Optional P16 heartbeat POST failed (non-fatal): %s", exc)
 
+    def _record_observe_only_ticks(
+        self,
+        snapshots: dict[str, PairMarketSnapshot],
+        *,
+        trace_id: str,
+        fallback_ts_ms: int,
+    ) -> dict[str, dict[str, Any]]:
+        """Record L2 slippage/basis/funding diagnostics for observe-only coins (ZERO virtual positions or uptime impact)."""
+        out: dict[str, dict[str, Any]] = {}
+        for coin in self._observe_only_coins:
+            stats = self._observe_only_stats.setdefault(
+                coin,
+                {"count": 0.0, "fail_count": 0.0, "cost_sum_bps": 0.0, "max_abs_basis_bps": 0.0, "last_funding_apr_pct": 0.0},
+            )
+            snap = snapshots.get(coin)
+            if snap is None:
+                stats["fail_count"] += 1.0
+                out[coin] = {"mode": "OBSERVE_ONLY", "status": "MISSING"}
+                continue
+            ok, code, _msg = self.validate_snapshot(snap)
+            if not ok:
+                stats["fail_count"] += 1.0
+                with transaction(self.conn):
+                    self.conn.execute(
+                        """
+                        INSERT INTO shadow_ticks
+                        (trace_id, ts_observe_ms, coin, spot_bid, spot_ask, perp_bid, perp_ask,
+                         perp_mark, perp_funding_1h, dvol, guard_status, error_code, provenance)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            trace_id,
+                            fallback_ts_ms,
+                            coin,
+                            snap.spot_bid if _is_finite(snap.spot_bid) else None,
+                            snap.spot_ask if _is_finite(snap.spot_ask) else None,
+                            snap.perp_bid if _is_finite(snap.perp_bid) else None,
+                            snap.perp_ask if _is_finite(snap.perp_ask) else None,
+                            snap.perp_mark if _is_finite(snap.perp_mark) else None,
+                            snap.perp_funding_1h if _is_finite(snap.perp_funding_1h) else None,
+                            snap.dvol if _is_finite(snap.dvol) else None,
+                            "OBSERVE_ONLY_FAIL",
+                            code.value,
+                            snap.provenance,
+                        ),
+                    )
+                out[coin] = {"mode": "OBSERVE_ONLY", "status": "FAIL_CLOSED", "error_code": code.value}
+                continue
+
+            mid_spot = 0.5 * (float(snap.spot_bid) + float(snap.spot_ask))
+            mid_perp = 0.5 * (float(snap.perp_bid) + float(snap.perp_ask))
+            mark_perp = float(snap.perp_mark) if snap.perp_mark is not None else mid_perp
+            basis_mid_bps = ((mid_perp / mid_spot) - 1.0) * 10_000.0
+            basis_mark_bps = ((mark_perp / mid_spot) - 1.0) * 10_000.0
+            spot_spread_half_bps = (((float(snap.spot_ask) - float(snap.spot_bid)) / mid_spot) * 10_000.0) * 0.5
+            notional = self.config.capital_usd * self.config.max_pair_leg_weight
+            perp_slip_buy_bps = (
+                estimate_l2_vwap_slippage_bps(snap.perp_l2_asks, notional_usd=notional, mid_price=mid_perp, side="buy")
+                if snap.perp_l2_asks
+                else ((((float(snap.perp_ask) - float(snap.perp_bid)) / mid_perp) * 10_000.0) * 0.5)
+            )
+            perp_slip_sell_bps = (
+                estimate_l2_vwap_slippage_bps(snap.perp_l2_bids, notional_usd=notional, mid_price=mid_perp, side="sell")
+                if snap.perp_l2_bids
+                else ((((float(snap.perp_ask) - float(snap.perp_bid)) / mid_perp) * 10_000.0) * 0.5)
+            )
+            est_4leg_rt_bps = (
+                2.0 * (self.config.spot_taker_fee_bps + spot_spread_half_bps)
+                + 2.0 * self.config.perp_taker_fee_bps
+                + perp_slip_buy_bps
+                + perp_slip_sell_bps
+            )
+            funding_apr = float(snap.perp_funding_1h) * 8760.0 * 100.0
+            stats["count"] += 1.0
+            stats["cost_sum_bps"] += est_4leg_rt_bps
+            stats["max_abs_basis_bps"] = max(stats["max_abs_basis_bps"], abs(basis_mid_bps), abs(basis_mark_bps))
+            stats["last_funding_apr_pct"] = funding_apr
+
+            with transaction(self.conn):
+                self.conn.execute(
+                    """
+                    INSERT INTO shadow_ticks
+                    (trace_id, ts_observe_ms, coin, spot_bid, spot_ask, perp_bid, perp_ask,
+                     perp_mark, perp_funding_1h, basis_mid_bps, basis_mark_bps,
+                     exec_4leg_cost_bps, dvol, guard_status, error_code, provenance)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trace_id,
+                        int(snap.ts_observe_ms),
+                        coin,
+                        float(snap.spot_bid),
+                        float(snap.spot_ask),
+                        float(snap.perp_bid),
+                        float(snap.perp_ask),
+                        mark_perp,
+                        float(snap.perp_funding_1h),
+                        basis_mid_bps,
+                        basis_mark_bps,
+                        est_4leg_rt_bps,
+                        snap.dvol,
+                        "OBSERVE_ONLY",
+                        PlatformErrorCode.OK.value,
+                        snap.provenance,
+                    ),
+                )
+            out[coin] = {
+                "mode": "OBSERVE_ONLY",
+                "spot_mid": round(mid_spot, 6),
+                "perp_mid": round(mid_perp, 6),
+                "basis_mid_bps": round(basis_mid_bps, 4),
+                "basis_mark_bps": round(basis_mark_bps, 4),
+                "funding_apr_pct": round(funding_apr, 4),
+                "est_4leg_rt_cost_bps": round(est_4leg_rt_bps, 4),
+            }
+        return out
+
+    def _write_live_readiness_snapshot(self) -> None:
+        """Atomically persist world-readable (0644) live readiness JSON when configured."""
+        if self.readiness_report_path is None:
+            return
+        rep = self.evaluate_48h_readiness().to_dict()
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".ready_", suffix=".json", dir=str(self.readiness_report_path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(rep, fh, indent=2, sort_keys=True, allow_nan=False)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp_name, 0o644)
+            os.replace(tmp_name, self.readiness_report_path)
+        except Exception:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+            raise
+
     def run_once(self) -> dict[str, Any]:
         """Execute one deterministic read-only shadow observation, risk check, and paper tick."""
         if SHADOW_LIVE_EXECUTION_ENABLED:
@@ -1453,8 +1653,9 @@ class W3DNShadowMonitor:
                 message=f"Tick gap {dead_man_gap:.1f}s exceeded max_tick_gap_sec={self.config.max_tick_gap_sec}",
             )
 
+        fetch_coins = self._primary_coins + self._observe_only_coins
         try:
-            snapshots = self.provider.fetch_snapshots(self.config.coins, trace_id=trace_id)
+            snapshots = self.provider.fetch_snapshots(fetch_coins, trace_id=trace_id)
         except Exception as exc:
             self._consecutive_errors += 1
             self._health_status = (
@@ -1473,6 +1674,7 @@ class W3DNShadowMonitor:
             eq, margin_r = self._compute_shadow_equity_and_margin(self._last_valid_snaps)
             self._persist_checkpoint_only(now_ms)
             self._write_heartbeat(trace_id=trace_id, ts_ms=now_ms, equity_usd=eq, margin_ratio=margin_r)
+            self._write_live_readiness_snapshot()
             return {
                 "trace_id": trace_id,
                 "status": self._health_status,
@@ -1485,8 +1687,11 @@ class W3DNShadowMonitor:
         dvol_obs: float | None = None
         fallback_ts_ms = utc_now_ms()
 
-        for raw_coin in self.config.coins:
-            coin = str(raw_coin).upper()
+        observe_only_summary = self._record_observe_only_ticks(
+            snapshots, trace_id=trace_id, fallback_ts_ms=fallback_ts_ms
+        )
+
+        for coin in self._primary_coins:
             snap = snapshots.get(coin)
             if snap is None:
                 self._emit_alert(
@@ -1641,8 +1846,8 @@ class W3DNShadowMonitor:
                 self._start_ts_ms = ts_ms
             self._last_ts_ms = max(self._last_ts_ms or ts_ms, ts_ms)
 
-        # RB-08: require configured healthy coin ratio (default 100% of universe) to count healthy tick
-        min_needed = max(1, int(math.ceil(len(self.config.coins) * float(self.config.min_healthy_coin_ratio))))
+        # RB-08: require configured healthy coin ratio (default 100% of primary universe) to count healthy tick
+        min_needed = max(1, int(math.ceil(len(self._primary_coins) * float(self.config.min_healthy_coin_ratio))))
         if not valid_snaps:
             self._consecutive_errors += 1
             self._health_status = (
@@ -1679,12 +1884,16 @@ class W3DNShadowMonitor:
                 eq_d, margin_d = self._compute_shadow_equity_and_margin({}, snapshots)
             self._persist_checkpoint_only(ts_ms)
             self._write_heartbeat(trace_id=trace_id, ts_ms=ts_ms, equity_usd=eq_d, margin_ratio=margin_d)
-            return {
+            self._write_live_readiness_snapshot()
+            ret_d: dict[str, Any] = {
                 "trace_id": trace_id,
                 "status": self._health_status,
                 "valid_coins": 0,
                 "equity_usd": round(eq_d, 4),
             }
+            if observe_only_summary:
+                ret_d["observe_only"] = observe_only_summary
+            return ret_d
 
         if len(valid_snaps) >= min_needed:
             self._consecutive_errors = 0
@@ -1881,7 +2090,8 @@ class W3DNShadowMonitor:
             payload={"chain_hash": chain_hash, **audit_payload},
         )
         self._write_heartbeat(trace_id=trace_id, ts_ms=ts_ms, equity_usd=eq_final, margin_ratio=margin_final)
-        return {
+        self._write_live_readiness_snapshot()
+        ret_ok: dict[str, Any] = {
             "trace_id": trace_id,
             "status": self._health_status,
             "ts_ms": ts_ms,
@@ -1891,6 +2101,9 @@ class W3DNShadowMonitor:
             "chain_hash": chain_hash,
             "coins": tick_summary_by_coin,
         }
+        if observe_only_summary:
+            ret_ok["observe_only"] = observe_only_summary
+        return ret_ok
 
     def evaluate_48h_readiness(self) -> ShadowReadinessReport:
         """Compute machine-verifiable >=48h blind-run readiness verdict (never auto-enables live)."""
@@ -1940,6 +2153,18 @@ class W3DNShadowMonitor:
         else:
             verdict = "READY_FOR_OWNER_REVIEW"
 
+        obs_stats_out: dict[str, dict[str, Any]] = {}
+        for c, st in sorted(self._observe_only_stats.items()):
+            cnt = int(st.get("count", 0.0))
+            mean_obs = (float(st.get("cost_sum_bps", 0.0)) / cnt) if cnt > 0 else 0.0
+            obs_stats_out[c] = {
+                "valid_ticks": cnt,
+                "fail_ticks": int(st.get("fail_count", 0.0)),
+                "mean_4leg_cost_bps": round(mean_obs, 4),
+                "max_abs_basis_bps": round(float(st.get("max_abs_basis_bps", 0.0)), 4),
+                "last_funding_apr_pct": round(float(st.get("last_funding_apr_pct", 0.0)), 4),
+            }
+
         return ShadowReadinessReport(
             verdict=verdict,
             live_execution_enabled=SHADOW_LIVE_EXECUTION_ENABLED,
@@ -1966,4 +2191,5 @@ class W3DNShadowMonitor:
             alert_counts_by_code=dict(sorted(self._alert_counts.items())),
             alert_suppressed_by_code=dict(sorted(self._alert_suppressed_counts.items())),
             blocking_reasons=blockers,
+            observe_only_coin_stats=obs_stats_out,
         )

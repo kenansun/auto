@@ -38,13 +38,26 @@ from alphaloop.platform.shadow.w3_dn_shadow_monitor import (
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="W3-DN Read-Only Shadow Blind-Run Monitor (Zero Live Execution)")
     p.add_argument("--state-dir", type=Path, default=ROOT / "data" / "w3_dn_shadow", help="SQLite/log/heartbeat directory")
-    p.add_argument("--coins", type=str, default=",".join(DEFAULT_W3_DN_SHADOW_COINS), help="Comma-separated coins")
+    p.add_argument("--coins", type=str, default=",".join(DEFAULT_W3_DN_SHADOW_COINS), help="Comma-separated primary coins")
+    p.add_argument(
+        "--observe-only-coins",
+        type=str,
+        default="",
+        help="Optional comma-separated diagnostic-only coins (L2/basis telemetry only, zero virtual positions)",
+    )
     p.add_argument("--ticks", type=int, default=1, help="Number of polling ticks (0 = run until SIGINT/SIGTERM)")
     p.add_argument("--interval-sec", type=float, default=60.0, help="Polling interval in seconds")
     p.add_argument("--capital-usd", type=float, default=10_000.0, help="Virtual shadow capital USD")
     p.add_argument("--p8-feed", type=Path, default=None, help="Optional STD-32 P8 MD-Gateway BBO JSONL/CSV path")
     p.add_argument("--p16-heartbeat-url", type=str, default="", help="Optional local P16 watchdog heartbeat URL")
-    p.add_argument("--report-out", type=Path, default=None, help="Optional JSON output path for readiness report")
+    p.add_argument("--p16-heartbeat-path", type=Path, default=None, help="Optional explicit P16 heartbeat JSON path")
+    p.add_argument(
+        "--live-readiness-path",
+        type=Path,
+        default=None,
+        help="Optional atomic 0644 readiness JSON updated after every tick for continuous monitoring",
+    )
+    p.add_argument("--report-out", type=Path, default=None, help="Optional JSON output path for final readiness report")
     return p.parse_args(argv)
 
 
@@ -55,11 +68,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parse_args(argv)
     coins = tuple(c.strip().upper() for c in str(args.coins).split(",") if c.strip())
+    obs_coins = tuple(c.strip().upper() for c in str(args.observe_only_coins).split(",") if c.strip())
     cfg = ShadowMonitorConfig(
         state_dir=args.state_dir,
         coins=coins or DEFAULT_W3_DN_SHADOW_COINS,
+        observe_only_coins=obs_coins,
         capital_usd=float(args.capital_usd),
         p16_heartbeat_url=str(args.p16_heartbeat_url or ""),
+        p16_heartbeat_path=args.p16_heartbeat_path,
+        readiness_report_path=args.live_readiness_path,
     )
     provider = (
         P8MDGatewayFileQuoteProvider(args.p8_feed)

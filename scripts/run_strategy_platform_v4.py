@@ -69,6 +69,7 @@ from alphaloop.platform.core_engine import (
     verify_full_parity,
 )
 from alphaloop.platform.data_foundation import (
+    CN_ASHARE_PURE_STOCK_BOND_UNIVERSE,
     CanonicalBar,
     DataFoundationRouter,
     MacroEventRelease,
@@ -83,7 +84,11 @@ from alphaloop.platform.factors import (
     MacroRegimeTimeline,
     StreamingFactorEngine,
 )
-from alphaloop.platform.strategies.ashare import AShareETFRotationKernel
+from alphaloop.platform.strategies.ashare import (
+    AShareETFRotationKernel,
+    AShareMacroERPRotationKernel,
+    CNMacroRegimeTimeline,
+)
 from alphaloop.platform.strategies.gold import (
     Gold4hEventKernel,
     GoldMacroEngine,
@@ -368,6 +373,69 @@ def _build_a1_factor_audit(
         snaps_by_symbol=snaps_by_sym,
         horizon_bars=horizon_bars,
         priors={"a1_risk_adj_mom": +1},
+    )
+
+
+def _build_a2_macro_factor_audit(
+    bars_by_symbol: dict[str, list[CanonicalBar]],
+    macro_timeline: CNMacroRegimeTimeline,
+    *,
+    horizon_bars: int = 10,
+    track_name: str = "ashare_track_a2_macro_erp_10d",
+) -> Any:
+    """Strictly causal G2 audit of A2's domestic ChinaBond CGB, SSE/SZSE Margin & USD/CNY macro signals."""
+    bond_set = frozenset({"511260.SS", "511010.SS"})
+    div_set = frozenset({"512890.SS", "515080.SS", "510880.SS"})
+    by_ts: dict[int, dict[str, CanonicalBar]] = {}
+    for sym, bl in bars_by_symbol.items():
+        for b in bl:
+            by_ts.setdefault(int(b.ts_event_ms), {})[sym] = b
+    snaps_by_sym: dict[str, list[FactorSnapshot]] = {s: [] for s in bars_by_symbol}
+    for ts in sorted(by_ts):
+        frame = by_ts[ts]
+        as_of = max((int(b.ts_avail_ms) for b in frame.values()), default=int(ts))
+        st = macro_timeline.resolve(as_of)
+        for sym, b in frame.items():
+            comp = (
+                st.bond_easing_score
+                if sym in bond_set
+                else (0.5 * st.bond_easing_score + 0.5 * st.risk_on_score if sym in div_set else st.risk_on_score)
+            )
+            snaps_by_sym[sym].append(
+                FactorSnapshot(
+                    symbol=sym,
+                    venue=b.venue,
+                    timeframe_h=float(b.timeframe_h),
+                    ts_event_ms=b.ts_event_ms,
+                    ts_avail_ms=b.ts_avail_ms,
+                    close=float(b.close),
+                    atr_14=float(b.close) * 0.015,
+                    prior_high_40=float(b.high),
+                    prior_low_40=float(b.low),
+                    prior_high_20=float(b.high),
+                    prior_low_20=float(b.low),
+                    values={
+                        "a2_active_macro_composite": float(comp),
+                        "a2_active_risk_on_score": float(st.risk_on_score),
+                        "cn_cgb_10y_fall_20d": float(-st.cgb_10y_chg_20d),
+                        "cn_margin_decrowding_20d": float(-st.margin_mom_20d),
+                        "cn_fx_cny_strength_20d": float(st.fx_cny_strength_20d),
+                    },
+                )
+            )
+    auditor = FactorDirectionAuditor()
+    return auditor.audit(
+        track_name=track_name,
+        bars_by_symbol=bars_by_symbol,
+        snaps_by_symbol=snaps_by_sym,
+        horizon_bars=horizon_bars,
+        priors={
+            "a2_active_macro_composite": +1,
+            "a2_active_risk_on_score": +1,
+            "cn_cgb_10y_fall_20d": +1,
+            "cn_margin_decrowding_20d": +1,
+            "cn_fx_cny_strength_20d": +1,
+        },
     )
 
 
@@ -780,6 +848,8 @@ def run_platform_v4_evaluation(
     offline: bool = True,
     refresh: bool = False,
     capital_usd: float = 10_000.0,
+    trial_ledger_mode: str = "official",
+    sandbox_trial_db_path: Path | None = None,
 ) -> dict[str, Any]:
     """Execute end-to-end Platform v4 real-data empirical evaluation."""
     t_start = time.perf_counter()
@@ -797,7 +867,11 @@ def run_platform_v4_evaluation(
                 f"Fail-closed: required Option B data lake store missing: {req_path}"
             )
 
-    router = DataFoundationRouter(lake_dir)
+    router = DataFoundationRouter(
+        lake_dir,
+        trial_ledger_mode=trial_ledger_mode,
+        sandbox_trial_db_path=sandbox_trial_db_path,
+    )
     try:
         # ------------------------------------------------------------------
         # 1. Load & Verify 100% Real Data From Physically Partitioned Stores
@@ -1809,6 +1883,7 @@ def run_platform_v4_evaluation(
         cn_specs_all = default_cn_ashare_specs()
         cn_bars_passed: dict[str, list[CanonicalBar]] = {}
         cn_dq_passed: list[Any] = []
+        cn_dq_by_sym: dict[str, Any] = {}
         for sym, spec in cn_specs_all.items():
             raw_b = router.load_bars("cn_ashare", "cn_a_share", sym, 86_400)
             if not raw_b:
@@ -1820,6 +1895,7 @@ def run_platform_v4_evaluation(
             if dq_a.passed and len(raw_b) >= 200:
                 cn_bars_passed[sym] = raw_b
                 cn_dq_passed.append(dq_a)
+                cn_dq_by_sym[sym] = dq_a
             else:
                 ashare_dq_excluded.append(sym)
 
@@ -1949,6 +2025,177 @@ def run_platform_v4_evaluation(
                     "net_pnl_usd": round(a1_no_gold_sim.net_pnl_usd, 4),
                 }
 
+        # A2: Native Pure Domestic CN Stock-Bond Macro-ERP, CGB Yield, Margin-Flow & FX Strategy (Phase D)
+        # Strictly forbids Gold ETF (`518880.SS`); runs when real CN macro + pure stock-bond bars exist.
+        a2_sim: SimulationResult | None = None
+        a2_gates: InstitutionalGateReport | None = None
+        a2_detail: dict[str, Any] | None = None
+        cn_macro_pts = router.load_cn_ashare_macro()
+        cn_macro_real = [p for p in cn_macro_pts if p.provenance == PROVENANCE_REAL]
+        pure_sb_set = frozenset(CN_ASHARE_PURE_STOCK_BOND_UNIVERSE)
+        a2_bars_passed = {
+            s: bl for s, bl in cn_bars_passed.items() if s in pure_sb_set and s != "518880.SS"
+        }
+        a2_dq_passed = [cn_dq_by_sym[s] for s in a2_bars_passed if s in cn_dq_by_sym]
+        if (
+            len(a2_bars_passed) >= 5
+            and "510300.SS" in a2_bars_passed
+            and any(s in a2_bars_passed for s in ("511260.SS", "511010.SS"))
+            and len(cn_macro_real) >= 500
+        ):
+            a2_specs = {s: cn_specs_all[s] for s in a2_bars_passed}
+            a2_macro_tl = CNMacroRegimeTimeline(cn_macro_real)
+            a2_risk = RiskAllocatorConfig(
+                max_positions=6,
+                target_annual_vol_pct=12.0,
+                max_portfolio_leverage=1.0,
+                max_single_weight=0.55,
+            )
+            a2_factor_audit = _build_a2_macro_factor_audit(
+                a2_bars_passed,
+                a2_macro_tl,
+                horizon_bars=10,
+                track_name="ashare_track_a2_macro_erp_10d",
+            )
+            bh_csi300_a2 = compute_buy_and_hold_returns(a2_bars_passed["510300.SS"])
+            a2_grid = [
+                (
+                    ix,
+                    iy,
+                    f"mt{int(mt * 100)}_reb{rb}",
+                    {
+                        "base_bond_weight": 0.55,
+                        "base_dividend_weight": 0.30,
+                        "base_broad_weight": 0.10,
+                        "macro_tilt_strength": mt,
+                        "rebalance_every_bars": rb,
+                    },
+                    (
+                        lambda _mt=mt, _rb=rb: AShareMacroERPRotationKernel(
+                            macro_timeline=a2_macro_tl,
+                            base_bond_weight=0.55,
+                            base_dividend_weight=0.30,
+                            base_broad_weight=0.10,
+                            macro_tilt_strength=_mt,
+                            rebalance_every_bars=_rb,
+                        )
+                    ),
+                )
+                for ix, mt in enumerate((0.15, 0.20, 0.25))
+                for iy, rb in enumerate((5, 10, 20))
+            ]
+            # Strictly genuine active pure-CN-stock-bond peers for honest G6 CSCV PBO (ZERO passive B&H filler!)
+            # RB-D04: Pass empty CNMacroRegimeTimeline([]) + macro_tilt_strength=0.0 for TRUE zero-macro ablation!
+            a2_static_no_macro_sim = acct.simulate(
+                AShareMacroERPRotationKernel(
+                    macro_timeline=CNMacroRegimeTimeline([]),
+                    base_bond_weight=0.55,
+                    base_dividend_weight=0.30,
+                    base_broad_weight=0.10,
+                    macro_tilt_strength=0.0,
+                    rebalance_every_bars=10,
+                ),
+                a2_specs,
+                a2_bars_passed,
+                risk_cfg=a2_risk,
+                capital_usd=capital_usd,
+            )
+            a2_peer_refs = [
+                acct.simulate(
+                    AShareETFRotationKernel(
+                        top_k=2,
+                        fast_mom_days=20,
+                        slow_mom_days=60,
+                        rank_hysteresis=1,
+                        inertia_buffer=0.25,
+                        rebalance_every_bars=10,
+                    ),
+                    a2_specs,
+                    a2_bars_passed,
+                    risk_cfg=a1_risk,
+                    capital_usd=capital_usd,
+                ).period_returns,
+                a2_static_no_macro_sim.period_returns,
+                acct.simulate(
+                    AShareMacroERPRotationKernel(
+                        macro_timeline=a2_macro_tl,
+                        base_bond_weight=0.35,
+                        base_dividend_weight=0.35,
+                        base_broad_weight=0.25,
+                        macro_tilt_strength=0.25,
+                        rebalance_every_bars=10,
+                    ),
+                    a2_specs,
+                    a2_bars_passed,
+                    risk_cfg=a2_risk,
+                    capital_usd=capital_usd,
+                ).period_returns,
+                acct.simulate(
+                    AShareMacroERPRotationKernel(
+                        macro_timeline=a2_macro_tl,
+                        base_bond_weight=0.40,
+                        base_dividend_weight=0.40,
+                        base_broad_weight=0.15,
+                        macro_tilt_strength=0.20,
+                        rebalance_every_bars=5,
+                        inertia_buffer=0.0,
+                    ),
+                    a2_specs,
+                    a2_bars_passed,
+                    risk_cfg=a2_risk,
+                    capital_usd=capital_usd,
+                ).period_returns,
+            ]
+            a2_sim, a2_gates, a2_detail = _evaluate_strategy_full(
+                router=router,
+                family_id="ashare_track_a2_macro_erp_rotation",
+                track_name="track_a_cn_ashare",
+                strategy_id="ashare_a2_macro_erp_rotation",
+                asset_domain="ashare",
+                baseline_factory=lambda: AShareMacroERPRotationKernel(
+                    macro_timeline=a2_macro_tl,
+                    base_bond_weight=0.55,
+                    base_dividend_weight=0.30,
+                    base_broad_weight=0.10,
+                    macro_tilt_strength=0.20,
+                    rebalance_every_bars=10,
+                ),
+                grid_factories=a2_grid,
+                specs=a2_specs,
+                bars_by_symbol=a2_bars_passed,
+                risk_cfg=a2_risk,
+                dq_reports=a2_dq_passed,
+                factor_audit=a2_factor_audit,
+                benchmark_returns=bh_csi300_a2,
+                benchmark_name="CSI300_ETF_510300_TR_BH",
+                periods_per_year=242.0,
+                capital_usd=capital_usd,
+                pbo_distinct_returns=a2_peer_refs,
+                purge_bars=5,
+                embargo_bars=5,
+                baseline_grid_label="mt20_reb10",
+            )
+            a2_detail["pure_stock_bond_universe"] = sorted(a2_bars_passed.keys())
+            a2_detail["excluded_gold_etf"] = "518880.SS"
+            a2_detail["cn_macro_rows_used"] = len(cn_macro_real)
+            a2_detail["static_no_macro_ablation"] = {
+                "macro_tilt_strength": 0.0,
+                "cagr_pct": round(a2_static_no_macro_sim.cagr_pct, 4),
+                "sharpe_ratio": round(a2_static_no_macro_sim.sharpe_ratio, 4),
+                "max_drawdown_pct": round(a2_static_no_macro_sim.max_drawdown_pct, 4),
+                "calmar_ratio": round(a2_static_no_macro_sim.calmar_ratio, 4),
+                "net_pnl_usd": round(a2_static_no_macro_sim.net_pnl_usd, 2),
+                "delta_cagr_pct_from_macro_tilt": round(
+                    a2_sim.cagr_pct - a2_static_no_macro_sim.cagr_pct, 4
+                ),
+                "delta_max_dd_pct_from_macro_tilt": round(
+                    a2_sim.max_drawdown_pct - a2_static_no_macro_sim.max_drawdown_pct, 4
+                ),
+                "delta_calmar_from_macro_tilt": round(
+                    a2_sim.calmar_ratio - a2_static_no_macro_sim.calmar_ratio, 4
+                ),
+            }
+
         # ------------------------------------------------------------------
         # 4. Top-Level Return-Stream Composition (PortfolioCombiner, OBS-05b 2.0% vol floor)
         # ------------------------------------------------------------------
@@ -2045,6 +2292,20 @@ def run_platform_v4_evaluation(
                 capital_usd=capital_usd,
             )
             portfolio_comp_dict["phase_c_three_domain_w1_w3dn_g1_g4_a1"] = combined_three_domain.to_dict()
+        if a2_sim is not None:
+            combined_phase_d_three_domain = combiner.combine_sleeves(
+                {
+                    "web3_w1_xs_mom_carry": w1_sim,
+                    "web3_w3_delta_neutral_carry": w3_dn_sim,
+                    "gold_g1_gld_macro": g1_gld_sim,
+                    "gold_g4_miner_spread_mr": g4_sim,
+                    "ashare_a2_macro_erp_rotation": a2_sim,
+                },
+                method="causal_inv_vol",
+                target_vol_pct=15.0,
+                capital_usd=capital_usd,
+            )
+            portfolio_comp_dict["phase_d_three_domain_w1_w3dn_g1_g4_a2"] = combined_phase_d_three_domain.to_dict()
 
         elapsed_sec = round(time.perf_counter() - t_start, 3)
 
@@ -2079,19 +2340,27 @@ def run_platform_v4_evaluation(
             "G4_gold_miner_spread_mr": {"verdict": g4_gates.verdict, "passed": g4_gates.passed_gates, "total": 8},
         }
         if a1_detail is not None and a1_gates is not None:
-            tracks_dict["ashare"] = {"A1_cn_ashare_etf_rotation": a1_detail}
+            tracks_dict.setdefault("ashare", {})["A1_cn_ashare_etf_rotation"] = a1_detail
             verdict_summary_dict["A1_cn_ashare_etf_rotation"] = {
                 "verdict": a1_gates.verdict,
                 "passed": a1_gates.passed_gates,
                 "total": 8,
             }
+        if a2_detail is not None and a2_gates is not None:
+            tracks_dict.setdefault("ashare", {})["A2_cn_ashare_macro_erp_rotation"] = a2_detail
+            verdict_summary_dict["A2_cn_ashare_macro_erp_rotation"] = {
+                "verdict": a2_gates.verdict,
+                "passed": a2_gates.passed_gates,
+                "total": 8,
+            }
 
         report: dict[str, Any] = {
-            "platform_version": "4.2-phase-c",
+            "platform_version": "4.3-phase-d",
             "generated_at_utc": _utc_iso(),
             "elapsed_sec": elapsed_sec,
             "provenance": PROVENANCE_REAL,
             "lake_dir": str(lake_dir),
+            "trial_ledger_mode": router.trial_ledger_mode,
             "capital_usd": float(capital_usd),
             "dataset_inventory": {
                 "web3_12h_symbols": {s: len(web3_bars_12h[s]) for s in WEB3_12_UNIVERSE},
@@ -2107,11 +2376,15 @@ def run_platform_v4_evaluation(
                 "gold_paxg_basis_rows": len(paxg_basis_pts),
                 "cn_ashare_1d_symbols": ashare_inventory,
                 "cn_ashare_dq_excluded": ashare_dq_excluded,
+                "cn_ashare_macro_rows": len(cn_macro_real),
             },
             "isolation_invariants": {
                 "d7_web3_zero_yahoo_vix_bit_identical": bool(d7_zero_vix_bit_identical),
                 "d8_gold_single_instrument_separated": True,
                 "w3_dn_max_abs_delta_weight": round(float(w3_dn_max_abs_delta), 12),
+                "a2_pure_cn_stock_bond_zero_gold_etf": bool(
+                    a2_detail is None or "518880.SS" not in a2_detail.get("pure_stock_bond_universe", [])
+                ),
                 "cross_domain_signal_coupling": False,
             },
             "tracks": tracks_dict,
@@ -2142,7 +2415,7 @@ def run_platform_v4_evaluation(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run AlphaLoop Strategy R&D Platform v4 real-data 8-gate evaluation across Track W (Web3) and Track G (Gold)."
+        description="Run AlphaLoop Strategy R&D Platform v4 real-data 8-gate evaluation across Track W (Web3), Track G (Gold), and Track A (CN A-Share)."
     )
     parser.add_argument(
         "--lake-dir",
@@ -2172,6 +2445,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=10_000.0,
         help="Initial per-sleeve simulation capital in USD.",
     )
+    parser.add_argument(
+        "--trial-ledger-mode",
+        choices=("official", "sandbox", "readonly"),
+        default="official",
+        help="OBS-07 trial_ledger routing: 'official' appends to catalog.sqlite; 'sandbox' writes to isolated sidecar DB; 'readonly' records in memory only (0 official DB writes, DSR counts still conservative).",
+    )
+    parser.add_argument(
+        "--sandbox-trial-db",
+        type=Path,
+        default=None,
+        help="Optional explicit SQLite path when --trial-ledger-mode=sandbox.",
+    )
     return parser
 
 
@@ -2192,6 +2477,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             offline=bool(args.offline or not args.refresh),
             refresh=bool(args.refresh),
             capital_usd=float(args.capital_usd),
+            trial_ledger_mode=str(args.trial_ledger_mode),
+            sandbox_trial_db_path=args.sandbox_trial_db,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.error("Platform v4 evaluation failed closed: %s", exc)

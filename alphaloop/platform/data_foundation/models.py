@@ -305,6 +305,49 @@ def validate_web3_market_macro_point(
 
 
 @dataclass(frozen=True)
+class CNAshareMacroPoint:
+    """Point-in-Time domestic CN A-Share macro, sovereign yield curve, margin-flow & FX observation.
+
+    Stored strictly inside `domains/cn_ashare_lake.sqlite` (`cn_ashare_macro` table),
+    physically isolated from Web3 and Gold/Macro data stores.
+    Enforces strict `ts_avail_ms > ts_event_ms` so post-close ChinaBond yields (18:00 CST)
+    and next-morning SSE/SZSE margin balances (T+1 08:30 CST) never leak intraday.
+    """
+
+    source: str
+    series_id: str
+    ts_event_ms: int
+    ts_avail_ms: int
+    value: float
+    provenance: str = PROVENANCE_REAL
+    source_fingerprint: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def validate_cn_ashare_macro_point(
+    row: CNAshareMacroPoint,
+    allow_synthetic_in_test: bool = False,
+) -> None:
+    if not (_is_nonempty_str(row.source) and _is_nonempty_str(row.series_id)):
+        raise ValueError("CNAshareMacroPoint requires non-empty source and series_id")
+    if not (_is_strict_int(row.ts_event_ms) and _is_strict_int(row.ts_avail_ms)) or (
+        row.ts_event_ms < MIN_PLATFORM_EPOCH_MS
+        or row.ts_event_ms > MAX_PLATFORM_EPOCH_MS
+        or row.ts_avail_ms <= row.ts_event_ms
+        or row.ts_avail_ms > MAX_PLATFORM_EPOCH_MS
+    ):
+        raise ValueError(
+            f"Invalid/lookahead timestamp on CNAshareMacroPoint {row.source}/{row.series_id}@{row.ts_event_ms}"
+        )
+    if not _is_finite_real(row.value):
+        raise ValueError(f"Non-finite value on CNAshareMacroPoint {row.series_id}@{row.ts_event_ms}")
+    if not _is_provenance_allowed(row.provenance, allow_synthetic_in_test):
+        raise ValueError(f"Disallowed provenance on CNAshareMacroPoint: {row.provenance!r}")
+
+
+@dataclass(frozen=True)
 class MacroYieldPoint:
     """Point-in-Time US Treasury Daily Par Real Yield Curve observation (5Y/7Y/10Y/20Y/30Y)."""
 

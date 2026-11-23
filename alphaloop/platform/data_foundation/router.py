@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-from alphaloop.core.db import LockedConnection, connect_wal, transaction
+from alphaloop.core.db import LockedConnection, connect_memory, connect_readonly, connect_wal, transaction
 from alphaloop.core.provenance import PROVENANCE_REAL, sha256_file, sha256_obj, utc_now_ms
 from alphaloop.platform.assets import (
     ASSET_CLASS_CN_A_SHARE,
@@ -47,6 +47,7 @@ from alphaloop.platform.assets import (
 )
 from alphaloop.platform.data_foundation.models import (
     DAY_MS,
+    CNAshareMacroPoint,
     CanonicalBar,
     DomainStoreProtocol,
     MacroEventRelease,
@@ -58,6 +59,7 @@ from alphaloop.platform.data_foundation.models import (
     audit_bars_quality,
     classify_tradfi_session_tag,
     validate_canonical_bar,
+    validate_cn_ashare_macro_point,
     validate_macro_event_release,
     validate_macro_yield_point,
     validate_paxg_basis_point,
@@ -373,13 +375,23 @@ class _SQLiteBarDomainStore:
         db_path: Path,
         bars_table: str,
         pit_index_name: str,
+        *,
+        readonly: bool = False,
     ) -> None:
         self.domain_name = domain_name
         self.db_path = Path(db_path)
         self.bars_table = bars_table
         self.pit_index_name = pit_index_name
-        self.conn: LockedConnection = connect_wal(self.db_path)
-        self._init_bars_table()
+        self.readonly: bool = bool(readonly)
+        if self.readonly:
+            if self.db_path.is_file():
+                self.conn: LockedConnection = connect_readonly(self.db_path)
+            else:
+                self.conn = connect_memory()
+                self._init_bars_table()
+        else:
+            self.conn = connect_wal(self.db_path)
+            self._init_bars_table()
 
     def _init_bars_table(self) -> None:
         with transaction(self.conn):
@@ -557,14 +569,16 @@ class _SQLiteBarDomainStore:
 class Web3DomainStore(_SQLiteBarDomainStore):
     """Physically isolated Web3 SQLite WAL domain store (`domains/web3_lake.sqlite`)."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, readonly: bool = False) -> None:
         super().__init__(
             domain_name="web3",
             db_path=db_path,
             bars_table="web3_bars",
             pit_index_name="idx_web3_bars_pit_sec",
+            readonly=readonly,
         )
-        self._init_web3_tables()
+        if (not self.readonly) or (not self.db_path.is_file()):
+            self._init_web3_tables()
 
     def _init_web3_tables(self) -> None:
         with transaction(self.conn):
@@ -789,14 +803,16 @@ class Web3DomainStore(_SQLiteBarDomainStore):
 class GoldMacroDomainStore(_SQLiteBarDomainStore):
     """Physically isolated Gold & Macro SQLite WAL domain store (`domains/gold_macro_lake.sqlite`)."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, readonly: bool = False) -> None:
         super().__init__(
             domain_name="gold_macro",
             db_path=db_path,
             bars_table="tradfi_bars",
             pit_index_name="idx_tradfi_bars_pit_sec",
+            readonly=readonly,
         )
-        self._init_gold_macro_tables()
+        if (not self.readonly) or (not self.db_path.is_file()):
+            self._init_gold_macro_tables()
 
     def _init_gold_macro_tables(self) -> None:
         with transaction(self.conn):
@@ -1186,20 +1202,132 @@ class CNAshareDomainStore(_SQLiteBarDomainStore):
     """Physically isolated CN A-Share SQLite WAL domain store (`domains/cn_ashare_lake.sqlite`).
 
     Zero cross-domain coupling or lock contention with Web3 or Gold/Macro SQLite stores.
+    Stores both `cn_ashare_bars` (OHLCV ETFs) and `cn_ashare_macro` (ChinaBond CGB yields,
+    SSE/SZSE margin financing balances, USD/CNY & offshore proxies) under strict PIT lags.
     """
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, readonly: bool = False) -> None:
         super().__init__(
             domain_name="cn_ashare",
             db_path=db_path,
             bars_table="cn_ashare_bars",
             pit_index_name="idx_cn_ashare_bars_pit_sec",
+            readonly=readonly,
         )
+        if (not self.readonly) or (not self.db_path.is_file()):
+            self._init_cn_macro_schema()
+
+    def _init_cn_macro_schema(self) -> None:
+        with transaction(self.conn):
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cn_ashare_macro (
+                    source TEXT NOT NULL,
+                    series_id TEXT NOT NULL,
+                    ts_event_ms INTEGER NOT NULL,
+                    ts_avail_ms INTEGER NOT NULL,
+                    value REAL NOT NULL,
+                    provenance TEXT NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    PRIMARY KEY (series_id, ts_event_ms)
+                );
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cn_ashare_macro_pit
+                ON cn_ashare_macro (series_id, ts_avail_ms);
+                """
+            )
+
+    def upsert_cn_macro(
+        self,
+        rows: Sequence[CNAshareMacroPoint],
+        *,
+        allow_synthetic_in_test: bool = False,
+    ) -> int:
+        if not rows:
+            return 0
+        payload: list[tuple[Any, ...]] = []
+        for r in rows:
+            validate_cn_ashare_macro_point(r, allow_synthetic_in_test=allow_synthetic_in_test)
+            payload.append(
+                (
+                    r.source,
+                    r.series_id,
+                    int(r.ts_event_ms),
+                    int(r.ts_avail_ms),
+                    float(r.value),
+                    r.provenance,
+                    r.source_fingerprint,
+                )
+            )
+        with transaction(self.conn):
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO cn_ashare_macro
+                (source, series_id, ts_event_ms, ts_avail_ms, value, provenance, source_fingerprint)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                payload,
+            )
+        return len(payload)
+
+    def load_cn_macro(
+        self,
+        series_ids: Sequence[str] | None = None,
+        *,
+        as_of_ms: int | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> list[CNAshareMacroPoint]:
+        sql = (
+            "SELECT source, series_id, ts_event_ms, ts_avail_ms, value, provenance, source_fingerprint "
+            "FROM cn_ashare_macro WHERE 1=1"
+        )
+        params: list[Any] = []
+        if series_ids:
+            placeholders = ",".join("?" for _ in series_ids)
+            sql += f" AND series_id IN ({placeholders})"
+            params.extend(str(s) for s in series_ids)
+        if start_ms is not None:
+            sql += " AND ts_event_ms >= ?"
+            params.append(int(start_ms))
+        if end_ms is not None:
+            sql += " AND ts_event_ms <= ?"
+            params.append(int(end_ms))
+        if as_of_ms is not None:
+            sql += " AND ts_avail_ms <= ?"
+            params.append(int(as_of_ms))
+        sql += " ORDER BY series_id ASC, ts_event_ms ASC"
+        rows = self.conn.fetch_all(sql, params)
+        return [
+            CNAshareMacroPoint(
+                source=str(r["source"]),
+                series_id=str(r["series_id"]),
+                ts_event_ms=int(r["ts_event_ms"]),
+                ts_avail_ms=int(r["ts_avail_ms"]),
+                value=float(r["value"]),
+                provenance=str(r["provenance"]),
+                source_fingerprint=str(r["source_fingerprint"] or ""),
+            )
+            for r in rows
+        ]
 
     def export_tables(self) -> dict[str, list[dict[str, Any]]]:
-        return {
+        tables: dict[str, list[dict[str, Any]]] = {
             "cn_ashare_bars": list(self.iter_export_rows()),
         }
+        macro_rows = [
+            dict(r)
+            for r in self.conn.fetch_all(
+                "SELECT source, series_id, ts_event_ms, ts_avail_ms, value, provenance, source_fingerprint "
+                "FROM cn_ashare_macro ORDER BY series_id ASC, ts_event_ms ASC"
+            )
+        ]
+        if macro_rows:
+            tables["cn_ashare_macro"] = macro_rows
+        return tables
 
 
 def _atomic_write_jsonl_gz(rows: Sequence[dict[str, Any]], target: Path) -> int:
@@ -1242,23 +1370,81 @@ def _atomic_write_parquet(rows: Sequence[dict[str, Any]], target: Path) -> int:
     return len(rows)
 
 
-class DataFoundationRouter:
-    """Unified PIT Control Plane (`catalog.sqlite`) + Physically Partitioned Domain Stores Router."""
+_VALID_TRIAL_LEDGER_MODES: frozenset[str] = frozenset({"official", "sandbox", "readonly"})
 
-    def __init__(self, base_dir: Path | str) -> None:
+
+class DataFoundationRouter:
+    """Unified PIT Control Plane (`catalog.sqlite`) + Physically Partitioned Domain Stores Router.
+
+    Supports `trial_ledger_mode` (`OBS-07` isolation):
+      - `"official"` (default): appends trials directly into immutable `catalog.sqlite` `trial_ledger`.
+      - `"sandbox"`: writes new trials into an isolated sandbox SQLite WAL DB (0 rows written to
+        official `catalog.sqlite`), while `get_family_trial_count()` returns `official + sandbox`
+        so DSR is NEVER under-penalized.
+      - `"readonly"`: appends trials strictly in memory (0 disk writes to `catalog.sqlite`), while
+        `get_family_trial_count()` returns `official + in_memory` so DSR stays strictly conservative.
+    """
+
+    def __init__(
+        self,
+        base_dir: Path | str,
+        *,
+        trial_ledger_mode: str = "official",
+        sandbox_trial_db_path: Path | str | None = None,
+    ) -> None:
+        mode_norm = str(trial_ledger_mode).strip().lower()
+        if mode_norm not in _VALID_TRIAL_LEDGER_MODES:
+            raise ValueError(
+                f"Invalid trial_ledger_mode {trial_ledger_mode!r}; expected one of {sorted(_VALID_TRIAL_LEDGER_MODES)}"
+            )
+        self.trial_ledger_mode: str = mode_norm
+        self._sandbox_tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self._sandbox_trial_conn: LockedConnection | None = None
+        self._sandbox_trial_path: Path | None = None
+        self._readonly_trials: list[dict[str, Any]] = []
+
         self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(parents=True, exist_ok=True)
         self.domains_dir = self.base_dir / "domains"
-        self.domains_dir.mkdir(parents=True, exist_ok=True)
         self.parquet_dir = self.base_dir / "parquet"
         self.catalog_path = self.base_dir / "catalog.sqlite"
+        self._official_lake_readonly: bool = self.trial_ledger_mode in ("readonly", "sandbox")
 
-        self.catalog_conn: LockedConnection = connect_wal(self.catalog_path)
-        self._init_catalog_schema()
+        if self._official_lake_readonly:
+            if not self.catalog_path.is_file():
+                raise FileNotFoundError(
+                    f"Official catalog.sqlite not found at {self.catalog_path} "
+                    f"for trial_ledger_mode={self.trial_ledger_mode!r}"
+                )
+            self.catalog_conn: LockedConnection = connect_readonly(self.catalog_path)
+        else:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            self.domains_dir.mkdir(parents=True, exist_ok=True)
+            self.catalog_conn = connect_wal(self.catalog_path)
+            self._init_catalog_schema()
 
-        self.web3_store = Web3DomainStore(self.domains_dir / "web3_lake.sqlite")
-        self.gold_macro_store = GoldMacroDomainStore(self.domains_dir / "gold_macro_lake.sqlite")
-        self.cn_ashare_store = CNAshareDomainStore(self.domains_dir / "cn_ashare_lake.sqlite")
+        if self.trial_ledger_mode == "sandbox":
+            if sandbox_trial_db_path is not None:
+                sb_path = Path(sandbox_trial_db_path)
+                sb_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                self._sandbox_tmpdir = tempfile.TemporaryDirectory(prefix="alphaloop_trial_sandbox_")
+                sb_path = Path(self._sandbox_tmpdir.name) / "trial_sandbox.sqlite"
+            self._sandbox_trial_path = sb_path
+            self._sandbox_trial_conn = connect_wal(sb_path)
+            self._init_trial_ledger_table(self._sandbox_trial_conn)
+
+        self.web3_store = Web3DomainStore(
+            self.domains_dir / "web3_lake.sqlite",
+            readonly=self._official_lake_readonly,
+        )
+        self.gold_macro_store = GoldMacroDomainStore(
+            self.domains_dir / "gold_macro_lake.sqlite",
+            readonly=self._official_lake_readonly,
+        )
+        self.cn_ashare_store = CNAshareDomainStore(
+            self.domains_dir / "cn_ashare_lake.sqlite",
+            readonly=self._official_lake_readonly,
+        )
         self._domain_stores: dict[str, DomainStoreProtocol] = {
             "web3": self.web3_store,
             "gold_macro": self.gold_macro_store,
@@ -1278,6 +1464,61 @@ class DataFoundationRouter:
     @staticmethod
     def has_duckdb() -> bool:
         return has_duckdb()
+
+    @staticmethod
+    def _init_trial_ledger_table(conn: LockedConnection) -> None:
+        """Create immutable REA-001 `trial_ledger` table + append-only triggers on a SQLite WAL connection."""
+        with transaction(conn):
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trial_ledger (
+                    trial_id TEXT PRIMARY KEY,
+                    created_ts_ms INTEGER NOT NULL,
+                    family_id TEXT NOT NULL,
+                    track_name TEXT NOT NULL,
+                    strategy_name TEXT NOT NULL,
+                    params_hash TEXT NOT NULL,
+                    dataset_sha256 TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    schema_version TEXT NOT NULL DEFAULT 'rea-001-v1'
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_trial_family
+                ON trial_ledger (family_id, created_ts_ms);
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_trial_ledger_no_update
+                BEFORE UPDATE ON trial_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'trial_ledger is append-only (REA-001): UPDATE forbidden');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_trial_ledger_no_delete
+                BEFORE DELETE ON trial_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'trial_ledger is append-only (REA-001): DELETE forbidden');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_trial_ledger_no_replace
+                BEFORE INSERT ON trial_ledger
+                WHEN EXISTS (SELECT 1 FROM trial_ledger WHERE trial_id = NEW.trial_id)
+                BEGIN
+                    SELECT RAISE(ABORT, 'trial_ledger is append-only (REA-001): REPLACE/overwrite forbidden');
+                END;
+                """
+            )
 
     def _init_catalog_schema(self) -> None:
         with transaction(self.catalog_conn):
@@ -1446,7 +1687,14 @@ class DataFoundationRouter:
             )
         return store
 
+    def _assert_official_writable(self, op_name: str) -> None:
+        if self._official_lake_readonly:
+            raise PermissionError(
+                f"Official lake write {op_name!r} forbidden in trial_ledger_mode={self.trial_ledger_mode!r}"
+            )
+
     def register_asset(self, spec: AssetSpec, *, domain: str | None = None) -> None:
+        self._assert_official_writable("register_asset")
         dom = normalize_domain(domain) if domain else ASSET_CLASS_TO_DOMAIN.get(spec.asset_class, "web3")
         with transaction(self.catalog_conn):
             self.catalog_conn.execute(
@@ -1619,6 +1867,29 @@ class DataFoundationRouter:
             end_ms=end_ms,
         )
 
+    def upsert_cn_ashare_macro(
+        self,
+        rows: Sequence[CNAshareMacroPoint],
+        *,
+        allow_synthetic_in_test: bool = False,
+    ) -> int:
+        return self.cn_ashare_store.upsert_cn_macro(rows, allow_synthetic_in_test=allow_synthetic_in_test)
+
+    def load_cn_ashare_macro(
+        self,
+        series_ids: Sequence[str] | None = None,
+        *,
+        as_of_ms: int | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> list[CNAshareMacroPoint]:
+        return self.cn_ashare_store.load_cn_macro(
+            series_ids=series_ids,
+            as_of_ms=as_of_ms,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
     def record_trial(
         self,
         family_id: str,
@@ -1630,7 +1901,7 @@ class DataFoundationRouter:
         *,
         dataset_sha256: str = "",
     ) -> str:
-        """Append an immutable hypothesis-family trial record to REA-001 `trial_ledger`."""
+        """Append an immutable hypothesis-family trial record respecting `trial_ledger_mode` (OBS-07)."""
         now = utc_now_ms()
         nonce = uuid.uuid4().hex[:8]
         digest = sha256_obj(
@@ -1643,9 +1914,34 @@ class DataFoundationRouter:
                 "n": nonce,
             }
         )[:12]
-        trial_id = f"TR-{digest}-{nonce[:6]}"
-        with transaction(self.catalog_conn):
-            self.catalog_conn.execute(
+        prefix = "TR-RO" if self.trial_ledger_mode == "readonly" else ("TR-SB" if self.trial_ledger_mode == "sandbox" else "TR")
+        trial_id = f"{prefix}-{digest}-{nonce[:6]}"
+        metrics_json = json.dumps(metrics, sort_keys=True)
+
+        if self.trial_ledger_mode == "readonly":
+            self._readonly_trials.append(
+                {
+                    "trial_id": trial_id,
+                    "created_ts_ms": now,
+                    "family_id": family_id,
+                    "track_name": track_name,
+                    "strategy_name": strategy_name,
+                    "params_hash": params_hash,
+                    "dataset_sha256": dataset_sha256,
+                    "metrics": dict(metrics),
+                    "verdict": verdict,
+                    "schema_version": "rea-001-v1",
+                }
+            )
+            return trial_id
+
+        target_conn = (
+            self._sandbox_trial_conn
+            if (self.trial_ledger_mode == "sandbox" and self._sandbox_trial_conn is not None)
+            else self.catalog_conn
+        )
+        with transaction(target_conn):
+            target_conn.execute(
                 """
                 INSERT INTO trial_ledger
                 (trial_id, created_ts_ms, family_id, track_name, strategy_name,
@@ -1660,18 +1956,32 @@ class DataFoundationRouter:
                     strategy_name,
                     params_hash,
                     dataset_sha256,
-                    json.dumps(metrics, sort_keys=True),
+                    metrics_json,
                     verdict,
                 ),
             )
         return trial_id
 
-    def get_family_trial_count(self, family_id: str) -> int:
+    def get_official_family_trial_count(self, family_id: str) -> int:
         row = self.catalog_conn.fetch_one(
             "SELECT COUNT(*) AS cnt FROM trial_ledger WHERE family_id=?",
             (family_id,),
         )
         return int(row["cnt"]) if row is not None else 0
+
+    def get_family_trial_count(self, family_id: str) -> int:
+        """Cumulative trial count (official + sandbox/readonly) so DSR is NEVER under-penalized."""
+        official_cnt = self.get_official_family_trial_count(family_id)
+        if self.trial_ledger_mode == "sandbox" and self._sandbox_trial_conn is not None:
+            sb_row = self._sandbox_trial_conn.fetch_one(
+                "SELECT COUNT(*) AS cnt FROM trial_ledger WHERE family_id=?",
+                (family_id,),
+            )
+            return official_cnt + (int(sb_row["cnt"]) if sb_row is not None else 0)
+        if self.trial_ledger_mode == "readonly":
+            ro_cnt = sum(1 for r in self._readonly_trials if r["family_id"] == family_id)
+            return official_cnt + ro_cnt
+        return official_cnt
 
     def list_family_trials(self, family_id: str) -> list[dict[str, Any]]:
         rows = self.catalog_conn.fetch_all(
@@ -1685,9 +1995,25 @@ class DataFoundationRouter:
             d = dict(r)
             d["metrics"] = json.loads(d.pop("metrics_json"))
             out.append(d)
+        if self.trial_ledger_mode == "sandbox" and self._sandbox_trial_conn is not None:
+            sb_rows = self._sandbox_trial_conn.fetch_all(
+                "SELECT trial_id, created_ts_ms, family_id, track_name, strategy_name, params_hash, "
+                "dataset_sha256, metrics_json, verdict, schema_version "
+                "FROM trial_ledger WHERE family_id=? ORDER BY created_ts_ms ASC, trial_id ASC",
+                (family_id,),
+            )
+            for r in sb_rows:
+                d = dict(r)
+                d["metrics"] = json.loads(d.pop("metrics_json"))
+                out.append(d)
+        elif self.trial_ledger_mode == "readonly":
+            for r in self._readonly_trials:
+                if r["family_id"] == family_id:
+                    out.append(dict(r))
         return out
 
     def save_factor_audit(self, track_name: str, dataset_sha256: str, payload: dict[str, Any]) -> str:
+        self._assert_official_writable("save_factor_audit")
         now = utc_now_ms()
         nonce = uuid.uuid4().hex[:8]
         aid = f"FA-{sha256_obj({'t': track_name, 'd': dataset_sha256, 'ts': now, 'n': nonce})[:12]}"
@@ -1707,6 +2033,7 @@ class DataFoundationRouter:
         regime_label: str,
         payload: dict[str, Any],
     ) -> str:
+        self._assert_official_writable("save_regime_snapshot")
         now = utc_now_ms()
         nonce = uuid.uuid4().hex[:8]
         sid = f"REG-{sha256_obj({'v': venue, 's': symbol, 'r': regime_label, 'ts': now, 'n': nonce})[:12]}"
@@ -1727,6 +2054,7 @@ class DataFoundationRouter:
         dataset_sha256: str,
         payload: dict[str, Any],
     ) -> str:
+        self._assert_official_writable("save_strategy_blueprint")
         now = utc_now_ms()
         nonce = uuid.uuid4().hex[:8]
         bid = f"BP-{sha256_obj({'t': track_name, 'a': archetype, 'd': dataset_sha256, 'ts': now, 'n': nonce})[:12]}"
@@ -1750,7 +2078,7 @@ class DataFoundationRouter:
         allow_synthetic_in_test: bool = False,
         min_bars: int = 40,
     ) -> MultiAssetDQReport:
-        """Run DQ-MA-01..07 on a domain series and persist the DQ certificate to `catalog.sqlite`."""
+        """Run DQ-MA-01..07 on a domain series and persist the DQ certificate to `catalog.sqlite` in official mode."""
         dom = normalize_domain(domain)
         bars = self.load_bars(dom, venue, symbol, int(timeframe_sec))
         label = f"{dom}:{venue}:{symbol}:{int(timeframe_sec)}s"
@@ -1761,32 +2089,35 @@ class DataFoundationRouter:
             min_bars=min_bars,
             allow_synthetic_in_test=allow_synthetic_in_test,
         )
-        now = utc_now_ms()
-        nonce = uuid.uuid4().hex[:8]
-        cert_id = f"DQ-{sha256_obj({'l': label, 'sha': report.dataset_sha256, 'ts': now, 'n': nonce})[:12]}"
-        with transaction(self.catalog_conn):
-            self.catalog_conn.execute(
-                """
-                INSERT OR REPLACE INTO dq_certificates
-                (cert_id, created_ts_ms, domain, venue, symbol, timeframe_sec, dataset_sha256, passed, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    cert_id,
-                    now,
-                    dom,
-                    venue,
-                    symbol,
-                    int(timeframe_sec),
-                    report.dataset_sha256,
-                    1 if report.passed else 0,
-                    json.dumps(report.to_dict(), sort_keys=True),
-                ),
-            )
+        # RB-D05: Never mutate catalog.sqlite in readonly/sandbox modes (enables running on 0444 snapshots!)
+        if not self._official_lake_readonly:
+            now = utc_now_ms()
+            nonce = uuid.uuid4().hex[:8]
+            cert_id = f"DQ-{sha256_obj({'l': label, 'sha': report.dataset_sha256, 'ts': now, 'n': nonce})[:12]}"
+            with transaction(self.catalog_conn):
+                self.catalog_conn.execute(
+                    """
+                    INSERT OR REPLACE INTO dq_certificates
+                    (cert_id, created_ts_ms, domain, venue, symbol, timeframe_sec, dataset_sha256, passed, payload_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cert_id,
+                        now,
+                        dom,
+                        venue,
+                        symbol,
+                        int(timeframe_sec),
+                        report.dataset_sha256,
+                        1 if report.passed else 0,
+                        json.dumps(report.to_dict(), sort_keys=True),
+                    ),
+                )
         return report
 
     def export_domain_partition(self, domain: str, fmt: str = "auto") -> dict[str, Any]:
         """Atomically export domain tables to immutable Parquet (if pyarrow) or deterministic `.jsonl.gz`."""
+        self._assert_official_writable("export_domain_partition")
         dom = normalize_domain(domain)
         store = self.get_domain_store(dom)
         fmt_norm = fmt.strip().lower()
@@ -1801,7 +2132,7 @@ class DataFoundationRouter:
         else:
             raise ValueError(f"Unsupported partition export format: {fmt!r}")
 
-        if isinstance(store, (Web3DomainStore, GoldMacroDomainStore)):
+        if isinstance(store, (Web3DomainStore, GoldMacroDomainStore, CNAshareDomainStore)):
             tables = store.export_tables()
         else:
             tables = {f"{dom}_bars": list(store.iter_export_rows())}
@@ -2200,6 +2531,7 @@ class DataFoundationRouter:
     def summary_stats(self) -> dict[str, Any]:
         return {
             "base_dir": str(self.base_dir),
+            "trial_ledger_mode": self.trial_ledger_mode,
             "domains": {
                 name: store.list_series()
                 for name, store in sorted(self._domain_stores.items())
@@ -2219,6 +2551,9 @@ class DataFoundationRouter:
             "paxg_basis_count": int(
                 (self.gold_macro_store.conn.fetch_one("SELECT COUNT(*) AS c FROM paxg_basis_arbitration") or {"c": 0})["c"]
             ),
+            "cn_ashare_macro_count": int(
+                (self.cn_ashare_store.conn.fetch_one("SELECT COUNT(*) AS c FROM cn_ashare_macro") or {"c": 0})["c"]
+            ),
             "trial_ledger_count": int(
                 (self.catalog_conn.fetch_one("SELECT COUNT(*) AS c FROM trial_ledger") or {"c": 0})["c"]
             ),
@@ -2236,4 +2571,10 @@ class DataFoundationRouter:
             if id(store) not in seen_stores:
                 seen_stores.add(id(store))
                 store.close()
+        if self._sandbox_trial_conn is not None:
+            self._sandbox_trial_conn.close()
+            self._sandbox_trial_conn = None
+        if self._sandbox_tmpdir is not None:
+            self._sandbox_tmpdir.cleanup()
+            self._sandbox_tmpdir = None
         self.catalog_conn.close()

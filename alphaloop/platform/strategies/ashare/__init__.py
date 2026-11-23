@@ -4,5 +4,15 @@ Zero imports from `alphaloop.platform.strategies.web3` or `alphaloop.platform.st
 """
 
 from alphaloop.platform.strategies.ashare.etf_rotation import AShareETFRotationKernel
+from alphaloop.platform.strategies.ashare.macro_erp_rotation import (
+    AShareMacroERPRotationKernel,
+    CNMacroRegimeSnapshot,
+    CNMacroRegimeTimeline,
+)
 
-__all__ = ["AShareETFRotationKernel"]
+__all__ = [
+    "AShareETFRotationKernel",
+    "AShareMacroERPRotationKernel",
+    "CNMacroRegimeSnapshot",
+    "CNMacroRegimeTimeline",
+]

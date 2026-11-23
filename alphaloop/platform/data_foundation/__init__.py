@@ -57,6 +57,7 @@ from alphaloop.platform.data_foundation.models import (
     HOUR_MS,
     MAX_PLATFORM_EPOCH_MS,
     MIN_PLATFORM_EPOCH_MS,
+    CNAshareMacroPoint,
     CanonicalBar,
     DomainStoreProtocol,
     MacroEventRelease,
@@ -72,6 +73,7 @@ from alphaloop.platform.data_foundation.models import (
     fingerprint_canonical_bars,
     resample_bars,
     validate_canonical_bar,
+    validate_cn_ashare_macro_point,
     validate_macro_event_release,
     validate_macro_yield_point,
     validate_paxg_basis_point,
@@ -79,7 +81,10 @@ from alphaloop.platform.data_foundation.models import (
     validate_web3_market_macro_point,
 )
 from alphaloop.platform.data_foundation.collectors_cn_ashare import (
+    CN_ASHARE_BROAD_EQUITY_ETFS,
     CN_ASHARE_DEFENSIVE_BOND_ETFS,
+    CN_ASHARE_DIVIDEND_ETFS,
+    CN_ASHARE_PURE_STOCK_BOND_UNIVERSE,
     CN_ASHARE_RISK_ETFS,
     DEFAULT_CN_ASHARE_ETF_UNIVERSE,
     CNAsharePublicCollector,
@@ -108,6 +113,7 @@ __all__ = [
     "MIN_PLATFORM_EPOCH_MS",
     "MAX_PLATFORM_EPOCH_MS",
     "CanonicalBar",
+    "CNAshareMacroPoint",
     "Web3DerivativesMetric",
     "Web3MarketMacroPoint",
     "MacroYieldPoint",
@@ -119,6 +125,7 @@ __all__ = [
     "DomainStoreProtocol",
     "check_canonical_bar",
     "validate_canonical_bar",
+    "validate_cn_ashare_macro_point",
     "validate_web3_derivatives_metric",
     "validate_web3_market_macro_point",
     "validate_macro_yield_point",
@@ -159,6 +166,9 @@ __all__ = [
     "ny_local_to_utc_ms",
     "us_federal_holidays",
     "DEFAULT_CN_ASHARE_ETF_UNIVERSE",
+    "CN_ASHARE_PURE_STOCK_BOND_UNIVERSE",
+    "CN_ASHARE_DIVIDEND_ETFS",
+    "CN_ASHARE_BROAD_EQUITY_ETFS",
     "CN_ASHARE_RISK_ETFS",
     "CN_ASHARE_DEFENSIVE_BOND_ETFS",
     "CNAsharePublicCollector",
@@ -553,19 +563,25 @@ def ingest_cn_ashare_real_lake(
     base_dir: Path | str,
     *,
     symbols: tuple[str, ...] = DEFAULT_CN_ASHARE_ETF_UNIVERSE,
-    range_str: str = "5y",
+    range_str: str = "10y",
+    include_macro: bool = True,
     export_partitions: bool = True,
 ) -> dict[str, Any]:
-    """Ingest real multi-year CN A-Share ETF OHLCV strictly into `domains/cn_ashare_lake.sqlite`.
+    """Ingest real multi-year CN A-Share ETF OHLCV + native domestic macro strictly into `domains/cn_ashare_lake.sqlite`.
 
     Zero mutation of `web3_lake.sqlite` or `gold_macro_lake.sqlite`; writes SHA-256 dataset
-    manifest and DQ certification into `catalog.sqlite`.
+    manifests (`cn_ashare_bars` + `cn_ashare_macro`) and DQ certifications into `catalog.sqlite`.
     """
     client = RateLimitedHTTPClient(default_timeout=15.0)
     collector = CNAsharePublicCollector(client)
     specs = default_cn_ashare_specs(symbols, venue="cn_a_share")
 
-    summary: dict[str, Any] = {"base_dir": str(Path(base_dir).resolve()), "rows": {}, "errors": []}
+    summary: dict[str, Any] = {
+        "base_dir": str(Path(base_dir).resolve()),
+        "rows": {},
+        "macro_rows": {},
+        "errors": [],
+    }
     with DataFoundationRouter(base_dir) as router:
         for sym, spec in specs.items():
             router.register_asset(spec, domain="cn_ashare")
@@ -576,6 +592,20 @@ def ingest_cn_ashare_real_lake(
             except Exception as exc:
                 logger.warning("CN A-Share ingest failed for %s: %s", sym, exc)
                 summary["errors"].append(f"cn_ashare:{sym}:{exc}")
+
+        if include_macro:
+            for macro_name, fn in (
+                ("eastmoney_cgb", lambda: collector.fetch_eastmoney_cgb_yields(max_pages=7, page_size=500)),
+                ("eastmoney_rzrq", lambda: collector.fetch_eastmoney_margin_balance(max_pages=6, page_size=500)),
+                ("yahoo_cn_macro", lambda: collector.fetch_cn_fx_and_offshore(range_str=range_str)),
+            ):
+                try:
+                    pts = fn()
+                    n_m = router.upsert_cn_ashare_macro(pts)
+                    summary["macro_rows"][macro_name] = n_m
+                except Exception as exc:
+                    logger.warning("CN A-Share macro ingest failed for %s: %s", macro_name, exc)
+                    summary["errors"].append(f"cn_ashare_macro:{macro_name}:{exc}")
 
         if export_partitions:
             summary["export_cn_ashare"] = router.export_domain_partition("cn_ashare", fmt="auto")
@@ -590,6 +620,7 @@ def ingest_cn_ashare_real_lake(
             }
         summary["dq_audit"] = dq_summary
         summary["total_rows"] = sum(int(v) for v in summary["rows"].values())
+        summary["total_macro_rows"] = sum(int(v) for v in summary["macro_rows"].values())
         summary["stats"] = router.summary_stats()
 
     return summary
