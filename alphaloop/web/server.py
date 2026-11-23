@@ -665,7 +665,7 @@ code {
   margin: 12px 14px 0;
   padding: 10px 12px;
   border-radius: var(--radius-control);
-  background: var(--color-loss-tint);
+  background: linear-gradient(var(--color-loss-tint), var(--color-loss-tint)), var(--bg-surface);
   border: 1px solid rgba(239, 68, 68, 0.40);
   color: var(--color-loss-text);
   font-size: var(--text-xs);
@@ -676,6 +676,9 @@ code {
   border-radius: 50%;
   background: var(--color-loss);
   flex-shrink: 0;
+}
+.fleet-role {
+  font-size: var(--text-2xs);
 }
 
 /* ── Cycle Expanded Diff Detail Grid ── */
@@ -984,9 +987,9 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
   .ui-topbar { flex-wrap: wrap; padding: 6px var(--space-3); }
   .ui-topbar__meta { width: 100%; justify-content: flex-end; }
   .ui-tablist { top: 0; position: static; }
-  .kill-strip { top: var(--topbar-h); }
+  .kill-strip { position: static; top: auto; }
   .ui-kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .ui-btn, .ui-tab, .ui-select { min-height: 36px; }
+  .ui-btn, .ui-tab, .ui-select, .ui-input { min-height: 36px; }
   .ui-toast-stack { left: 12px; right: 12px; bottom: 12px; max-width: none; }
 }
 </style>
@@ -1146,7 +1149,7 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
     </div>
     <div class="ui-dialog__actions">
       <button type="button" class="ui-btn ui-btn--ghost" data-dlg-cancel>Cancel</button>
-      <button type="button" class="ui-btn ui-btn--primary" data-dlg-submit>
+      <button type="button" class="ui-btn ui-btn--primary" data-dlg-submit data-dlg-ok>
         <span class="ui-spinner" aria-hidden="true"></span>
         <span class="ui-btn__label" data-dlg-submit-label>Execute</span>
       </button>
@@ -1235,30 +1238,40 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
   function isFiniteNum(v) {
     return typeof v === 'number' && Number.isFinite(v);
   }
+  function parseStrictNum(v) {
+    if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+    if (typeof v === 'string') {
+      const s = v.trim();
+      if (!s) return null;
+      const n = Number(s);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  }
   function numOr(v, fallback) {
-    const n = typeof v === 'number' ? v : Number(v);
-    return Number.isFinite(n) ? n : fallback;
+    const n = parseStrictNum(v);
+    return n !== null ? n : fallback;
   }
   function fmtNum(v, digits = 2) {
-    const n = Number(v);
-    if (v === null || v === undefined || v === '' || !Number.isFinite(n)) return '—';
+    const n = parseStrictNum(v);
+    if (n === null) return '—';
     return n.toFixed(digits);
   }
   function fmtSigned(v, digits = 2, suffix = '') {
-    const n = Number(v);
-    if (v === null || v === undefined || v === '' || !Number.isFinite(n)) return '—';
+    const n = parseStrictNum(v);
+    if (n === null) return '—';
     return (n > 0 ? '+' : '') + n.toFixed(digits) + suffix;
   }
   function fmtUsd(v, digits = 2, signed = false) {
-    const n = Number(v);
-    if (v === null || v === undefined || v === '' || !Number.isFinite(n)) return '—';
+    const n = parseStrictNum(v);
+    if (n === null) return '—';
     const abs = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
     if (n < 0) return '-$' + abs;
     return (signed && n > 0 ? '+$' : '$') + abs;
   }
   function fmtUtc(tsMs) {
-    const n = Number(tsMs);
-    if (!Number.isFinite(n) || n <= 0) return '—';
+    const n = parseStrictNum(tsMs);
+    if (n === null || n <= 0) return '—';
     try {
       return new Date(n).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
     } catch {
@@ -1266,8 +1279,8 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
     }
   }
   function fmtUtcShort(tsMs) {
-    const n = Number(tsMs);
-    if (!Number.isFinite(n) || n <= 0) return '—';
+    const n = parseStrictNum(tsMs);
+    if (n === null || n <= 0) return '—';
     try {
       return new Date(n).toISOString().slice(0, 16).replace('T', ' ');
     } catch {
@@ -1275,8 +1288,8 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
     }
   }
   function fmtFreshness(sec) {
-    const n = Number(sec);
-    if (sec === null || sec === undefined || !Number.isFinite(n) || n < 0 || n >= 999999) return 'N/A';
+    const n = parseStrictNum(sec);
+    if (n === null || n < 0 || n >= 999999) return 'N/A';
     return n.toFixed(1) + 's';
   }
   function clampPct(val) {
@@ -1531,7 +1544,7 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
       const otherCnt = list.length - shadowCnt;
       cards.push(list.length > 0
         ? { label: 'Strategies', value: String(list.length), stateAttr: 'live', badgeText: 'LIVE', sub: shadowCnt + ' SHADOW · ' + otherCnt + ' other' }
-        : { label: 'Strategies', value: '0', stateAttr: 'no-channel', badgeText: 'NO_CHANNEL', sub: 'No active configs' });
+        : { label: 'Strategies', value: '—', stateAttr: 'no-channel', badgeText: 'NO_CHANNEL', sub: 'No active configs' });
     }
 
     // 3. Funding Rows & 4. BBO Ticks
@@ -1549,11 +1562,19 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
         : { label: 'Funding Rows', value: '—', stateAttr: 'no-channel', badgeText: 'NO_CHANNEL', sub: 'No funding bars' });
 
       const bRows = bbo.reduce((a, x) => a + numOr(x.rows, 0), 0);
-      const bLatWeighted = bbo.reduce((a, x) => a + numOr(x.avg_latency_ms, 0) * Math.max(1, numOr(x.rows, 0)), 0);
-      const bWeight = bbo.reduce((a, x) => a + Math.max(1, numOr(x.rows, 0)), 0);
-      const avgLat = bWeight > 0 ? (bLatWeighted / bWeight).toFixed(1) : '—';
+      let bLatWeighted = 0;
+      let bWeight = 0;
+      bbo.forEach((x) => {
+        const lat = parseStrictNum(x.avg_latency_ms);
+        if (lat !== null) {
+          const w = Math.max(1, numOr(x.rows, 0));
+          bLatWeighted += lat * w;
+          bWeight += w;
+        }
+      });
+      const avgLat = bWeight > 0 ? (bLatWeighted / bWeight).toFixed(1) + 'ms avg' : 'lat N/A';
       cards.push(bbo.length > 0
-        ? { label: 'BBO Ticks', value: bRows.toLocaleString('en-US'), stateAttr: 'live', badgeText: 'LIVE', sub: bbo.length + ' venues · ' + avgLat + 'ms avg' }
+        ? { label: 'BBO Ticks', value: bRows.toLocaleString('en-US'), stateAttr: 'live', badgeText: 'LIVE', sub: bbo.length + ' venues · ' + avgLat }
         : { label: 'BBO Ticks', value: '—', stateAttr: 'no-channel', badgeText: 'NO_CHANNEL', sub: 'No live BBO ticks' });
     }
 
@@ -1576,7 +1597,10 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
     } else {
       const sp = R.parity.data || {};
       if (!sp.valid) {
-        cards.push({ label: 'Shadow Parity', value: '—', stateAttr: 'no-channel', badgeText: 'NO_CHANNEL', sub: sp.error || 'No shadow report' });
+        const isCorrupt = isSnapshotCorruptionError(sp.error);
+        cards.push(isCorrupt
+          ? { label: 'Shadow Parity', value: '—', stateAttr: 'upstream-error', badgeText: 'ERR', sub: String(sp.error) }
+          : { label: 'Shadow Parity', value: '—', stateAttr: 'no-channel', badgeText: 'NO_CHANNEL', sub: sp.error || 'No shadow report' });
       } else {
         const st = String(sp.status || 'PARITY_OK');
         const stratCnt = (sp.strategies || []).length;
@@ -1651,6 +1675,13 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
     if (grid) grid.innerHTML = cards.map(renderKpiCard).join('');
   }
 
+  function isSnapshotCorruptionError(err) {
+    if (!err) return false;
+    const s = String(err).trim();
+    if (!s) return false;
+    return !/^NO_[A-Z0-9_]+_SAVED$/i.test(s);
+  }
+
   function renderShadowParity(res) {
     const box = document.getElementById('shadowParityBox');
     if (!box) return;
@@ -1660,7 +1691,11 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
     }
     const sp = res.data || {};
     if (!sp.valid) {
-      box.innerHTML = renderHonestEmpty('no-channel', 'NO_CHANNEL', sp.error || 'Shadow daemon has not written shadow_parity_report.json yet');
+      if (isSnapshotCorruptionError(sp.error)) {
+        box.innerHTML = renderHonestEmpty('upstream-error', 'UPSTREAM_ERROR', String(sp.error));
+      } else {
+        box.innerHTML = renderHonestEmpty('no-channel', 'NO_CHANNEL', sp.error || 'Shadow daemon has not written shadow_parity_report.json yet');
+      }
       return;
     }
     const statusStr = String(sp.status || 'PARITY_OK');
@@ -1680,18 +1715,25 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
       const rowStatusCls = rowStatus === 'PARITY_OK' ? 'ui-pill--ok' : (rowStatus === 'WARN_WIDE_SPREAD' ? 'ui-pill--warn' : 'ui-pill--bad');
       const shRet = numOr(x.shadow_return_pct, 0);
 
+      let driftCellHtml;
+      if (!comparable && absDrift <= 150) {
+        driftCellHtml = '<span class="val-muted" title="' + esc(x.detail || 'Warmup window < 1h') + '">N/A (Warmup)</span>';
+      } else {
+        const warmupSuffix = !comparable ? ' <span class="val-muted">(Warmup)</span>' : '';
+        driftCellHtml =
+          '<div class="ui-meter">' +
+            '<div class="ui-meter__track"><div class="ui-meter__fill ' + driftFill + '" style="width:' + driftPct.toFixed(1) + '%"></div></div>' +
+            '<span class="ui-meter__val ' + driftTextCls + '">' + esc(fmtSigned(drift, 1, ' bp')) + warmupSuffix + '</span>' +
+          '</div>';
+      }
+
       return (
         '<tr>' +
           '<td><strong>' + esc(x.strategy_id) + '</strong><span class="val-muted">@' + esc(x.version) + '</span></td>' +
           '<td><span class="ui-pill ui-pill--info">' + esc(x.plugin_id || '—') + '</span></td>' +
           '<td class="num">' + esc(fmtUsd(x.shadow_equity_usd, 2)) + ' <span class="' + (shRet >= 0 ? 'val-pos' : 'val-neg') + '">(' + esc(fmtSigned(shRet, 2, '%')) + ')</span></td>' +
           '<td class="num">' + (comparable ? esc(fmtSigned(x.backtest_return_pct, 2, '%')) : '<span class="val-muted" title="' + esc(x.detail || 'Warmup window < 1h') + '">N/A (Warmup)</span>') + '</td>' +
-          '<td>' +
-            '<div class="ui-meter">' +
-              '<div class="ui-meter__track"><div class="ui-meter__fill ' + driftFill + '" style="width:' + driftPct.toFixed(1) + '%"></div></div>' +
-              '<span class="ui-meter__val ' + driftTextCls + '">' + esc(fmtSigned(drift, 1, ' bp')) + '</span>' +
-            '</div>' +
-          '</td>' +
+          '<td>' + driftCellHtml + '</td>' +
           '<td class="num">' + esc(fmtNum(x.live_median_half_spread_bps, 2)) + 'bp <span class="ui-pill ' + spreadPillCls + '">' + esc(fmtNum(spreadRatio, 2)) + 'x</span></td>' +
           '<td class="num">' + esc(x.plans_created ?? 0) + ' / ' + esc(x.plans_blocked ?? 0) + '</td>' +
           '<td><span class="ui-pill ' + rowStatusCls + '">' + esc(rowStatus || '—') + '</span></td>' +
@@ -1724,7 +1766,11 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
     }
     const pf = res.data || {};
     if (!pf.valid) {
-      box.innerHTML = renderHonestEmpty('no-channel', 'NO_CHANNEL', pf.error || 'No portfolio report saved yet');
+      if (isSnapshotCorruptionError(pf.error)) {
+        box.innerHTML = renderHonestEmpty('upstream-error', 'UPSTREAM_ERROR', String(pf.error));
+      } else {
+        box.innerHTML = renderHonestEmpty('no-channel', 'NO_CHANNEL', pf.error || 'No portfolio report saved yet');
+      }
       return;
     }
     const projections = Array.isArray(pf.scaling_projections) ? pf.scaling_projections : [];
@@ -1733,13 +1779,15 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
     const sleeveBar = sleeves.length > 0
       ? '<div class="ui-meta-bar">' +
           '<span class="ui-meta-item__k">Sleeves</span>' +
-          sleeves.map(([name, s]) => (
-            '<span class="ui-chip mono">' + esc(name) +
-              ' · w=' + esc(fmtNum(numOr(s.weight_final, 0) * 100, 1)) + '%' +
-              ' · APR ' + esc(fmtNum(s.apr_pct, 1)) + '%' +
-              ' · SR ' + esc(fmtNum(s.sharpe, 2)) +
-            '</span>'
-          )).join('') +
+          sleeves.map(([name, s]) => {
+            const sObj = s && typeof s === 'object' ? s : {};
+            const wNum = parseStrictNum(sObj.weight_final);
+            return '<span class="ui-chip mono">' + esc(name) +
+              ' · w=' + esc(wNum !== null ? (wNum * 100).toFixed(1) : '—') + '%' +
+              ' · APR ' + esc(fmtNum(sObj.apr_pct, 1)) + '%' +
+              ' · SR ' + esc(fmtNum(sObj.sharpe, 2)) +
+            '</span>';
+          }).join('') +
         '</div>'
       : '';
 
@@ -2242,7 +2290,8 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
     const m = res.data || {};
     const roundSpent = Math.max(0, numOr(m.round_spent_usd, 0));
     const roundCap = Math.max(0.01, numOr(m.max_cycle_budget_usd, 0.50));
-    const dailySpent = Math.max(0, Math.max(numOr(m.spent_usd, 0), numOr(m.daily_spent_usd, 0)));
+    const dailyRaw = parseStrictNum(m.daily_spent_usd);
+    const dailySpent = Math.max(0, dailyRaw !== null ? dailyRaw : numOr(m.spent_usd, 0));
     const dailyCap = Math.max(0.01, numOr(m.max_daily_budget_usd, 3.00));
     const roundPct = clampPct((roundSpent / roundCap) * 100);
     const dailyPct = clampPct((dailySpent / dailyCap) * 100);
@@ -2402,7 +2451,7 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
 
       return (
         '<tr>' +
-          '<td><strong>' + esc(x.label || x.node_id || '—') + '</strong>' + (x.primary_role ? '<div class="val-muted" style="font-size:11px">' + esc(x.primary_role) + '</div>' : '') + '</td>' +
+          '<td><strong>' + esc(x.label || x.node_id || '—') + '</strong>' + (x.primary_role ? '<div class="val-muted fleet-role">' + esc(x.primary_role) + '</div>' : '') + '</td>' +
           '<td><code>' + esc(x.ip || '—') + '</code></td>' +
           '<td><span class="ui-pill ' + (up ? 'ui-pill--ok' : 'ui-pill--bad') + '">' + (up ? 'OK' : 'DOWN') + '</span></td>' +
           '<td>' + (up ? renderFleetBar(x.root_disk_pct, fmtNum(x.root_disk_free_gb, 1) + 'GB free') : '<span class="val-muted">—</span>') + '</td>' +
@@ -2612,37 +2661,39 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
         setStrategyInFlight(sid, 'sprint');
         try {
           const sp = await postJson('/api/agent/run-sprint', { strategy_id: sid, max_rounds: maxRounds });
-          const rounds = Array.isArray(sp.rounds) ? sp.rounds : [];
-          const rows = rounds.map((r, i) => {
-            const df = r.diff_scorecard || {};
-            const gv = r.gate_verdict || {};
-            const rt = r.red_team_verdict || {};
-            return (
-              '<tr>' +
-                '<td class="mono">R' + (i + 1) + '</td>' +
-                '<td class="mono">' + esc(r.to_version) + '</td>' +
-                '<td class="num">' + esc(fmtSigned(df.apr_delta_pct, 1, '%')) + '</td>' +
-                '<td class="num">' + esc(gv.passed_count ?? 0) + '/' + esc(gv.total_count ?? 0) + '</td>' +
-                '<td>' + esc(rt.decision || '—') + '</td>' +
-                '<td><span class="ui-pill">' + esc(r.promotion_stage || 'HELD') + '</span></td>' +
-              '</tr>'
-            );
-          }).join('');
-          resEl.innerHTML =
-            '<div class="cycle-detail-kv mono">' +
-              '<span>Rounds: <strong>' + esc(sp.rounds_executed) + '</strong></span>' +
-              '<span>Final: <strong>' + esc(sp.final_version || '—') + '</strong></span>' +
-              '<span>Stage: <strong>' + esc(sp.final_promotion_stage || 'NONE') + '</strong></span>' +
-              '<span>Stop: <code>' + esc(sp.stop_reason || '—') + '</code></span>' +
-            '</div>' +
-            '<div class="ui-table-wrap">' +
-              '<table class="ui-table">' +
-                '<thead><tr><th>#</th><th>Version</th><th class="num">&Delta;APR</th><th class="num">Gates</th><th>Red-Team</th><th>Stage</th></tr></thead>' +
-                '<tbody>' + (rows || '<tr><td colspan="6" class="val-muted">No rounds returned</td></tr>') + '</tbody>' +
-              '</table>' +
-            '</div>';
-          resEl.hidden = false;
-          submitLabel.textContent = 'Run Again';
+          if (!ac.signal.aborted) {
+            const rounds = Array.isArray(sp.rounds) ? sp.rounds : [];
+            const rows = rounds.map((r, i) => {
+              const df = r.diff_scorecard || {};
+              const gv = r.gate_verdict || {};
+              const rt = r.red_team_verdict || {};
+              return (
+                '<tr>' +
+                  '<td class="mono">R' + (i + 1) + '</td>' +
+                  '<td class="mono">' + esc(r.to_version) + '</td>' +
+                  '<td class="num">' + esc(fmtSigned(df.apr_delta_pct, 1, '%')) + '</td>' +
+                  '<td class="num">' + esc(gv.passed_count ?? 0) + '/' + esc(gv.total_count ?? 0) + '</td>' +
+                  '<td>' + esc(rt.decision || '—') + '</td>' +
+                  '<td><span class="ui-pill">' + esc(r.promotion_stage || 'HELD') + '</span></td>' +
+                '</tr>'
+              );
+            }).join('');
+            resEl.innerHTML =
+              '<div class="cycle-detail-kv mono">' +
+                '<span>Rounds: <strong>' + esc(sp.rounds_executed) + '</strong></span>' +
+                '<span>Final: <strong>' + esc(sp.final_version || '—') + '</strong></span>' +
+                '<span>Stage: <strong>' + esc(sp.final_promotion_stage || 'NONE') + '</strong></span>' +
+                '<span>Stop: <code>' + esc(sp.stop_reason || '—') + '</code></span>' +
+              '</div>' +
+              '<div class="ui-table-wrap">' +
+                '<table class="ui-table">' +
+                  '<thead><tr><th>#</th><th>Version</th><th class="num">&Delta;APR</th><th class="num">Gates</th><th>Red-Team</th><th>Stage</th></tr></thead>' +
+                  '<tbody>' + (rows || '<tr><td colspan="6" class="val-muted">No rounds returned</td></tr>') + '</tbody>' +
+                '</table>' +
+              '</div>';
+            resEl.hidden = false;
+            submitLabel.textContent = 'Run Again';
+          }
           showToast({
             level: sp.final_promotion_stage === 'SHADOW_LIVE' ? 'success' : 'info',
             title: 'Sprint Completed (' + sid + ')',
@@ -2650,9 +2701,14 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
           });
           await refreshAll();
         } catch (err) {
-          setDlgError(err && err.message ? err.message : 'Sprint request failed');
+          const msg = err && err.message ? err.message : 'Sprint request failed';
+          if (!ac.signal.aborted) {
+            setDlgError(msg);
+          } else {
+            showToast({ level: 'error', title: 'Sprint Failed (' + sid + ')', message: msg });
+          }
         } finally {
-          setDlgLoading(false);
+          if (!ac.signal.aborted) setDlgLoading(false);
           setStrategyInFlight(sid, '');
         }
       };
@@ -2676,6 +2732,16 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
           '<span class="ui-dialog__hint">Evaluates live BBO tick window against assumed slippage &amp; dual-layer early-kill guard.</span>' +
         '</div>';
 
+      const microInp = document.getElementById('dlgMicroHours');
+      if (microInp) {
+        microInp.addEventListener('input', () => {
+          const val = microInp.value.trim();
+          contentEl.querySelectorAll('[data-action="micro-preset"]').forEach((b) => {
+            b.setAttribute('aria-pressed', b.dataset.hours === val ? 'true' : 'false');
+          });
+        }, { signal: ac.signal });
+      }
+
       onSubmit = async () => {
         setDlgError('');
         const raw = document.getElementById('dlgMicroHours').value;
@@ -2688,7 +2754,7 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
         setStrategyInFlight(sid, 'micro');
         try {
           const d = await postJson('/api/micro-runs/evaluate', { strategy_id: sid, target_hours: hours });
-          closeActionDialog(prevFocus);
+          if (!ac.signal.aborted) closeActionDialog(prevFocus);
           showToast({
             level: d.status === 'COMPLETED_PASS' ? 'success' : (d.status === 'KILLED_EARLY' ? 'error' : 'info'),
             title: 'MicroRun ' + (d.run_id || 'Done') + ' (' + sid + ')',
@@ -2700,9 +2766,14 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
           });
           await refreshAll();
         } catch (err) {
-          setDlgError(err && err.message ? err.message : 'MicroRun evaluation failed');
+          const msg = err && err.message ? err.message : 'MicroRun evaluation failed';
+          if (!ac.signal.aborted) {
+            setDlgError(msg);
+          } else {
+            showToast({ level: 'error', title: 'MicroRun Failed (' + sid + ')', message: msg });
+          }
         } finally {
-          setDlgLoading(false);
+          if (!ac.signal.aborted) setDlgLoading(false);
           setStrategyInFlight(sid, '');
         }
       };
@@ -2713,7 +2784,7 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
       contentEl.innerHTML =
         '<div class="ui-dialog__field">' +
           '<label class="ui-dialog__label" for="dlgRollbackSelect"><span>Registered Versions</span><span id="dlgRollbackVerBadge" class="ui-pill">Loading...</span></label>' +
-          '<select id="dlgRollbackSelect" class="ui-select mono"></select>' +
+          '<select id="dlgRollbackSelect" name="target_version" class="ui-select mono"></select>' +
         '</div>' +
         '<div class="ui-dialog__field">' +
           '<label class="ui-dialog__label" for="dlgRollbackManual"><span>Manual Version Override (optional)</span></label>' +
@@ -2725,7 +2796,7 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
         '</div>' +
         '<div class="ui-dialog__field">' +
           '<label class="ui-dialog__label" for="dlgRollbackToken"><span>Human Approval Token</span><span id="dlgTokenReqBadge" class="ui-pill">OPTIONAL</span></label>' +
-          '<input id="dlgRollbackToken" class="ui-input mono" type="text" autocomplete="off" placeholder="HUMAN_APPROVED:OPS-2026-01"/>' +
+          '<input id="dlgRollbackToken" name="human_approval_token" class="ui-input mono" type="text" autocomplete="off" placeholder="HUMAN_APPROVED:OPS-2026-01"/>' +
           '<span class="ui-dialog__hint">Format: <code>^HUMAN_APPROVED:[A-Za-z0-9._-]{4,64}$</code>. Required when target version status is CANARY / CANARY_APPROVED / LIVE.</span>' +
         '</div>';
 
@@ -2814,7 +2885,7 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
         setStrategyInFlight(sid, 'rollback');
         try {
           const d = await postJson('/api/strategies/rollback', payload);
-          closeActionDialog(prevFocus);
+          if (!ac.signal.aborted) closeActionDialog(prevFocus);
           showToast({
             level: 'success',
             title: 'Rollback Succeeded (' + sid + ')',
@@ -2822,9 +2893,14 @@ dialog.ui-dialog::backdrop { background: var(--bg-scrim); }
           });
           await refreshAll();
         } catch (err) {
-          setDlgError(err && err.message ? err.message : 'Rollback failed');
+          const msg = err && err.message ? err.message : 'Rollback failed';
+          if (!ac.signal.aborted) {
+            setDlgError(msg);
+          } else {
+            showToast({ level: 'error', title: 'Rollback Failed (' + sid + ')', message: msg });
+          }
         } finally {
-          setDlgLoading(false);
+          if (!ac.signal.aborted) setDlgLoading(false);
           setStrategyInFlight(sid, '');
         }
       };
@@ -2957,7 +3033,10 @@ class ConsoleAppContext:
         if not snap.exists():
             return {"nodes_total": 0, "nodes_reachable": 0, "p0_alerts": 0, "p1_alerts": 0, "nodes": []}
         try:
-            return json.loads(snap.read_text(encoding="utf-8"))
+            data = json.loads(snap.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"nodes_total": 0, "nodes_reachable": 0, "nodes": [], "error": "INVALID_SNAPSHOT_TYPE"}
+            return data
         except (OSError, json.JSONDecodeError):
             return {"nodes_total": 0, "nodes_reachable": 0, "nodes": [], "error": "UNREADABLE_SNAPSHOT"}
 
@@ -3019,7 +3098,10 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
             bind_host = str(self.server.server_address[0])
             if bind_host not in LOOPBACK_HOSTS:
                 return True
-            host_hdr = (self.headers.get("Host") or "").strip()
+            hosts = self.headers.get_all("Host") or []
+            if len(hosts) > 1:
+                return False
+            host_hdr = (hosts[0] if hosts else "").strip()
             if not host_hdr:
                 return True
             return bool(re.fullmatch(r"(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?", host_hdr, re.IGNORECASE))
@@ -3037,12 +3119,12 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
             raw_len = cl_all[0] if cl_all else None
             if raw_len is None:
                 return b"", None, None
-            try:
-                length = int(raw_len.strip())
-            except ValueError:
-                return None, 400, "INVALID_CONTENT_LENGTH"
-            if length < 0:
+            stripped = raw_len.strip()
+            if stripped.startswith("-"):
                 return None, 400, "NEGATIVE_CONTENT_LENGTH"
+            if not re.fullmatch(r"[0-9]+", stripped):
+                return None, 400, "INVALID_CONTENT_LENGTH"
+            length = int(stripped)
             if length > MAX_BODY_BYTES:
                 return None, 413, f"PAYLOAD_TOO_LARGE_MAX_{MAX_BODY_BYTES}"
             return self.rfile.read(length), None, None
@@ -3148,7 +3230,11 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
                 if ctype != "application/json":
                     self._send_json(415, {"error": "UNSUPPORTED_MEDIA_TYPE_REQUIRE_APPLICATION_JSON"})
                     return
-                origin = (self.headers.get("Origin") or "").strip()
+                origins = self.headers.get_all("Origin") or []
+                if len(origins) > 1:
+                    self._send_json(403, {"error": "FORBIDDEN_ORIGIN"})
+                    return
+                origin = (origins[0] if origins else "").strip()
                 if origin and not LOOPBACK_ORIGIN_RE.fullmatch(origin):
                     self._send_json(403, {"error": "FORBIDDEN_ORIGIN"})
                     return
@@ -3168,8 +3254,12 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
 
                 if path == "/api/agent/run-cycle":
                     sid = str(payload.get("strategy_id", "")).strip()
-                    next_ver = str(payload.get("next_version", f"v-{utc_now_ms()}")).strip()
-                    if not next_ver or len(next_ver) > 64 or any(ord(ch) < 32 for ch in next_ver):
+                    raw_next_ver = payload.get("next_version", f"v-{utc_now_ms()}")
+                    if not isinstance(raw_next_ver, str) or any(ord(ch) < 32 for ch in raw_next_ver):
+                        self._send_json(400, {"error": "INVALID_NEXT_VERSION"})
+                        return
+                    next_ver = raw_next_ver.strip()
+                    if not next_ver or len(next_ver) > 64:
                         self._send_json(400, {"error": "INVALID_NEXT_VERSION"})
                         return
                     try:
@@ -3206,10 +3296,18 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
                 if path == "/api/micro-runs/evaluate":
                     sid = str(payload.get("strategy_id", "")).strip()
                     raw_h = payload.get("target_hours", 24.0)
-                    if isinstance(raw_h, bool) or not isinstance(raw_h, (int, float)) or not math.isfinite(float(raw_h)) or float(raw_h) <= 0.0:
+                    if isinstance(raw_h, bool) or not isinstance(raw_h, (int, float)):
                         self._send_json(400, {"error": "INVALID_TARGET_HOURS"})
                         return
-                    target_h = min(720.0, float(raw_h))
+                    try:
+                        fh = float(raw_h)
+                    except OverflowError:
+                        self._send_json(400, {"error": "INVALID_TARGET_HOURS"})
+                        return
+                    if not math.isfinite(fh) or fh <= 0.0:
+                        self._send_json(400, {"error": "INVALID_TARGET_HOURS"})
+                        return
+                    target_h = min(720.0, fh)
                     try:
                         cfg = ctx.config_store.read_active(sid)
                     except ValueError as exc:
@@ -3227,14 +3325,17 @@ def _make_handler(ctx: ConsoleAppContext) -> type[BaseHTTPRequestHandler]:
                     target_ver = str(payload.get("target_version", "")).strip()
                     reason = str(payload.get("reason", "Manual console rollback")).strip()
                     token = payload.get("human_approval_token")
-                    token_s = str(token).strip() if token is not None else None
+                    if token is not None and not isinstance(token, str):
+                        self._send_json(403, {"error": "INVALID_HUMAN_APPROVAL_TOKEN_TYPE"})
+                        return
+                    token_s = token if token else None
                     try:
                         cfg = ctx.config_store.rollback(
                             sid,
                             target_ver,
                             actor="console-operator",
                             reason=reason,
-                            human_approval_token=token_s or None,
+                            human_approval_token=token_s,
                         )
                     except PermissionError as exc:
                         self._send_json(403, {"error": str(exc)})

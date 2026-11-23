@@ -749,6 +749,102 @@ class TestConsoleV22Endpoints(unittest.TestCase):
         self.assertIn("avg_latency_ms", mk["bbo_ticks"][0])
         self.assertAlmostEqual(float(mk["bbo_ticks"][0]["avg_latency_ms"]), 12.5, places=1)
 
+    def test_r2_security_hardening_and_std37_regressions(self) -> None:
+        import socket
+
+        # 1. Rollback token newline / whitespace / non-string rejection on CANARY_APPROVED
+        self.ctx.config_store.register_version(self._make_cfg("rb_r2", "v1.0", "SHADOW_LIVE"), actor="unit", reason="v1")
+        self.ctx.config_store.register_version(
+            self._make_cfg("rb_r2", "v2.0", "CANARY_APPROVED"),
+            actor="owner",
+            reason="v2 canary",
+            human_approval_token="HUMAN_APPROVED:SEED-R2",
+        )
+        self.ctx.config_store.rollback("rb_r2", "v1.0", actor="unit", reason="activate v1")
+
+        for bad_tok in ("HUMAN_APPROVED:ABCD\n", "HUMAN_APPROVED:ABCD\r\n", " HUMAN_APPROVED:ABCD ", 12345):
+            st, _, _ = self._post_json(
+                "/api/strategies/rollback",
+                {"strategy_id": "rb_r2", "target_version": "v2.0", "human_approval_token": bad_tok},
+            )
+            self.assertEqual(st, 403, f"Expected 403 for token {bad_tok!r}, got {st}")
+
+        # 2. Huge int target_hours returns 400 (not 500 OverflowError)
+        st_ovf, _, data_ovf = self._post_json(
+            "/api/micro-runs/evaluate",
+            {"strategy_id": "rb_r2", "target_hours": int("9" * 400)},
+        )
+        self.assertEqual(st_ovf, 400)
+        self.assertEqual(data_ovf["error"], "INVALID_TARGET_HOURS")
+
+        # 3. Trailing newline in next_version returns 400
+        st_nv, _, data_nv = self._post_json(
+            "/api/agent/run-cycle",
+            {"strategy_id": "rb_r2", "next_version": "v-newline\n"},
+        )
+        self.assertEqual(st_nv, 400)
+        self.assertEqual(data_nv["error"], "INVALID_NEXT_VERSION")
+
+        # 4. Duplicate Host / Origin headers & non-RFC Content-Length rejected via raw socket
+        def _raw_http(req: bytes) -> int:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5.0) as sock:
+                sock.sendall(req)
+                resp = sock.recv(4096).decode("latin1", errors="replace")
+                return int(resp.split(" ", 2)[1])
+
+        self.assertEqual(
+            _raw_http(
+                f"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nHost: evil.example\r\nConnection: close\r\n\r\n".encode()
+            ),
+            403,
+        )
+        body = b'{"strategy_id":"rb_r2","target_version":"v1.0"}'
+        self.assertEqual(
+            _raw_http(
+                (
+                    f"POST /api/strategies/rollback HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+                    f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+                    f"Origin: http://127.0.0.1:{self.port}\r\nOrigin: https://evil.example\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode()
+                + body
+            ),
+            403,
+        )
+        self.assertEqual(
+            _raw_http(
+                (
+                    f"POST /api/strategies/rollback HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+                    f"Content-Type: application/json\r\nContent-Length: +2\r\nConnection: close\r\n\r\n{{}}"
+                ).encode()
+            ),
+            400,
+        )
+        self.assertEqual(
+            _raw_http(
+                (
+                    f"POST /api/strategies/rollback HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+                    f"Content-Type: application/json\r\nContent-Length: 1_0\r\nConnection: close\r\n\r\n{{\"x\":1234}}"
+                ).encode()
+            ),
+            400,
+        )
+
+        # 5. Non-dict fleet_snapshot.json handled cleanly
+        fleet_dir = self.ctx.data_dir / "fleet_audit"
+        fleet_dir.mkdir(parents=True, exist_ok=True)
+        (fleet_dir / "fleet_snapshot.json").write_text("[]", encoding="utf-8")
+        st_fl, _, raw_fl = self._request("GET", "/api/fleet/audit")
+        self.assertEqual(st_fl, 200)
+        self.assertEqual(json.loads(raw_fl.decode("utf-8")).get("error"), "INVALID_SNAPSHOT_TYPE")
+
+        # 6. Static checks for Round 2 UI fixes
+        self.assertIn("function parseStrictNum(", CONSOLE_HTML)
+        self.assertIn("function isSnapshotCorruptionError(", CONSOLE_HTML)
+        self.assertIn("if (!ac.signal.aborted)", CONSOLE_HTML)
+        self.assertIn("linear-gradient(var(--color-loss-tint), var(--color-loss-tint)), var(--bg-surface)", CONSOLE_HTML)
+        self.assertIn("label: 'Strategies', value: '—', stateAttr: 'no-channel'", CONSOLE_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()
