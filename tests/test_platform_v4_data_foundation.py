@@ -1766,6 +1766,91 @@ class TestPlatformV4DataFoundation(unittest.TestCase):
             finally:
                 router.close()
 
+    def test_phase_b1_duckdb_temp_table_materialization_and_obs02_path_literal_guard(self) -> None:
+        """Phase B1 (REV-017 + OBS-02): TEMP TABLE materialization before sandbox lock & FROM/JOIN path block."""
+        # 1. OBS-02 static guard blocks quoted file-path literals after FROM / JOIN
+        for attack_sql in (
+            "SELECT * FROM '/etc/passwd'",
+            "SELECT * FROM \"/etc/passwd\"",
+            "SELECT * FROM web3_bars JOIN '/tmp/leak.parquet' ON 1=1",
+            "SELECT * FROM web3_bars LEFT JOIN '/etc/hosts' AS h ON 1=1",
+            "WITH x AS (SELECT * FROM '/var/secret.csv') SELECT * FROM x",
+        ):
+            with self.assertRaises(ValueError, msg=f"OBS-02 must reject path literal SQL: {attack_sql}"):
+                validate_readonly_sql(attack_sql)
+
+        # Legitimate string predicates in WHERE remain permitted
+        validate_readonly_sql("SELECT COUNT(*) AS n FROM web3_bars WHERE symbol = 'BTC' AND venue = 'hyperliquid'")
+        validate_readonly_sql("WITH cte AS (SELECT symbol, close FROM web3_bars WHERE symbol = 'ETH') SELECT COUNT(*) FROM cte")
+
+        # 2. Verify CREATE TEMP TABLE materialization runs strictly BEFORE SET enable_external_access = false
+        with tempfile.TemporaryDirectory(prefix="phase_b1_duckdb_") as td, DataFoundationRouter(Path(td) / "v4") as router:
+            pt = PAXGBasisPoint(
+                venue_perp="hyperliquid", venue_spot="binance_spot", ref_tradfi_symbol="GC=F",
+                timeframe_sec=14_400, ts_event_ms=BASE_2025_MS, ts_avail_ms=BASE_2025_MS + 4 * HOUR_MS,
+                paxg_perp_close=3000.0, paxg_spot_close=2998.0, gc_ref_close=2995.0,
+            )
+            router.upsert_paxg_basis([pt])
+            router.export_domain_partition("gold_macro", fmt="jsonl.gz")
+
+            # Empty jsonl.gz files must be skipped gracefully rather than crashing DuckDB schema inference
+            executed_sqls: list[str] = []
+
+            class _FakeCur:
+                description = [("c",)]
+
+                @staticmethod
+                def fetchall() -> list[tuple[int]]:
+                    return [(1,)]
+
+            class _FakeDuckCon:
+                def execute(self, sql_text: str, *args: Any) -> _FakeCur:
+                    if args:
+                        raise AssertionError("DuckDB DDL must not use positional ? params")
+                    executed_sqls.append(sql_text)
+                    return _FakeCur()
+
+                def close(self) -> None:
+                    return None
+
+            class _FakeDuckMod:
+                @staticmethod
+                def connect(target: str) -> _FakeDuckCon:
+                    assert target == ":memory:"
+                    return _FakeDuckCon()
+
+            with patch.object(_router_mod, "_HAS_DUCKDB", True), patch.object(_router_mod, "duckdb", _FakeDuckMod):
+                res = router.query_domain_readonly_duckdb(
+                    "gold_macro",
+                    "SELECT COUNT(*) AS c FROM paxg_basis_arbitration",
+                )
+            self.assertEqual(res, [{"c": 1}])
+            self.assertIn("SET enable_external_access = false", executed_sqls)
+            lock_idx = executed_sqls.index("SET enable_external_access = false")
+            pre_lock_sqls = executed_sqls[:lock_idx]
+            self.assertGreater(len(pre_lock_sqls), 0)
+            for ddl in pre_lock_sqls:
+                self.assertIn("CREATE TEMP TABLE ", ddl)
+                self.assertNotIn("CREATE OR REPLACE VIEW", ddl)
+            self.assertTrue(any("paxg_basis_arbitration" in ddl for ddl in pre_lock_sqls))
+            # Empty tables (zero rows -> 0-byte uncompressed jsonl.gz) were cleanly skipped
+            self.assertFalse(any("macro_events" in ddl for ddl in pre_lock_sqls))
+            self.assertEqual(executed_sqls[lock_idx + 1], "SELECT COUNT(*) AS c FROM paxg_basis_arbitration")
+
+            # 3. Incremental re-export replaces superseded dataset_manifests rows 1:1 with on-disk SHA-256
+            pt2 = PAXGBasisPoint(
+                venue_perp="hyperliquid", venue_spot="binance_spot", ref_tradfi_symbol="GC=F",
+                timeframe_sec=14_400, ts_event_ms=BASE_2025_MS + 4 * HOUR_MS, ts_avail_ms=BASE_2025_MS + 8 * HOUR_MS,
+                paxg_perp_close=3005.0, paxg_spot_close=3002.0, gc_ref_close=3000.0,
+            )
+            router.upsert_paxg_basis([pt2])
+            router.export_domain_partition("gold_macro", fmt="jsonl.gz")
+            manifests = router.list_dataset_manifests("gold_macro")
+            rel_paths = [m["rel_path"] for m in manifests]
+            self.assertEqual(len(rel_paths), len(set(rel_paths)), "Stale duplicate rel_path in dataset_manifests")
+            for m in manifests:
+                self.assertEqual(sha256_file(router.base_dir / m["rel_path"]), m["sha256"])
+
 
 if __name__ == "__main__":
     unittest.main()

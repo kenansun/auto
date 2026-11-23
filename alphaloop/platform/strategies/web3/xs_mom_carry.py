@@ -200,6 +200,8 @@ class Web3XSMomCarryKernel:
         funding_penalty_weight: float = 0.35,
         oi_confirm_weight: float = 0.25,
         score_ema_alpha: float = 0.35,
+        rebalance_every_bars: int = 1,
+        rank_hysteresis: int = 0,
         pit_listing_dates: dict[str, int] | None = None,
         metrics_by_symbol: dict[str, Sequence[Web3DerivativesMetric]] | None = None,
         regime_engine: Web3MarketRegimeEngine | None = None,
@@ -216,6 +218,8 @@ class Web3XSMomCarryKernel:
         self.funding_penalty_weight = _clamp(float(funding_penalty_weight), 0.0, 2.0)
         self.oi_confirm_weight = _clamp(float(oi_confirm_weight), 0.0, 2.0)
         self.score_ema_alpha = _clamp(float(score_ema_alpha), 0.05, 1.0)
+        self.rebalance_every_bars = max(1, int(rebalance_every_bars))
+        self.rank_hysteresis = max(0, int(rank_hysteresis))
 
         merged_listings = dict(DEFAULT_WEB3_PIT_LISTING_DATES)
         if pit_listing_dates:
@@ -279,6 +283,8 @@ class Web3XSMomCarryKernel:
             funding_penalty_weight=self.funding_penalty_weight,
             oi_confirm_weight=self.oi_confirm_weight,
             score_ema_alpha=self.score_ema_alpha,
+            rebalance_every_bars=self.rebalance_every_bars,
+            rank_hysteresis=self.rank_hysteresis,
             pit_listing_dates=dict(self.pit_listing_dates),
             metrics_by_symbol=self._raw_metrics_ref,
             regime_engine=self._external_regime_template,
@@ -525,7 +531,7 @@ class Web3XSMomCarryKernel:
             fund_score_map[sym] = fund_comp
             oi_score_map[sym] = oi_comp
 
-        # 6. Rank top-K long / bottom-K short cleanly without overlap
+        # 6. Rank top-K long / bottom-K short cleanly without overlap (with optional rank hysteresis)
         n_elig = len(eligible_syms)
         ranked_desc = sorted(eligible_syms, key=lambda s: (-scores[s], s))
         if n_elig == 1:
@@ -535,8 +541,37 @@ class Web3XSMomCarryKernel:
             eff_top = min(self.top_k, max(1, n_elig // 2))
             eff_bot = min(self.bottom_k, max(0, n_elig - eff_top))
 
-        long_syms = ranked_desc[:eff_top]
-        short_syms = ranked_desc[n_elig - eff_bot :] if eff_bot > 0 else []
+        if self.rank_hysteresis > 0 and n_elig > eff_top + eff_bot:
+            rank_pos = {s: idx for idx, s in enumerate(ranked_desc)}
+            # Retain currently held longs that stay within top (eff_top + hysteresis) band
+            held_longs = [
+                s for s in ranked_desc
+                if self._executed_weights.get(s, 0.0) > 1e-6 and rank_pos[s] < eff_top + self.rank_hysteresis
+            ]
+            long_syms = list(held_longs[:eff_top])
+            for s in ranked_desc:
+                if len(long_syms) >= eff_top:
+                    break
+                if s not in long_syms:
+                    long_syms.append(s)
+
+            long_set = set(long_syms)
+            bot_cutoff = max(eff_top, n_elig - eff_bot - self.rank_hysteresis)
+            held_shorts = [
+                s for s in reversed(ranked_desc)
+                if s not in long_set
+                and self._executed_weights.get(s, 0.0) < -1e-6
+                and rank_pos[s] >= bot_cutoff
+            ]
+            short_syms = list(held_shorts[:eff_bot])
+            for s in reversed(ranked_desc):
+                if len(short_syms) >= eff_bot:
+                    break
+                if s not in long_set and s not in short_syms:
+                    short_syms.append(s)
+        else:
+            long_syms = ranked_desc[:eff_top]
+            short_syms = ranked_desc[n_elig - eff_bot :] if eff_bot > 0 else []
 
         long_budget, short_budget = self._regime_leg_budgets(regime_label, exposure_scalar)
         desired_weights: dict[str, float] = {sym: 0.0 for sym in crypto_bars}
@@ -556,24 +591,36 @@ class Web3XSMomCarryKernel:
                 w_share = 0.50 * (1.0 / len(short_syms)) + 0.50 * (inv_vols_s[s] / max(sum_iv_s, 1e-12))
                 desired_weights[s] = -short_budget * w_share
 
-        # 7. Apply Carver inertia buffer using synced post-allocator weights
+        # 7. Optional scheduled rebalance cadence + Carver inertia buffer using synced post-allocator weights
         final_weights: dict[str, float] = {}
         inertia_held_map: dict[str, bool] = {}
 
-        for sym in sorted(crypto_bars):
-            des_w = desired_weights[sym]
-            prev_w = self._executed_weights.get(sym, 0.0)
-            # Never hold through exits (des_w == 0) or sign flips
-            if abs(prev_w) > 1e-9 and prev_w * des_w > 0.0 and self.inertia_buffer > 0.0:
-                band = max(0.012, self.inertia_buffer * max(abs(des_w), abs(prev_w)))
-                if abs(des_w - prev_w) <= band:
-                    final_weights[sym] = prev_w
-                    inertia_held_map[sym] = True
-                    continue
-            final_weights[sym] = des_w
-            inertia_held_map[sym] = False
+        has_any_held = any(abs(self._executed_weights.get(sym, 0.0)) > 1e-9 for sym in crypto_bars)
+        is_rebalance_bar = (
+            self.rebalance_every_bars <= 1
+            or not has_any_held
+            or ((self._step_count - self.warmup_bars) % self.rebalance_every_bars == 0)
+        )
 
-        # Guarantee market-neutrality ceiling in RISK_OFF_BEAR even after inertia
+        if not is_rebalance_bar:
+            for sym in sorted(crypto_bars):
+                final_weights[sym] = self._executed_weights.get(sym, 0.0)
+                inertia_held_map[sym] = True
+        else:
+            for sym in sorted(crypto_bars):
+                des_w = desired_weights[sym]
+                prev_w = self._executed_weights.get(sym, 0.0)
+                # Never hold through exits (des_w == 0) or sign flips
+                if abs(prev_w) > 1e-9 and prev_w * des_w > 0.0 and self.inertia_buffer > 0.0:
+                    band = max(0.012, self.inertia_buffer * max(abs(des_w), abs(prev_w)))
+                    if abs(des_w - prev_w) <= band:
+                        final_weights[sym] = prev_w
+                        inertia_held_map[sym] = True
+                        continue
+                final_weights[sym] = des_w
+                inertia_held_map[sym] = False
+
+        # Guarantee market-neutrality ceiling in RISK_OFF_BEAR even on off-cadence/inertia bars
         if regime_label == WEB3_REGIME_RISK_OFF_BEAR:
             gross_now = math.fsum(abs(w) for w in final_weights.values())
             net_now = math.fsum(final_weights.values())

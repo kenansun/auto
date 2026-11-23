@@ -2674,6 +2674,30 @@ def _populate_clean_clone_v4_lake(dst_dir: Path) -> Path:
                         source_fingerprint=f"clean_clone_sandbox:web3:{sym}",
                     )
                 )
+                # Matching Binance Spot 12h bar with small mean-reverting basis for W3-DN dual-leg tests
+                basis_bps = 6.0 * math.sin(2.0 * math.pi * i / 30.0 + phase)
+                s_mult = 1.0 / (1.0 + basis_bps / 10_000.0)
+                w3_bars.append(
+                    models_mod.CanonicalBar(
+                        asset_class=assets_mod.ASSET_CLASS_CRYPTO_SPOT,
+                        venue="binance_spot",
+                        symbol=sym,
+                        timeframe_h=12.0,
+                        timeframe_sec=43_200,
+                        ts_event_ms=ts_ev,
+                        ts_avail_ms=ts_av,
+                        open=round(o * s_mult, 4),
+                        high=round(hi * s_mult, 4),
+                        low=round(lo * s_mult, 4),
+                        close=round(c * s_mult, 4),
+                        volume_usd=round(80_000_000.0 * (1.0 + 0.25 * math.sin(i / 17.0)), 2),
+                        carry_rate_period=0.0,
+                        carry_interval_h=12.0,
+                        spread_bps=1.5,
+                        provenance=prov_syn,
+                        source_fingerprint=f"clean_clone_sandbox:binance_spot:{sym}:12h",
+                    )
+                )
                 px = c
         router.upsert_bars("web3", w3_bars, allow_synthetic_in_test=True)
 

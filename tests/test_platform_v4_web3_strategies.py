@@ -29,9 +29,12 @@ from typing import Any, Sequence
 from alphaloop.core.provenance import PROVENANCE_REAL
 from alphaloop.platform.assets import (
     ASSET_CLASS_CRYPTO_PERP,
+    ASSET_CLASS_CRYPTO_SPOT,
     ASSET_CLASS_MACRO_INDEX,
     AssetSpec,
     CALENDAR_CRYPTO_24_7,
+    COST_BINANCE_SPOT,
+    COST_HYPERLIQUID_PERP,
     CostModel,
     WEB3_LIQUID_UNIVERSE,
     default_web3_specs,
@@ -49,14 +52,21 @@ from alphaloop.platform.data_foundation.models import (
 )
 from alphaloop.platform.data_foundation.router import DataFoundationRouter
 from alphaloop.platform.strategies.web3 import (
+    DN_REGIME_ACTIVE,
+    DN_REGIME_BASIS_STOP,
+    DN_REGIME_DVOL_THROTTLED,
+    DN_REGIME_MARGIN_STORM_EXIT,
+    DN_REGIME_SUB_FLOOR,
     HYPE_PIT_LISTING_MS,
     WEB3_REGIME_ALT_SEASON,
     WEB3_REGIME_EXPANSION,
     WEB3_REGIME_RISK_OFF_BEAR,
     Web3AdaptiveTrendKernel,
+    Web3DeltaNeutralCarryKernel,
     Web3MarketRegimeEngine,
     Web3RegimeCarryKernel,
     Web3XSMomCarryKernel,
+    build_dual_leg_carry_universe,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -850,6 +860,299 @@ class TestRealLakeWeb3SmokeAndParity(unittest.TestCase):
             self.assertEqual(res_w1_full.liquidation_count, 0)
             self.assertTrue(math.isfinite(res_w1_full.cagr_pct))
             self.assertTrue(math.isfinite(res_w1_full.sharpe_ratio))
+
+            # Phase B W3-DN real Spot+Perp smoke & G7 parity when Binance Spot bars exist in lake
+            spot_hl = {c: router.load_bars("web3", "binance_spot", c, 43200) for c in majors}
+            if all(len(v) >= 400 for v in spot_hl.values()):
+                specs_dn, bars_dn = build_dual_leg_carry_universe(
+                    spot_hl, {c: bars_12h[c] for c in majors}, spot_venue="binance_spot", perp_venue="hyperliquid"
+                )
+                bars_dn_mid = {s: bl[-360:] for s, bl in bars_dn.items()}
+                cfg_dn = RiskAllocatorConfig(
+                    max_positions=8,
+                    target_annual_vol_pct=45.0,
+                    max_portfolio_leverage=1.30,
+                    max_single_weight=0.35,
+                    use_correlation_idm=False,
+                )
+                k_dn = Web3DeltaNeutralCarryKernel(
+                    max_spot_gross=0.65,
+                    max_pair_leg_weight=0.35,
+                    dvol_series=dvol,
+                )
+                res_dn = acct.simulate(k_dn.clone_fresh(), specs_dn, bars_dn_mid, risk_cfg=cfg_dn)
+                self.assertEqual(res_dn.liquidation_count, 0)
+                self.assertTrue(math.isfinite(res_dn.cagr_pct))
+                for _ts, wh in res_dn.allocated_weights_history:
+                    for c in majors:
+                        self.assertAlmostEqual(
+                            wh.get(f"{c}_SPOT", 0.0) + wh.get(f"{c}_PERP", 0.0),
+                            0.0,
+                            places=10,
+                            msg=f"W3-DN violated atomic delta neutrality on {c}",
+                        )
+                rep_dn = verify_full_parity(
+                    k_dn.clone_fresh(), specs_dn, bars_dn_mid, risk_cfg=cfg_dn, batch_result=res_dn
+                )
+                self.assertTrue(rep_dn.passed, f"W3-DN real-lake G7 parity failed: {rep_dn.detail}")
+                self.assertLessEqual(rep_dn.max_abs_weight_delta, 1e-10)
+                self.assertLessEqual(rep_dn.max_abs_equity_delta, 1e-8)
+
+
+class TestPhaseBWeb3DeltaNeutralAndW1Upgrades(unittest.TestCase):
+    """Phase B unit, adversarial & G7 parity tests for W3-DN dual-leg carry and W1 turnover guards."""
+
+    def _make_dual_leg_bars(
+        self,
+        n: int = 160,
+        *,
+        carry_rates: Sequence[float] | None = None,
+        basis_bps_series: Sequence[float] | None = None,
+        coins: Sequence[str] = ("BTC", "ETH"),
+    ) -> tuple[dict[str, AssetSpec], dict[str, list[CanonicalBar]]]:
+        spot_by_coin: dict[str, list[CanonicalBar]] = {}
+        perp_by_coin: dict[str, list[CanonicalBar]] = {}
+        for idx, coin in enumerate(coins):
+            closes_s = _trending_closes(n, start=100.0 * (idx + 1), step_ret=0.001, noise_std=0.015, seed=70 + idx)
+            b_series = basis_bps_series if basis_bps_series is not None else [5.0 * math.sin(i / 8.0) for i in range(n)]
+            closes_p = [cs * (1.0 + float(b_series[i]) / 10_000.0) for i, cs in enumerate(closes_s)]
+            c_rates = carry_rates if carry_rates is not None else [0.00035] * n  # ~25.55% APR (> 3x 34bps floor over 21d)
+            spot_by_coin[coin] = _make_bar_series(
+                symbol=coin,
+                closes=closes_s,
+                timeframe_h=12.0,
+                venue="binance_spot",
+                asset_class=ASSET_CLASS_CRYPTO_SPOT,
+                carry_rates=[0.0] * n,
+                carry_interval_h=12.0,
+            )
+            perp_by_coin[coin] = _make_bar_series(
+                symbol=coin,
+                closes=closes_p,
+                timeframe_h=12.0,
+                venue="hyperliquid",
+                asset_class=ASSET_CLASS_CRYPTO_PERP,
+                carry_rates=c_rates,
+                carry_interval_h=12.0,
+            )
+        return build_dual_leg_carry_universe(
+            spot_by_coin,
+            perp_by_coin,
+            spot_venue="binance_spot",
+            perp_venue="hyperliquid",
+            spot_cost_model=COST_BINANCE_SPOT,
+            perp_cost_model=COST_HYPERLIQUID_PERP,
+        )
+
+    def test_w3_dn_atomic_delta_neutrality_unpaired_suppression_and_g7_parity(self) -> None:
+        specs, bars = self._make_dual_leg_bars(n=180, coins=("BTC", "ETH"))
+        cfg = RiskAllocatorConfig(
+            max_positions=6,
+            target_annual_vol_pct=45.0,
+            max_portfolio_leverage=1.30,
+            max_single_weight=0.40,
+            use_correlation_idm=False,
+        )
+        acct = PortfolioAccountingEngine()
+        kernel = Web3DeltaNeutralCarryKernel(
+            warmup_bars=8,
+            hold_horizon_days=21.0,
+            cost_floor_multiplier=3.0,
+            exit_apr_pct=2.0,
+            max_spot_gross=0.65,
+            max_pair_leg_weight=0.35,
+        )
+
+        # Verify unpaired single leg & non-crypto bar are strictly suppressed to 0.0
+        probe = kernel.clone_fresh()
+        t0 = bars["BTC_SPOT"][0].ts_event_ms
+        non_crypto = CanonicalBar(
+            asset_class=ASSET_CLASS_MACRO_INDEX,
+            venue="yahoo",
+            symbol="GLD_SPOT",
+            timeframe_h=12.0,
+            ts_event_ms=t0,
+            ts_avail_ms=t0 + 12 * HOUR_MS,
+            open=200.0,
+            high=201.0,
+            low=199.0,
+            close=200.5,
+            volume_usd=1e7,
+            provenance=PROVENANCE_REAL,
+        )
+        decs_unpaired = probe.on_bar_step(
+            t0,
+            {"BTC_SPOT": bars["BTC_SPOT"][0], "SOL_PERP": bars["BTC_PERP"][0], "GLD_SPOT": non_crypto},
+        )
+        for s_chk in ("BTC_SPOT", "SOL_PERP", "GLD_SPOT"):
+            self.assertEqual(decs_unpaired[s_chk].target_weight, 0.0)
+
+        # Full simulation: exact w_spot + w_perp == 0.0, positive funding & net P&L, D7 VIX invariance, G7 parity
+        res_clean = acct.simulate(kernel.clone_fresh(), specs, bars, risk_cfg=cfg, capital_usd=10_000.0)
+        res_vix = acct.simulate(
+            kernel.clone_fresh(),
+            specs,
+            bars,
+            risk_cfg=cfg,
+            capital_usd=10_000.0,
+            context_provider=lambda _ts: {"yahoo_vix": 99.0, "macro_vix_stress_z": 15.0},
+        )
+        self.assertEqual(res_clean.equity_curve, res_vix.equity_curve)
+        self.assertGreater(res_clean.trade_count, 0)
+        self.assertGreater(res_clean.funding_pnl_usd, 0.0)
+        self.assertGreater(res_clean.net_pnl_usd, 0.0)
+        self.assertEqual(res_clean.liquidation_count, 0)
+
+        active_steps = 0
+        for _ts, wh in res_clean.allocated_weights_history:
+            for c in ("BTC", "ETH"):
+                ws = wh.get(f"{c}_SPOT", 0.0)
+                wp = wh.get(f"{c}_PERP", 0.0)
+                self.assertAlmostEqual(ws + wp, 0.0, places=12)
+                self.assertGreaterEqual(ws, -1e-12)
+                self.assertLessEqual(wp, 1e-12)
+                if ws > 1e-4:
+                    active_steps += 1
+        self.assertGreater(active_steps, 40)
+
+        rep = verify_full_parity(kernel.clone_fresh(), specs, bars, risk_cfg=cfg, batch_result=res_clean)
+        self.assertTrue(rep.passed, f"W3-DN G7 parity failed: {rep.detail}")
+        self.assertEqual(rep.max_abs_weight_delta, 0.0)
+        self.assertEqual(rep.max_abs_equity_delta, 0.0)
+
+    def test_w3_dn_cost_floor_hysteresis_basis_stop_dvol_and_margin_storm_exit(self) -> None:
+        # 1. Sub-floor funding stays strictly flat (0 trades)
+        _, bars_low = self._make_dual_leg_bars(n=40, carry_rates=[0.00005] * 40, coins=("BTC",))  # 3.65% APR < 17.7% entry floor
+        k = Web3DeltaNeutralCarryKernel(warmup_bars=4, hold_horizon_days=21.0, cost_floor_multiplier=3.0, full_4leg_rt_cost_bps=34.0)
+        for i in range(40):
+            ts = bars_low["BTC_SPOT"][i].ts_event_ms
+            bat = {"BTC_SPOT": bars_low["BTC_SPOT"][i], "BTC_PERP": bars_low["BTC_PERP"][i]}
+            decs = k.on_bar_step(ts, bat)
+            self.assertEqual(decs["BTC_SPOT"].target_weight, 0.0)
+            self.assertEqual(decs["BTC_PERP"].target_weight, 0.0)
+
+        # 2. Entry above floor -> hysteresis holds in middle band -> basis stop / DVOL / margin storm force atomic flat
+        rates = [0.00040] * 12 + [0.00010] * 10 + [-0.00010] * 8  # 29% APR -> 7.3% APR (hold!) -> -7.3% APR (exit!)
+        bases = [5.0] * 30
+        bases[15] = 420.0  # basis blow-up > 350 bps stop
+        _, bars_ev = self._make_dual_leg_bars(n=30, carry_rates=rates, basis_bps_series=bases, coins=("BTC",))
+        k2 = Web3DeltaNeutralCarryKernel(
+            warmup_bars=4,
+            carry_ema_span=2,
+            hold_horizon_days=21.0,
+            cost_floor_multiplier=3.0,
+            exit_apr_pct=2.0,
+            basis_stop_bps=350.0,
+            dvol_max_hard_cap=115.0,
+            margin_storm_exit_ratio=0.50,
+        )
+        opened = False
+        hysteresis_held = False
+        basis_stopped = False
+        for i in range(30):
+            ts = bars_ev["BTC_SPOT"][i].ts_event_ms
+            bat = {"BTC_SPOT": bars_ev["BTC_SPOT"][i], "BTC_PERP": bars_ev["BTC_PERP"][i]}
+            ctx: dict[str, Any] = {}
+            if i == 10:
+                ctx["margin_ratio"] = 0.45
+            elif i == 11:
+                ctx["dvol"] = 120.0
+            decs = k2.on_bar_step(ts, bat, ctx)
+            ws = decs["BTC_SPOT"].target_weight
+            wp = decs["BTC_PERP"].target_weight
+            self.assertAlmostEqual(ws + wp, 0.0, places=12)
+            k2.sync_executed_weights({"BTC_SPOT": ws, "BTC_PERP": wp})
+
+            if i == 8 and ws > 0.0:
+                opened = True
+                self.assertEqual(decs["BTC_SPOT"].regime_label, DN_REGIME_ACTIVE)
+            elif i == 10:
+                self.assertEqual(ws, 0.0)
+                self.assertEqual(decs["BTC_SPOT"].regime_label, DN_REGIME_MARGIN_STORM_EXIT)
+            elif i == 11:
+                self.assertEqual(ws, 0.0)
+                self.assertEqual(decs["BTC_SPOT"].regime_label, DN_REGIME_DVOL_THROTTLED)
+            elif i == 15:
+                self.assertEqual(ws, 0.0)
+                self.assertEqual(decs["BTC_SPOT"].regime_label, DN_REGIME_BASIS_STOP)
+                basis_stopped = True
+            elif i == 13 and ws > 0.0:
+                # Re-verify hysteresis hold when carry drops below entry floor (~17.7%) but stays > exit_apr_pct (2%)
+                hysteresis_held = True
+        self.assertTrue(opened)
+        self.assertTrue(basis_stopped)
+        # Separate clean hysteresis check without interrupting storm/DVOL/basis shocks
+        k3 = Web3DeltaNeutralCarryKernel(warmup_bars=4, carry_ema_span=2, hold_horizon_days=21.0, cost_floor_multiplier=3.0, exit_apr_pct=2.0)
+        _, bars_hyst = self._make_dual_leg_bars(n=24, carry_rates=[0.00040] * 10 + [0.00010] * 7 + [-0.00010] * 7, coins=("BTC",))
+        saw_mid_hold = False
+        saw_clean_exit = False
+        for i in range(24):
+            ts = bars_hyst["BTC_SPOT"][i].ts_event_ms
+            decs = k3.on_bar_step(ts, {"BTC_SPOT": bars_hyst["BTC_SPOT"][i], "BTC_PERP": bars_hyst["BTC_PERP"][i]})
+            ws = decs["BTC_SPOT"].target_weight
+            wp = decs["BTC_PERP"].target_weight
+            k3.sync_executed_weights({"BTC_SPOT": ws, "BTC_PERP": wp})
+            if i == 14 and ws > 0.0:
+                saw_mid_hold = True
+            if i == 23 and ws == 0.0 and decs["BTC_SPOT"].regime_label == DN_REGIME_SUB_FLOOR:
+                saw_clean_exit = True
+        self.assertTrue(saw_mid_hold, "W3-DN must hold active pair via hysteresis above exit_apr_pct")
+        self.assertTrue(saw_clean_exit, "W3-DN must exit cleanly once carry drops below exit_apr_pct")
+
+    def test_w1_low_turnover_rebalance_cadence_hysteresis_and_parity(self) -> None:
+        coins = ("BTC", "ETH", "SOL", "AVAX", "LINK", "AAVE", "DOGE", "XRP")
+        bars = {
+            c: _make_bar_series(
+                symbol=c,
+                closes=_trending_closes(160, start=50.0 + idx * 10.0, step_ret=0.001 * (idx - 3), noise_std=0.025, seed=90 + idx),
+                timeframe_h=12.0,
+                carry_rates=[0.00015] * 160,
+            )
+            for idx, c in enumerate(coins)
+        }
+        specs = default_web3_specs(coins)
+        cfg = RiskAllocatorConfig(max_positions=6, target_annual_vol_pct=20.0, max_portfolio_leverage=1.5, max_single_weight=0.35)
+        acct = PortfolioAccountingEngine()
+
+        # 1. Backwards compatibility: default args == explicit (rebalance_every_bars=1, rank_hysteresis=0)
+        res_def = acct.simulate(Web3XSMomCarryKernel(top_k=2, bottom_k=2), specs, bars, risk_cfg=cfg)
+        res_exp = acct.simulate(
+            Web3XSMomCarryKernel(top_k=2, bottom_k=2, rebalance_every_bars=1, rank_hysteresis=0),
+            specs,
+            bars,
+            risk_cfg=cfg,
+        )
+        self.assertEqual(res_def.equity_curve, res_exp.equity_curve)
+
+        # 2. Low-turnover hysteresis + slower EMA + wider inertia strictly reduces turnover & trades + passes G7 parity
+        k_low = Web3XSMomCarryKernel(
+            top_k=2,
+            bottom_k=2,
+            score_ema_alpha=0.15,
+            rank_hysteresis=2,
+            inertia_buffer=0.25,
+            rebalance_every_bars=4,
+        )
+        res_low = acct.simulate(k_low.clone_fresh(), specs, bars, risk_cfg=cfg)
+        self.assertLess(res_low.total_turnover, res_def.total_turnover)
+        self.assertLess(res_low.trade_count, res_def.trade_count)
+
+        rep = verify_full_parity(k_low.clone_fresh(), specs, bars, risk_cfg=cfg, batch_result=res_low)
+        self.assertTrue(rep.passed, f"W1 low-turnover G7 parity failed: {rep.detail}")
+        self.assertEqual(rep.max_abs_weight_delta, 0.0)
+        self.assertEqual(rep.max_abs_equity_delta, 0.0)
+
+        # 3. RISK_OFF_BEAR net neutrality enforced even on off-cadence bars
+        k_bear = k_low.clone_fresh()
+        for i in range(40):
+            ts = bars["BTC"][i].ts_event_ms
+            bat = {c: bars[c][i] for c in coins}
+            ctx = {"regime_label": WEB3_REGIME_RISK_OFF_BEAR, "exposure_scalar": 0.30} if i >= 30 else {}
+            decs = k_bear.on_bar_step(ts, bat, ctx)
+            k_bear.sync_executed_weights({c: d.target_weight for c, d in decs.items()})
+            if i >= 31:
+                net_w = math.fsum(d.target_weight for d in decs.values())
+                self.assertLessEqual(abs(net_w), 1e-6, f"RISK_OFF_BEAR net neutrality broken on step {i}: {net_w}")
 
 
 if __name__ == "__main__":

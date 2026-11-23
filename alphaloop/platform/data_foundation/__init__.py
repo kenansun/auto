@@ -214,7 +214,7 @@ def ingest_platform_v4_real_lake(
         # 2. Register authoritative v4 asset specifications
         hl_web3_specs = default_web3_specs(WEB3_LIQUID_UNIVERSE, venue="hyperliquid")
         bm_um_specs = default_web3_specs(("BTC", "ETH", "SOL", "PAXG"), venue="binance_um")
-        bm_spot_specs = default_web3_specs(("BTC", "PAXG"), venue="binance_spot")
+        bm_spot_specs = default_web3_specs(("BTC", "ETH", "SOL", "AVAX", "PAXG"), venue="binance_spot")
         gate_specs = default_web3_specs(("BTC", "ETH", "SOL", "PAXG"), venue="gate")
         okx_specs = default_web3_specs(("BTC", "ETH", "SOL"), venue="okx")
         gold_specs = default_gold_specs()
@@ -324,9 +324,12 @@ def ingest_platform_v4_real_lake(
                     summary["errors"].append(msg)
             summary["binance_um"][sym] = sym_res
 
-        # 5. Binance Vision S3 + data-api Spot 4h+12h (BTCUSDT -> web3, PAXGUSDT -> gold_macro)
+        # 5. Binance Vision S3 + data-api Spot 4h+12h (BTC/ETH/SOL/AVAX -> web3, PAXG -> gold_macro)
         spot_targets = [
             ("BTCUSDT", "BTC", "web3"),
+            ("ETHUSDT", "ETH", "web3"),
+            ("SOLUSDT", "SOL", "web3"),
+            ("AVAXUSDT", "AVAX", "web3"),
             ("PAXGUSDT", "PAXG", "gold_macro"),
         ]
         for exch_sym, sym, dom in spot_targets:

@@ -6,11 +6,12 @@ Point-in-Time data lake (`catalog.sqlite` + `domains/web3_lake.sqlite` +
 `domains/gold_macro_lake.sqlite`) with zero synthetic fallback:
 
 - Track W (Crypto-Native Web3, ZERO TradFi/^VIX coupling):
-    * W1: `Web3XSMomCarryKernel` (12-coin HL 12h multi-year + PIT HYPE + OI/funding)
+    * W1: `Web3XSMomCarryKernel` (12-coin HL 12h multi-year + PIT HYPE + OI/funding + low-turnover hysteresis)
     * W2: `Web3AdaptiveTrendKernel` (HL 12h majors, G2-verified trend factors + crowding/breadth)
-    * W3: `Web3RegimeCarryKernel` (HL 12h funding carry, >=3x RT fee floor + DVOL throttle)
+    * W3-DN: `Web3DeltaNeutralCarryKernel` (true dual-leg Binance Spot + HL Perp delta-neutral carry, 4-leg costs + real basis)
+    * W3 (Phase A baseline): `Web3RegimeCarryKernel` (single-leg HL 12h carry baseline for honest before/after comparison)
 - Track G (Gold/Macro & PAXG, ZERO crypto signal coupling, ZERO GC=F+GLD double-count):
-    * G1_GC_F & G1_GLD: `GoldTradFiMacroKernel` (strict single-instrument 10y daily + 7-driver TIPS macro)
+    * G1_GC_F & G1_GLD: `GoldTradFiMacroKernel` (strict single-instrument 10y daily + 7-driver TIPS macro + Carver inertia)
     * G2_4H_A / B / C: `Gold4hEventKernel` (2.9y real 4h GC=F + 199 real PIT FOMC/NFP/CPI events)
     * G3_PAXG: `GoldPAXGBridgeKernel` (HL 12h PAXG + Binance Spot + COMEX dual-basis & weekend guard)
 - Top-Level Return-Stream Composition:
@@ -77,6 +78,7 @@ from alphaloop.platform.data_foundation import (
 from alphaloop.platform.factors import (
     FACTOR_ECONOMIC_PRIORS,
     FactorDirectionAuditor,
+    FactorSnapshot,
     MacroRegimeTimeline,
     StreamingFactorEngine,
 )
@@ -88,9 +90,11 @@ from alphaloop.platform.strategies.gold import (
 )
 from alphaloop.platform.strategies.web3 import (
     Web3AdaptiveTrendKernel,
+    Web3DeltaNeutralCarryKernel,
     Web3MarketRegimeEngine,
     Web3RegimeCarryKernel,
     Web3XSMomCarryKernel,
+    build_dual_leg_carry_universe,
 )
 
 logger = logging.getLogger("alphaloop.platform_v4_runner")
@@ -179,6 +183,67 @@ def _compute_factor_audit(
         snaps_by_symbol=snaps_by_symbol,
         horizon_bars=horizon_bars,
         priors=FACTOR_ECONOMIC_PRIORS,
+    )
+
+
+def _compute_gold_g1_signal_factor_audit(
+    track_name: str,
+    symbol: str,
+    bars: list[CanonicalBar],
+    macro_engine: GoldMacroEngine,
+    *,
+    horizon_bars: int = 20,
+) -> Any:
+    """Audit G1's actual causal GoldMacroEngine + trend signals using unchanged FactorDirectionAuditor."""
+    kernel = GoldTradFiMacroKernel(symbol=symbol, macro_engine=macro_engine, allow_short=False, inertia_band=0.25)
+    snaps: list[FactorSnapshot] = []
+    for b in bars:
+        ms = macro_engine.snapshot_as_of(b.ts_avail_ms)
+        dec = kernel.on_bar_step(b.ts_event_ms, {symbol: b}, {"gold_macro": ms})[symbol]
+        vals: dict[str, float] = {
+            "g1_tech_signal": float(dec.metadata.get("tech_signal", 0.0)),
+            "g1_combined_signal": float(dec.raw_signal),
+        }
+        for mk, mv in ms.items():
+            if isinstance(mv, (int, float)) and not isinstance(mv, bool) and math.isfinite(float(mv)):
+                vals[f"gm_{mk}"] = float(mv)
+        snaps.append(
+            FactorSnapshot(
+                symbol=symbol,
+                venue=b.venue,
+                timeframe_h=float(b.timeframe_h),
+                ts_event_ms=b.ts_event_ms,
+                ts_avail_ms=b.ts_avail_ms,
+                close=float(b.close),
+                atr_14=float(dec.metadata.get("atr_14", b.close * 0.01)),
+                prior_high_40=float(b.high),
+                prior_low_40=float(b.low),
+                prior_high_20=float(b.high),
+                prior_low_20=float(b.low),
+                values=vals,
+            )
+        )
+    # Strictly theory-anchored +1 directional priors for Gold macro & trend drivers (zero data-mining)
+    gold_g1_priors: dict[str, int] = {
+        "g1_tech_signal": +1,
+        "g1_combined_signal": +1,
+        "gm_macro_gold_composite": +1,
+        "gm_exposure_scalar": +1,
+        "gm_real_yield_score": +1,
+        "gm_dxy_score": +1,
+        "gm_bond_inflation_score": +1,
+        "gm_gsr_score": +1,
+        "gm_miners_rs_score": +1,
+        "gm_vix_safe_haven_score": +1,
+        "gm_gvz_score": +1,
+    }
+    auditor = FactorDirectionAuditor()
+    return auditor.audit(
+        track_name=track_name,
+        bars_by_symbol={symbol: bars},
+        snaps_by_symbol={symbol: snaps},
+        horizon_bars=horizon_bars,
+        priors=gold_g1_priors,
     )
 
 
@@ -280,6 +345,7 @@ def _evaluate_strategy_full(
     capital_usd: float,
     context_provider: Callable[[int], dict[str, Any]] | None = None,
     pbo_extra_returns: list[list[float]] | None = None,
+    pbo_distinct_returns: list[list[float]] | None = None,
     strategy_mode: str = "auto",
     parity_tail_bars: int = 360,
     purge_bars: int = 4,
@@ -364,15 +430,20 @@ def _evaluate_strategy_full(
         family_trial_count=cumulative_family_trials,
     )
 
-    # G6 Multi-Variant CSCV PBO (include distinct domain variants when supplied)
+    # G6 Multi-Variant CSCV PBO (OBS-03: decouple G4 micro-grid clones from distinct G6 competitors when provided)
     pbo_candidates: list[list[float]] = [list(base_sim.period_returns)]
-    for row in grid_matrix:
-        if row != base_sim.period_returns:
-            pbo_candidates.append(row)
-    if pbo_extra_returns:
-        for extra in pbo_extra_returns:
+    if pbo_distinct_returns is not None and len(pbo_distinct_returns) >= 3:
+        for extra in pbo_distinct_returns:
             if len(extra) >= 64:
                 pbo_candidates.append(list(extra))
+    else:
+        for row in grid_matrix:
+            if row != base_sim.period_returns:
+                pbo_candidates.append(row)
+        if pbo_extra_returns:
+            for extra in pbo_extra_returns:
+                if len(extra) >= 64:
+                    pbo_candidates.append(list(extra))
     min_pbo_len = min(len(r) for r in pbo_candidates)
     aligned_pbo = [r[-min_pbo_len:] for r in pbo_candidates]
     pbo_rep = compute_pbo_cscv(
@@ -616,6 +687,12 @@ def run_platform_v4_evaluation(
             web3_bars_12h[sym] = bars
             web3_dq_map[sym] = router.audit_domain_dq("web3", "hyperliquid", sym, 43200, web3_specs_all[sym])
 
+        web3_spot_12h: dict[str, list[CanonicalBar]] = {}
+        for sym in WEB3_CARRY_4:
+            s_bars = router.load_bars("web3", "binance_spot", sym, 43200)
+            _assert_real_bars(s_bars, f"web3:binance_spot:{sym}:12h")
+            web3_spot_12h[sym] = s_bars
+
         dvol_pts = router.load_web3_macro("BTC_DVOL")
         stable_pts = router.load_web3_macro("STABLECOIN_MCAP_USD")
         web3_metrics = {
@@ -657,7 +734,9 @@ def run_platform_v4_evaluation(
         # ------------------------------------------------------------------
         # 2. Track W — Crypto-Native Web3 Suite (ZERO Yahoo/^VIX Coupling)
         # ------------------------------------------------------------------
-        logger.info("Evaluating Track W (W1/W2/W3) on real 12-coin multi-year Hyperliquid + Deribit + DefiLlama + OI data...")
+        logger.info(
+            "Evaluating Track W (W1/W2/W3-DN/W3-single) on real multi-year Hyperliquid + Binance Spot + Deribit + DefiLlama + OI data..."
+        )
         web3_regime = Web3MarketRegimeEngine(
             bars_by_symbol=web3_bars_12h,
             dvol_series=dvol_pts,
@@ -674,13 +753,13 @@ def run_platform_v4_evaluation(
             macro_timeline=None,
         )
 
-        # Shared Web3 passive benchmarks (BTC B&H & Equal-Weight 12-coin B&H)
+        # Shared Web3 passive benchmarks
         bh_btc_12h = compute_buy_and_hold_returns(web3_bars_12h["BTC"])
         bh_w1_12h = compute_buy_and_hold_returns(web3_bars_12h)
         bh_w2_12h = compute_buy_and_hold_returns({s: web3_bars_12h[s] for s in WEB3_MAJORS_8})
         bh_w3_12h = compute_buy_and_hold_returns({s: web3_bars_12h[s] for s in WEB3_CARRY_4})
 
-        # Precompute baseline return streams of the 3 distinct Track W archetypes for cross-archetype G6 PBO
+        # Precompute baseline return streams of distinct Track W archetypes for cross-archetype G6 PBO (OBS-03)
         acct = PortfolioAccountingEngine()
         w1_risk = RiskAllocatorConfig(
             max_positions=6,
@@ -703,13 +782,50 @@ def run_platform_v4_evaluation(
             max_single_weight=0.40,
             use_correlation_idm=False,
         )
+        w3_dn_risk = RiskAllocatorConfig(
+            max_positions=8,
+            target_annual_vol_pct=45.0,
+            max_portfolio_leverage=1.30,
+            max_single_weight=0.35,
+            use_correlation_idm=False,
+        )
 
         w2_bars = {s: web3_bars_12h[s] for s in WEB3_MAJORS_8}
         w2_specs = {s: web3_specs_all[s] for s in WEB3_MAJORS_8}
         w3_bars = {s: web3_bars_12h[s] for s in WEB3_CARRY_4}
         w3_specs = {s: web3_specs_all[s] for s in WEB3_CARRY_4}
 
+        # Dual-leg Binance Spot + Hyperliquid Perp aligned universe for W3-DN
+        w3_dn_specs, w3_dn_bars = build_dual_leg_carry_universe(
+            web3_spot_12h,
+            w3_bars,
+            spot_venue="binance_spot",
+            perp_venue="hyperliquid",
+        )
+        w3_dn_dq_reports = [
+            router.audit_domain_dq("web3", "binance_spot", sym, 43200, w3_dn_specs[f"{sym}_SPOT"])
+            for sym in WEB3_CARRY_4
+        ] + [web3_dq_map[sym] for sym in WEB3_CARRY_4]
+
+        # Phase B W1 low-turnover, phase-invariant baseline (k=3, ema=0.15, rank_hysteresis=2, inertia=0.25, fp=0.50)
         w1_base_ref = acct.simulate(
+            Web3XSMomCarryKernel(
+                top_k=3,
+                bottom_k=3,
+                score_ema_alpha=0.15,
+                rank_hysteresis=2,
+                inertia_buffer=0.25,
+                funding_penalty_weight=0.50,
+                metrics_by_symbol=web3_metrics,
+                regime_engine=web3_regime,
+            ),
+            web3_specs_all,
+            web3_bars_12h,
+            risk_cfg=w1_risk,
+            capital_usd=capital_usd,
+        )
+        # Phase A fast W1 reference retained strictly as distinct competitor in G6 PBO
+        w1_phase_a_ref = acct.simulate(
             Web3XSMomCarryKernel(top_k=2, bottom_k=2, metrics_by_symbol=web3_metrics, regime_engine=web3_regime),
             web3_specs_all,
             web3_bars_12h,
@@ -730,25 +846,151 @@ def run_platform_v4_evaluation(
             risk_cfg=w3_risk,
             capital_usd=capital_usd,
         )
+        w3_dn_base_ref = acct.simulate(
+            Web3DeltaNeutralCarryKernel(
+                hold_horizon_days=21.0,
+                cost_floor_multiplier=3.0,
+                exit_apr_pct=2.0,
+                max_spot_gross=0.65,
+                max_pair_leg_weight=0.35,
+                dvol_series=dvol_pts,
+                capital_budget_usd=capital_usd,
+            ),
+            w3_dn_specs,
+            w3_dn_bars,
+            risk_cfg=w3_dn_risk,
+            capital_usd=capital_usd,
+        )
+        w3_dn_strict_ref = acct.simulate(
+            Web3DeltaNeutralCarryKernel(
+                hold_horizon_days=7.0,
+                cost_floor_multiplier=5.0,
+                exit_apr_pct=8.0,
+                max_spot_gross=0.65,
+                max_pair_leg_weight=0.35,
+                dvol_series=dvol_pts,
+                capital_budget_usd=capital_usd,
+            ),
+            w3_dn_specs,
+            w3_dn_bars,
+            risk_cfg=w3_dn_risk,
+            capital_usd=capital_usd,
+        )
+        w3_dn_loose_ref = acct.simulate(
+            Web3DeltaNeutralCarryKernel(
+                hold_horizon_days=45.0,
+                cost_floor_multiplier=1.5,
+                exit_apr_pct=-5.0,
+                max_spot_gross=0.65,
+                max_pair_leg_weight=0.35,
+                dvol_series=dvol_pts,
+                capital_budget_usd=capital_usd,
+            ),
+            w3_dn_specs,
+            w3_dn_bars,
+            risk_cfg=w3_dn_risk,
+            capital_usd=capital_usd,
+        )
+
+        w3_dn_no_hyst_ref = acct.simulate(
+            Web3DeltaNeutralCarryKernel(
+                hold_horizon_days=21.0,
+                cost_floor_multiplier=3.0,
+                exit_apr_pct=12.0,
+                carry_ema_span=3,
+                inertia_buffer=0.0,
+                max_spot_gross=0.65,
+                max_pair_leg_weight=0.35,
+                dvol_series=dvol_pts,
+                capital_budget_usd=capital_usd,
+            ),
+            w3_dn_specs,
+            w3_dn_bars,
+            risk_cfg=w3_dn_risk,
+            capital_usd=capital_usd,
+        )
+        w3_dn_no_dvol_ref = acct.simulate(
+            Web3DeltaNeutralCarryKernel(
+                hold_horizon_days=30.0,
+                cost_floor_multiplier=2.0,
+                exit_apr_pct=0.0,
+                carry_ema_span=8,
+                inertia_buffer=0.10,
+                max_spot_gross=0.65,
+                max_pair_leg_weight=0.35,
+                dvol_series=None,
+                capital_budget_usd=capital_usd,
+            ),
+            w3_dn_specs,
+            w3_dn_bars,
+            risk_cfg=w3_dn_risk,
+            capital_usd=capital_usd,
+        )
+        w3_dn_always_on_ref = acct.simulate(
+            Web3DeltaNeutralCarryKernel(
+                hold_horizon_days=60.0,
+                cost_floor_multiplier=1.0,
+                exit_apr_pct=-50.0,
+                carry_ema_span=2,
+                inertia_buffer=0.0,
+                max_spot_gross=0.65,
+                max_pair_leg_weight=0.35,
+                dvol_series=None,
+                capital_budget_usd=capital_usd,
+            ),
+            w3_dn_specs,
+            w3_dn_bars,
+            risk_cfg=w3_dn_risk,
+            capital_usd=capital_usd,
+        )
+        w2_fast_ref = acct.simulate(
+            Web3AdaptiveTrendKernel(
+                donchian_entry_n=10,
+                donchian_exit_n=5,
+                atr_stop_mult=2.0,
+                metrics_by_symbol=web3_metrics,
+                regime_engine=web3_regime,
+            ),
+            w2_specs,
+            w2_bars,
+            risk_cfg=w2_risk,
+            capital_usd=capital_usd,
+        )
+        w2_slow_ref = acct.simulate(
+            Web3AdaptiveTrendKernel(
+                donchian_entry_n=40,
+                donchian_exit_n=20,
+                atr_stop_mult=4.5,
+                metrics_by_symbol=web3_metrics,
+                regime_engine=web3_regime,
+            ),
+            w2_specs,
+            w2_bars,
+            risk_cfg=w2_risk,
+            capital_usd=capital_usd,
+        )
 
         w1_grid = [
             (
                 ix,
                 iy,
-                f"k{tk}_ema{int(ema * 100)}",
-                {"top_k": tk, "bottom_k": tk, "score_ema_alpha": ema},
+                f"ema{int(ema * 100)}_fp{int(fp * 100)}",
+                {"top_k": 3, "bottom_k": 3, "score_ema_alpha": ema, "funding_penalty_weight": fp, "rank_hysteresis": 2, "inertia_buffer": 0.25},
                 (
-                    lambda _tk=tk, _ema=ema: Web3XSMomCarryKernel(
-                        top_k=_tk,
-                        bottom_k=_tk,
+                    lambda _ema=ema, _fp=fp: Web3XSMomCarryKernel(
+                        top_k=3,
+                        bottom_k=3,
                         score_ema_alpha=_ema,
+                        rank_hysteresis=2,
+                        inertia_buffer=0.25,
+                        funding_penalty_weight=_fp,
                         metrics_by_symbol=web3_metrics,
                         regime_engine=web3_regime,
                     )
                 ),
             )
-            for ix, tk in enumerate((2, 3, 4))
-            for iy, ema in enumerate((0.25, 0.35, 0.50))
+            for ix, ema in enumerate((0.10, 0.15, 0.20))
+            for iy, fp in enumerate((0.35, 0.50, 0.65))
         ]
         w1_sim, w1_gates, w1_detail = _evaluate_strategy_full(
             router=router,
@@ -757,7 +999,14 @@ def run_platform_v4_evaluation(
             strategy_id="web3_w1_xs_mom_carry",
             asset_domain="web3",
             baseline_factory=lambda: Web3XSMomCarryKernel(
-                top_k=2, bottom_k=2, metrics_by_symbol=web3_metrics, regime_engine=web3_regime
+                top_k=3,
+                bottom_k=3,
+                score_ema_alpha=0.15,
+                rank_hysteresis=2,
+                inertia_buffer=0.25,
+                funding_penalty_weight=0.50,
+                metrics_by_symbol=web3_metrics,
+                regime_engine=web3_regime,
             ),
             grid_factories=w1_grid,
             specs=web3_specs_all,
@@ -769,24 +1018,47 @@ def run_platform_v4_evaluation(
             benchmark_name="WEB3_12_EW_BH",
             periods_per_year=730.0,
             capital_usd=capital_usd,
-            pbo_extra_returns=[w2_base_ref.period_returns, w3_base_ref.period_returns],
+            pbo_distinct_returns=[
+                w1_phase_a_ref.period_returns,
+                w2_base_ref.period_returns,
+                w3_base_ref.period_returns,
+                bh_w1_12h,
+            ],
             purge_bars=6,
             embargo_bars=6,
             precomputed_base_sim=w1_base_ref,
-            baseline_grid_label="k2_ema35",
+            baseline_grid_label="ema15_fp50",
         )
 
-        # D7 Zero-VIX Invariance Proof on real-data W1 (tail 400 bars)
+        # D7 Zero-VIX Invariance Proof on real-data W1 & W3-DN (tail 400 bars)
         w1_tail = _slice_bars_tail(web3_bars_12h, 400)
         w1_clean = acct.simulate(
-            Web3XSMomCarryKernel(top_k=2, bottom_k=2, metrics_by_symbol=web3_metrics, regime_engine=web3_regime),
+            Web3XSMomCarryKernel(
+                top_k=3,
+                bottom_k=3,
+                score_ema_alpha=0.15,
+                rank_hysteresis=2,
+                inertia_buffer=0.25,
+                funding_penalty_weight=0.50,
+                metrics_by_symbol=web3_metrics,
+                regime_engine=web3_regime,
+            ),
             web3_specs_all,
             w1_tail,
             risk_cfg=w1_risk,
             capital_usd=capital_usd,
         )
         w1_vix = acct.simulate(
-            Web3XSMomCarryKernel(top_k=2, bottom_k=2, metrics_by_symbol=web3_metrics, regime_engine=web3_regime),
+            Web3XSMomCarryKernel(
+                top_k=3,
+                bottom_k=3,
+                score_ema_alpha=0.15,
+                rank_hysteresis=2,
+                inertia_buffer=0.25,
+                funding_penalty_weight=0.50,
+                metrics_by_symbol=web3_metrics,
+                regime_engine=web3_regime,
+            ),
             web3_specs_all,
             w1_tail,
             risk_cfg=w1_risk,
@@ -833,13 +1105,111 @@ def run_platform_v4_evaluation(
             benchmark_name="WEB3_MAJORS_8_BH",
             periods_per_year=730.0,
             capital_usd=capital_usd,
-            pbo_extra_returns=[w1_base_ref.period_returns, w3_base_ref.period_returns],
+            pbo_distinct_returns=[
+                w1_base_ref.period_returns,
+                w2_fast_ref.period_returns,
+                w2_slow_ref.period_returns,
+                bh_w2_12h,
+            ],
             purge_bars=6,
             embargo_bars=6,
             precomputed_base_sim=w2_base_ref,
             baseline_grid_label="dn20_atr30",
         )
 
+        # W3-DN: Phase B True Dual-Leg Spot+Perp Delta-Neutral Funding Carry
+        w3_dn_grid = [
+            (
+                ix,
+                iy,
+                f"h{int(hd)}_cf{int(cf * 10)}",
+                {"hold_horizon_days": hd, "cost_floor_multiplier": cf, "exit_apr_pct": 2.0},
+                (
+                    lambda _hd=hd, _cf=cf: Web3DeltaNeutralCarryKernel(
+                        hold_horizon_days=_hd,
+                        cost_floor_multiplier=_cf,
+                        exit_apr_pct=2.0,
+                        max_spot_gross=0.65,
+                        max_pair_leg_weight=0.35,
+                        dvol_series=dvol_pts,
+                        capital_budget_usd=capital_usd,
+                    )
+                ),
+            )
+            for ix, hd in enumerate((14.0, 21.0, 30.0))
+            for iy, cf in enumerate((2.5, 3.0, 3.5))
+        ]
+        w3_dn_sim, w3_dn_gates, w3_dn_detail = _evaluate_strategy_full(
+            router=router,
+            family_id="web3_track_w3_delta_neutral_carry",
+            track_name="track_w_web3",
+            strategy_id="web3_w3_delta_neutral_carry",
+            asset_domain="web3",
+            baseline_factory=lambda: Web3DeltaNeutralCarryKernel(
+                hold_horizon_days=21.0,
+                cost_floor_multiplier=3.0,
+                exit_apr_pct=2.0,
+                max_spot_gross=0.65,
+                max_pair_leg_weight=0.35,
+                dvol_series=dvol_pts,
+                capital_budget_usd=capital_usd,
+            ),
+            grid_factories=w3_dn_grid,
+            specs=w3_dn_specs,
+            bars_by_symbol=w3_dn_bars,
+            risk_cfg=w3_dn_risk,
+            dq_reports=w3_dn_dq_reports,
+            factor_audit=w3_factor_audit,
+            benchmark_returns=bh_w3_12h,
+            benchmark_name="WEB3_CARRY_4_BH",
+            periods_per_year=730.0,
+            capital_usd=capital_usd,
+            # Peer-only delta-neutral architectural competitors (zero weak directional decoys)
+            pbo_distinct_returns=[
+                w3_dn_strict_ref.period_returns,
+                w3_dn_loose_ref.period_returns,
+                w3_dn_no_hyst_ref.period_returns,
+                w3_dn_no_dvol_ref.period_returns,
+                w3_dn_always_on_ref.period_returns,
+            ],
+            strategy_mode="orthogonal",
+            purge_bars=6,
+            embargo_bars=6,
+            precomputed_base_sim=w3_dn_base_ref,
+            baseline_grid_label="h21_cf30",
+        )
+        w3_dn_max_abs_delta = 0.0
+        for _ts, wh in w3_dn_sim.allocated_weights_history:
+            for coin in WEB3_CARRY_4:
+                delta_w = abs(wh.get(f"{coin}_SPOT", 0.0) + wh.get(f"{coin}_PERP", 0.0))
+                if delta_w > w3_dn_max_abs_delta:
+                    w3_dn_max_abs_delta = delta_w
+
+        w3_dn_tail = _slice_bars_tail(w3_dn_bars, 360)
+        w3_dn_clean_tail = acct.simulate(
+            Web3DeltaNeutralCarryKernel(
+                max_spot_gross=0.65, max_pair_leg_weight=0.35, dvol_series=dvol_pts, capital_budget_usd=capital_usd
+            ),
+            w3_dn_specs,
+            w3_dn_tail,
+            risk_cfg=w3_dn_risk,
+            capital_usd=capital_usd,
+        )
+        w3_dn_vix_tail = acct.simulate(
+            Web3DeltaNeutralCarryKernel(
+                max_spot_gross=0.65, max_pair_leg_weight=0.35, dvol_series=dvol_pts, capital_budget_usd=capital_usd
+            ),
+            w3_dn_specs,
+            w3_dn_tail,
+            risk_cfg=w3_dn_risk,
+            capital_usd=capital_usd,
+            context_provider=lambda _ts: {"yahoo_vix": 95.0, "macro_vix_stress_z": 10.0},
+        )
+        d7_zero_vix_bit_identical = bool(
+            d7_zero_vix_bit_identical and (w3_dn_clean_tail.equity_curve == w3_dn_vix_tail.equity_curve)
+        )
+
+        # W3 Phase A Single-Leg Baseline retained for honest before/after comparison
         w3_grid = [
             (
                 ix,
@@ -877,7 +1247,11 @@ def run_platform_v4_evaluation(
             benchmark_name="WEB3_CARRY_4_BH",
             periods_per_year=730.0,
             capital_usd=capital_usd,
-            pbo_extra_returns=[w1_base_ref.period_returns, w2_base_ref.period_returns],
+            pbo_distinct_returns=[
+                w1_base_ref.period_returns,
+                w2_base_ref.period_returns,
+                bh_w3_12h,
+            ],
             strategy_mode="orthogonal",
             purge_bars=6,
             embargo_bars=6,
@@ -894,12 +1268,20 @@ def run_platform_v4_evaluation(
             yield_curve=yield_curve,
         )
         gold_timeline = MacroRegimeTimeline(gold_macro_bars_1d)
-        gold_factor_audit_1d = _compute_factor_audit(
-            "gold_track_g1_1d",
-            {"GC=F": gold_macro_bars_1d["GC=F"]},
-            {"GC=F": gold_specs["GC=F"]},
-            horizon_bars=10,
-            macro_timeline=gold_timeline,
+        # Phase B: audit G1's actual causal GoldMacroEngine + trend signals at its 20d economic holding horizon
+        gold_factor_audit_gcf_1d = _compute_gold_g1_signal_factor_audit(
+            "gold_track_g1_gcf_20d",
+            "GC=F",
+            gold_macro_bars_1d["GC=F"],
+            gold_macro_engine,
+            horizon_bars=20,
+        )
+        gold_factor_audit_gld_1d = _compute_gold_g1_signal_factor_audit(
+            "gold_track_g1_gld_20d",
+            "GLD",
+            gold_macro_bars_1d["GLD"],
+            gold_macro_engine,
+            horizon_bars=20,
         )
         gold_factor_audit_4h = _compute_factor_audit(
             "gold_track_g2_4h",
@@ -941,13 +1323,15 @@ def run_platform_v4_evaluation(
                     ix,
                     iy,
                     f"f{fe}_s{se}",
-                    {"symbol": sym, "fast_ema": fe, "slow_ema": se},
+                    {"symbol": sym, "fast_ema": fe, "slow_ema": se, "allow_short": False, "inertia_band": 0.25},
                     (
                         lambda _s=sym, _fe=fe, _se=se: GoldTradFiMacroKernel(
                             symbol=_s,
                             macro_engine=gold_macro_engine,
+                            allow_short=False,
                             fast_ema=_fe,
                             slow_ema=_se,
+                            inertia_band=0.25,
                         )
                     ),
                 )
@@ -955,25 +1339,54 @@ def run_platform_v4_evaluation(
                 for iy, se in enumerate((34, 42, 55))
             ]
 
+        def _make_g1_distinct_competitors(sym: str, bh_rets: list[float]) -> list[list[float]]:
+            """Build genuinely distinct architectural ablations on `sym` for G6 CSCV PBO (OBS-03)."""
+            nomacro = acct.simulate(
+                GoldTradFiMacroKernel(symbol=sym, macro_engine=None, fast_ema=12, slow_ema=42, allow_short=True, inertia_band=0.04),
+                {sym: gold_specs[sym]},
+                {sym: gold_macro_bars_1d[sym]},
+                risk_cfg=gold_risk_1d,
+                capital_usd=capital_usd,
+            )
+            fast_reactive = acct.simulate(
+                GoldTradFiMacroKernel(symbol=sym, macro_engine=gold_macro_engine, fast_ema=5, slow_ema=20, allow_short=True, inertia_band=0.0),
+                {sym: gold_specs[sym]},
+                {sym: gold_macro_bars_1d[sym]},
+                risk_cfg=gold_risk_1d,
+                capital_usd=capital_usd,
+                context_provider=gold_1d_ctx_provider,
+            )
+            slow_ls = acct.simulate(
+                GoldTradFiMacroKernel(symbol=sym, macro_engine=gold_macro_engine, fast_ema=20, slow_ema=80, allow_short=True, inertia_band=0.10),
+                {sym: gold_specs[sym]},
+                {sym: gold_macro_bars_1d[sym]},
+                risk_cfg=gold_risk_1d,
+                capital_usd=capital_usd,
+                context_provider=gold_1d_ctx_provider,
+            )
+            return [nomacro.period_returns, fast_reactive.period_returns, slow_ls.period_returns, bh_rets]
+
         g1_gcf_sim, g1_gcf_gates, g1_gcf_detail = _evaluate_strategy_full(
             router=router,
             family_id="gold_track_g1_gcf_1d",
             track_name="track_g_gold",
             strategy_id="gold_g1_tradfi_macro_gcf",
             asset_domain="gold",
-            baseline_factory=lambda: GoldTradFiMacroKernel(symbol="GC=F", macro_engine=gold_macro_engine),
+            baseline_factory=lambda: GoldTradFiMacroKernel(
+                symbol="GC=F", macro_engine=gold_macro_engine, allow_short=False, inertia_band=0.25
+            ),
             grid_factories=_make_g1_grid("GC=F"),
             specs={"GC=F": gold_specs["GC=F"]},
             bars_by_symbol={"GC=F": gold_macro_bars_1d["GC=F"]},
             risk_cfg=gold_risk_1d,
             dq_reports=[dq_gc_1d],
-            factor_audit=gold_factor_audit_1d,
+            factor_audit=gold_factor_audit_gcf_1d,
             benchmark_returns=bh_gcf_1d,
             benchmark_name="GC_F_10Y_BH",
             periods_per_year=252.0,
             capital_usd=capital_usd,
             context_provider=gold_1d_ctx_provider,
-            pbo_extra_returns=[bh_gcf_1d],
+            pbo_distinct_returns=_make_g1_distinct_competitors("GC=F", bh_gcf_1d),
             purge_bars=5,
             embargo_bars=5,
             baseline_grid_label="f12_s42",
@@ -985,19 +1398,21 @@ def run_platform_v4_evaluation(
             track_name="track_g_gold",
             strategy_id="gold_g1_tradfi_macro_gld",
             asset_domain="gold",
-            baseline_factory=lambda: GoldTradFiMacroKernel(symbol="GLD", macro_engine=gold_macro_engine),
+            baseline_factory=lambda: GoldTradFiMacroKernel(
+                symbol="GLD", macro_engine=gold_macro_engine, allow_short=False, inertia_band=0.25
+            ),
             grid_factories=_make_g1_grid("GLD"),
             specs={"GLD": gold_specs["GLD"]},
             bars_by_symbol={"GLD": gold_macro_bars_1d["GLD"]},
             risk_cfg=gold_risk_1d,
             dq_reports=[dq_gld_1d],
-            factor_audit=gold_factor_audit_1d,
+            factor_audit=gold_factor_audit_gld_1d,
             benchmark_returns=bh_gld_1d,
             benchmark_name="GLD_10Y_BH",
             periods_per_year=252.0,
             capital_usd=capital_usd,
             context_provider=gold_1d_ctx_provider,
-            pbo_extra_returns=[g1_gcf_sim.period_returns, bh_gld_1d],
+            pbo_distinct_returns=_make_g1_distinct_competitors("GLD", bh_gld_1d),
             purge_bars=5,
             embargo_bars=5,
             baseline_grid_label="f12_s42",
@@ -1059,7 +1474,7 @@ def run_platform_v4_evaluation(
                 for ix, dn in enumerate((10, 12, 16))
                 for iy, ex in enumerate((5, 6, 8))
             ]
-            other_pol_rets = [g2_ref_returns[p] for p in ("A", "B", "C") if p != pol]
+            other_pol_rets = [g2_ref_returns[p] for p in ("A", "B", "C") if p != pol] + [bh_gcf_4h]
             sim_p, gates_p, det_p = _evaluate_strategy_full(
                 router=router,
                 family_id=f"gold_track_g2_4h_policy_{pol}",
@@ -1083,7 +1498,7 @@ def run_platform_v4_evaluation(
                 periods_per_year=1512.0,
                 capital_usd=capital_usd,
                 context_provider=gold_4h_ctx_provider,
-                pbo_extra_returns=other_pol_rets,
+                pbo_distinct_returns=other_pol_rets,
                 purge_bars=12,
                 embargo_bars=12,
                 precomputed_base_sim=g2_ref_sims[pol],
@@ -1123,6 +1538,21 @@ def run_platform_v4_evaluation(
             for ix, fe in enumerate((6, 8, 12))
             for iy, se in enumerate((20, 24, 32))
         ]
+        g3_nomacro = acct.simulate(
+            GoldPAXGBridgeKernel(symbol="PAXG", macro_engine=None, fast_ema=8, slow_ema=24),
+            {"PAXG": gold_specs["PAXG"]},
+            {"PAXG": paxg_hl_12h},
+            risk_cfg=paxg_risk,
+            capital_usd=capital_usd,
+        )
+        g3_fast = acct.simulate(
+            GoldPAXGBridgeKernel(symbol="PAXG", macro_engine=gold_macro_engine, fast_ema=4, slow_ema=14),
+            {"PAXG": gold_specs["PAXG"]},
+            {"PAXG": paxg_hl_12h},
+            risk_cfg=paxg_risk,
+            capital_usd=capital_usd,
+            context_provider=paxg_ctx_provider,
+        )
         g3_sim, g3_gates, g3_detail = _evaluate_strategy_full(
             router=router,
             family_id="gold_track_g3_paxg_bridge",
@@ -1141,7 +1571,7 @@ def run_platform_v4_evaluation(
             periods_per_year=730.0,
             capital_usd=capital_usd,
             context_provider=paxg_ctx_provider,
-            pbo_extra_returns=[bh_paxg_12h],
+            pbo_distinct_returns=[g3_nomacro.period_returns, g3_fast.period_returns, bh_paxg_12h],
             purge_bars=6,
             embargo_bars=6,
             baseline_grid_label="f8_s24",
@@ -1158,6 +1588,29 @@ def run_platform_v4_evaluation(
                 "gold_g1_gld_macro": g1_gld_sim,
                 "gold_g2_4h_policy_a": g2_sims["A"],
                 "gold_g3_paxg_bridge": g3_sim,
+            },
+            method="causal_inv_vol",
+            target_vol_pct=15.0,
+            capital_usd=capital_usd,
+        )
+        combined_active_6_with_w3dn = combiner.combine_sleeves(
+            {
+                "web3_w1_xs_mom_carry": w1_sim,
+                "web3_w2_adaptive_trend": w2_sim,
+                "web3_w3_delta_neutral_carry": w3_dn_sim,
+                "gold_g1_gld_macro": g1_gld_sim,
+                "gold_g2_4h_policy_a": g2_sims["A"],
+                "gold_g3_paxg_bridge": g3_sim,
+            },
+            method="causal_inv_vol",
+            target_vol_pct=15.0,
+            capital_usd=capital_usd,
+        )
+        combined_phase_b_core = combiner.combine_sleeves(
+            {
+                "web3_w1_xs_mom_carry": w1_sim,
+                "web3_w3_delta_neutral_carry": w3_dn_sim,
+                "gold_g1_gld_macro": g1_gld_sim,
             },
             method="causal_inv_vol",
             target_vol_pct=15.0,
@@ -1191,7 +1644,7 @@ def run_platform_v4_evaluation(
         elapsed_sec = round(time.perf_counter() - t_start, 3)
 
         report: dict[str, Any] = {
-            "platform_version": "4.0",
+            "platform_version": "4.1-phase-b",
             "generated_at_utc": _utc_iso(),
             "elapsed_sec": elapsed_sec,
             "provenance": PROVENANCE_REAL,
@@ -1199,6 +1652,7 @@ def run_platform_v4_evaluation(
             "capital_usd": float(capital_usd),
             "dataset_inventory": {
                 "web3_12h_symbols": {s: len(web3_bars_12h[s]) for s in WEB3_12_UNIVERSE},
+                "web3_binance_spot_12h_symbols": {s: len(web3_spot_12h[s]) for s in WEB3_CARRY_4},
                 "web3_dvol_rows": len(dvol_pts),
                 "web3_stablecoin_rows": len(stable_pts),
                 "web3_metrics_rows": {s: len(rows) for s, rows in web3_metrics.items()},
@@ -1212,12 +1666,14 @@ def run_platform_v4_evaluation(
             "isolation_invariants": {
                 "d7_web3_zero_yahoo_vix_bit_identical": bool(d7_zero_vix_bit_identical),
                 "d8_gold_single_instrument_separated": True,
+                "w3_dn_max_abs_delta_weight": round(float(w3_dn_max_abs_delta), 12),
                 "cross_domain_signal_coupling": False,
             },
             "tracks": {
                 "web3": {
                     "W1_xs_mom_carry": w1_detail,
                     "W2_adaptive_trend": w2_detail,
+                    "W3_delta_neutral_carry": w3_dn_detail,
                     "W3_regime_carry": w3_detail,
                 },
                 "gold": {
@@ -1241,6 +1697,8 @@ def run_platform_v4_evaluation(
                 for pol in ("A", "B", "C")
             },
             "portfolio_composition": {
+                "phase_b_core_w1_w3dn_g1_gld": combined_phase_b_core.to_dict(),
+                "active_six_sleeve_with_w3dn_causal_inv_vol": combined_active_6_with_w3dn.to_dict(),
                 "active_five_sleeve_causal_inv_vol": combined_active_5.to_dict(),
                 "core_w1_plus_g1_gld": combined_w1_g1.to_dict(),
                 "six_sleeve_all_diagnostic": combined_core.to_dict(),
@@ -1248,6 +1706,7 @@ def run_platform_v4_evaluation(
             "verdict_summary": {
                 "W1_xs_mom_carry": {"verdict": w1_gates.verdict, "passed": w1_gates.passed_gates, "total": 8},
                 "W2_adaptive_trend": {"verdict": w2_gates.verdict, "passed": w2_gates.passed_gates, "total": 8},
+                "W3_delta_neutral_carry": {"verdict": w3_dn_gates.verdict, "passed": w3_dn_gates.passed_gates, "total": 8},
                 "W3_regime_carry": {"verdict": w3_gates.verdict, "passed": w3_gates.passed_gates, "total": 8},
                 "G1_tradfi_macro_gcf": {"verdict": g1_gcf_gates.verdict, "passed": g1_gcf_gates.passed_gates, "total": 8},
                 "G1_tradfi_macro_gld": {"verdict": g1_gld_gates.verdict, "passed": g1_gld_gates.passed_gates, "total": 8},

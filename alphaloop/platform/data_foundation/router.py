@@ -148,6 +148,8 @@ def validate_readonly_sql(sql: str) -> str:
         raise ValueError("Read-only DuckDB query must start with SELECT or WITH")
     if _FORBIDDEN_SQL_RE.search(cleaned):
         raise ValueError("Read-only DuckDB query contains forbidden write/DDL/external-IO keyword")
+    if re.search(r"\b(?:FROM|JOIN)\s+['\"]", cleaned, re.IGNORECASE):
+        raise ValueError("Read-only DuckDB query forbids direct file-path literals in FROM/JOIN")
     return cleaned
 
 
@@ -1701,6 +1703,11 @@ class DataFoundationRouter:
             manifest_id = f"MF-{sha256_obj({'d': dom, 't': table_name, 's': digest, 'ts': now, 'n': uuid.uuid4().hex[:6]})[:12]}"
 
             with transaction(self.catalog_conn):
+                # Keep dataset_manifests 1:1 with the current file at (domain, rel_path) on disk
+                self.catalog_conn.execute(
+                    "DELETE FROM dataset_manifests WHERE domain=? AND rel_path=?",
+                    (dom, rel_path),
+                )
                 self.catalog_conn.execute(
                     """
                     INSERT OR REPLACE INTO dataset_manifests
@@ -1782,19 +1789,35 @@ class DataFoundationRouter:
             )
         con = duckdb.connect(":memory:")
         try:
+            # Prefer Parquet over jsonl.gz if both exist for the same table name; materialize
+            # strictly into :memory: TEMP TABLEs BEFORE disabling external_access so user SQL
+            # can query loaded partitions while external filesystem/network access stays blocked.
+            selected_files: dict[str, tuple[str, Path]] = {}
             for p in sorted(part_dir.iterdir()):
-                escaped_path = str(p.resolve()).replace("'", "''")
+                if not p.is_file():
+                    continue
                 if p.suffix == ".parquet":
                     tname = p.stem
                     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tname):
-                        con.execute(
-                            f"CREATE VIEW {tname} AS SELECT * FROM read_parquet('{escaped_path}')"
-                        )
+                        selected_files[tname] = ("parquet", p)
                 elif p.name.endswith(".jsonl.gz"):
                     tname = p.name[: -len(".jsonl.gz")]
-                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tname):
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tname) and tname not in selected_files:
+                        selected_files[tname] = ("jsonl.gz", p)
+
+            for tname, (kind, p) in sorted(selected_files.items()):
+                escaped_path = str(p.resolve()).replace("'", "''")
+                if kind == "parquet":
+                    con.execute(
+                        f"CREATE TEMP TABLE {tname} AS SELECT * FROM read_parquet('{escaped_path}')"
+                    )
+                else:
+                    # Skip 0-row gzip files (empty ndjson) so non-empty sibling tables stay queryable
+                    with gzip.open(p, "rt", encoding="utf-8") as fh:
+                        first_line = fh.readline().strip()
+                    if first_line:
                         con.execute(
-                            f"CREATE VIEW {tname} AS SELECT * FROM read_json_auto('{escaped_path}')"
+                            f"CREATE TEMP TABLE {tname} AS SELECT * FROM read_json_auto('{escaped_path}')"
                         )
             # Lock down external filesystem/network access before running user SQL
             con.execute("SET enable_external_access = false")
