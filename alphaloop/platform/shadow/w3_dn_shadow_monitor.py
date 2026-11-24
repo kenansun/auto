@@ -63,6 +63,10 @@ from alphaloop.platform.strategies.web3.delta_neutral_carry import (
 
 SHADOW_LIVE_EXECUTION_ENABLED: Final[bool] = False
 DEFAULT_W3_DN_SHADOW_COINS: Final[tuple[str, ...]] = ("BTC", "ETH", "SOL", "AVAX")
+SHADOW_STATUS_ACTIVE: Final[str] = "ACTIVE_EXECUTION"
+SHADOW_STATUS_VACUOUS: Final[str] = "SHADOW_VACUOUS_ZERO_TRADES"
+_MIN_VALID_EPOCH_MS: Final[int] = 1_577_836_800_000  # 2020-01-01T00:00:00Z
+_MAX_VALID_EPOCH_MS: Final[int] = 4_102_444_800_000  # 2100-01-01T00:00:00Z
 
 _BINANCE_SPOT_WATERFALL_BASES: Final[tuple[str, ...]] = (
     "https://data-api.binance.vision",
@@ -112,6 +116,8 @@ _CODE_SEVERITY: Final[dict[PlatformErrorCode, str]] = {
 
 
 def _is_pos_finite(x: Any) -> bool:
+    if isinstance(x, bool):
+        return False
     try:
         v = float(x)
     except (TypeError, ValueError):
@@ -120,11 +126,52 @@ def _is_pos_finite(x: Any) -> bool:
 
 
 def _is_finite(x: Any) -> bool:
+    if isinstance(x, bool):
+        return False
     try:
         v = float(x)
     except (TypeError, ValueError):
         return False
     return math.isfinite(v)
+
+
+def _percentile_nearest_rank(sorted_vals: Sequence[float], q: float) -> float:
+    """Deterministic nearest-rank percentile on a pre-sorted finite sequence."""
+    if not sorted_vals:
+        return 0.0
+    idx = min(len(sorted_vals) - 1, max(0, math.ceil(float(q) * len(sorted_vals)) - 1))
+    return float(sorted_vals[idx])
+
+
+def _compute_4leg_cost_distribution(values: Sequence[float], threshold_bps: float) -> dict[str, Any]:
+    """Compute finite 4-leg cost tail distribution (mean/p95/p99/max and budget-breach spike stats)."""
+    finite_vals = sorted(float(v) for v in values if _is_finite(v))
+    cnt = len(finite_vals)
+    if cnt == 0:
+        return {
+            "count": 0,
+            "mean_bps": 0.0,
+            "p95_bps": 0.0,
+            "p99_bps": 0.0,
+            "max_bps": 0.0,
+            "spike_count": 0,
+            "spike_rate": 0.0,
+        }
+    mean_v = math.fsum(finite_vals) / cnt
+    p95_v = _percentile_nearest_rank(finite_vals, 0.95)
+    p99_v = _percentile_nearest_rank(finite_vals, 0.99)
+    max_v = float(finite_vals[-1])
+    thr = float(threshold_bps) if _is_pos_finite(threshold_bps) else 36.0
+    spikes = sum(1 for v in finite_vals if v > thr)
+    return {
+        "count": cnt,
+        "mean_bps": round(mean_v, 4),
+        "p95_bps": round(p95_v, 4),
+        "p99_bps": round(p99_v, 4),
+        "max_bps": round(max_v, 4),
+        "spike_count": int(spikes),
+        "spike_rate": round(spikes / cnt, 6),
+    }
 
 
 def _normalize_coin_symbol(raw_sym: str) -> str:
@@ -276,6 +323,8 @@ class ShadowMonitorConfig:
     readiness_report_path: Path | None = None
     observe_only_coins: tuple[str, ...] = ()
     service_name: str = "w3_dn_shadow_monitor"
+    enable_prewarm: bool = False
+    prewarm_bars: int = 12
 
 
 @dataclass
@@ -318,7 +367,7 @@ class VirtualPairPosition:
 class ShadowReadinessReport:
     """Machine-verifiable >=48h shadow blind-run readiness assessment."""
 
-    verdict: str  # "READY_FOR_OWNER_REVIEW" | "SHADOW_OBSERVATION_IN_PROGRESS" | "FAIL_CLOSED_BLOCKED"
+    verdict: str  # "READY_FOR_OWNER_REVIEW" | "SHADOW_OBSERVATION_IN_PROGRESS" | "SHADOW_VACUOUS_ZERO_TRADES" | "FAIL_CLOSED_BLOCKED"
     live_execution_enabled: bool
     health_status: str
     elapsed_hours: float
@@ -344,6 +393,19 @@ class ShadowReadinessReport:
     alert_suppressed_by_code: dict[str, int]
     blocking_reasons: list[str]
     observe_only_coin_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    executed_trades: int = 0
+    prewarmed_bars: int = 0
+    non_vacuous: bool = False
+    non_vacuous_parity: bool = False
+    shadow_status: str = SHADOW_STATUS_VACUOUS
+    parity_depth: str = SHADOW_STATUS_VACUOUS
+    p95_observed_4leg_cost_bps: float = 0.0
+    p99_observed_4leg_cost_bps: float = 0.0
+    max_observed_4leg_cost_bps: float = 0.0
+    tail_cost_spike_threshold_bps: float = 36.0
+    tail_cost_spike_count: int = 0
+    tail_cost_spike_rate: float = 0.0
+    primary_coin_cost_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -393,15 +455,21 @@ class PublicRestWaterfallQuoteProvider:
                 )
                 if not isinstance(payload, dict):
                     continue
-                bid = float(payload["bidPrice"])
-                ask = float(payload["askPrice"])
-                bid_qty = float(payload.get("bidQty", 0.0))
-                ask_qty = float(payload.get("askQty", 0.0))
-                # RB-16: fail over to next host on <=0 or crossed BBO!
-                if not (_is_pos_finite(bid) and _is_pos_finite(ask) and bid < ask):
+                raw_bid = payload["bidPrice"]
+                raw_ask = payload["askPrice"]
+                raw_bid_qty = payload.get("bidQty", 0.0)
+                raw_ask_qty = payload.get("askQty", 0.0)
+                if any(isinstance(v, bool) for v in (raw_bid, raw_ask, raw_bid_qty, raw_ask_qty)):
+                    continue
+                bid = float(raw_bid)
+                ask = float(raw_ask)
+                bid_qty = float(raw_bid_qty)
+                ask_qty = float(raw_ask_qty)
+                # RB-16 + STD-46: explicit math.isfinite guard before ordering comparison; fail over on invalid/crossed BBO
+                if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0.0 and ask > 0.0 and bid < ask):
                     logger.warning("Spot waterfall endpoint %s returned invalid BBO for %s: %s/%s", base, sym, bid, ask)
                     continue
-                if not (_is_pos_finite(bid_qty) and _is_pos_finite(ask_qty)):
+                if not (math.isfinite(bid_qty) and math.isfinite(ask_qty) and bid_qty > 0.0 and ask_qty > 0.0):
                     continue
                 ts_ms = utc_now_ms()
                 return bid, ask, bid_qty, ask_qty, ts_ms, base
@@ -719,6 +787,7 @@ class W3DNShadowMonitor:
         *,
         provider: W3DNQuoteProvider | None = None,
         kernel: Web3DeltaNeutralCarryKernel | None = None,
+        prewarm_frames: Sequence[Any] | None = None,
     ) -> None:
         if SHADOW_LIVE_EXECUTION_ENABLED:
             raise RuntimeError(f"{PlatformErrorCode.LIVE_SWITCH_BLOCKED.value}: live execution forbidden")
@@ -798,8 +867,15 @@ class W3DNShadowMonitor:
         self._alert_counts: dict[str, int] = {}
         self._alert_suppressed_counts: dict[str, int] = {}
         self._health_status: str = "INITIALIZING"
+        self._executed_trades: int = 0
+        self._prewarmed_bars: int = 0
+        self._last_prewarm_bucket: int | None = None
 
         self._hydrate_checkpoint()
+
+        if prewarm_frames is not None and self._prewarmed_bars == 0:
+            cap = int(self.config.prewarm_bars) if (self.config.enable_prewarm and int(self.config.prewarm_bars) > 0) else None
+            self.prewarm_from_snapshots(prewarm_frames, max_bars=cap)
 
     def __enter__(self) -> W3DNShadowMonitor:
         return self
@@ -954,6 +1030,9 @@ class W3DNShadowMonitor:
             "alert_counts": dict(self._alert_counts),
             "alert_suppressed_counts": dict(self._alert_suppressed_counts),
             "health_status": self._health_status,
+            "executed_trades": self._executed_trades,
+            "prewarmed_bars": self._prewarmed_bars,
+            "last_prewarm_bucket": self._last_prewarm_bucket,
             "kernel_state": self.kernel.export_state(),
         }
 
@@ -1000,6 +1079,16 @@ class W3DNShadowMonitor:
             str(k): int(v) for k, v in (st.get("alert_suppressed_counts") or {}).items()
         }
         self._health_status = str(st.get("health_status", "INITIALIZING"))
+        if "executed_trades" in st and st["executed_trades"] is not None:
+            self._executed_trades = max(0, int(st["executed_trades"]))
+        else:
+            cnt_row = self.conn.fetch_one(
+                "SELECT COUNT(*) AS cnt FROM shadow_events WHERE action IN ('VIRTUAL_OPEN_PAIR', 'VIRTUAL_CLOSE_PAIR')"
+            )
+            self._executed_trades = int(cnt_row["cnt"]) if cnt_row is not None else 0
+        self._prewarmed_bars = max(0, int(st.get("prewarmed_bars", 0)))
+        raw_lpw = st.get("last_prewarm_bucket")
+        self._last_prewarm_bucket = int(raw_lpw) if raw_lpw is not None else None
         if isinstance(st.get("kernel_state"), dict):
             self.kernel.restore_state(st["kernel_state"])
 
@@ -1215,6 +1304,511 @@ class W3DNShadowMonitor:
 
         return True, PlatformErrorCode.OK, "OK"
 
+    def _build_kernel_bars(
+        self,
+        valid_snaps: dict[str, PairMarketSnapshot],
+        ts_ms: int,
+    ) -> dict[str, CanonicalBar]:
+        """Construct canonical paired {COIN}_SPOT and {COIN}_PERP bars shared by live ticks and pre-warming."""
+        bucket_sec = max(60, int(self.config.kernel_bar_interval_sec))
+        tf_h = bucket_sec / 3600.0
+        bars_at_ts: dict[str, CanonicalBar] = {}
+        for coin, snap in valid_snaps.items():
+            mid_spot = 0.5 * (float(snap.spot_bid) + float(snap.spot_ask))
+            mid_perp = 0.5 * (float(snap.perp_bid) + float(snap.perp_ask))
+            s_sym = spot_leg_symbol(coin)
+            p_sym = perp_leg_symbol(coin)
+            spot_vol = float(snap.spot_bid_qty) * mid_spot if snap.spot_bid_qty is not None else mid_spot
+            bars_at_ts[s_sym] = CanonicalBar(
+                asset_class=ASSET_CLASS_CRYPTO_SPOT,
+                venue="binance_spot",
+                symbol=s_sym,
+                timeframe_h=tf_h,
+                timeframe_sec=bucket_sec,
+                ts_event_ms=int(ts_ms),
+                ts_avail_ms=int(ts_ms),
+                open=mid_spot,
+                high=float(snap.spot_ask),
+                low=float(snap.spot_bid),
+                close=mid_spot,
+                volume_usd=spot_vol,
+                carry_rate_period=0.0,
+                carry_interval_h=tf_h,
+                spread_bps=((float(snap.spot_ask) - float(snap.spot_bid)) / mid_spot) * 10_000.0,
+                provenance=snap.provenance,
+            )
+            bars_at_ts[p_sym] = CanonicalBar(
+                asset_class=ASSET_CLASS_CRYPTO_PERP,
+                venue="hyperliquid",
+                symbol=p_sym,
+                timeframe_h=tf_h,
+                timeframe_sec=bucket_sec,
+                ts_event_ms=int(ts_ms),
+                ts_avail_ms=int(ts_ms),
+                open=mid_perp,
+                high=float(snap.perp_ask),
+                low=float(snap.perp_bid),
+                close=mid_perp,
+                volume_usd=float(self.config.capital_usd),
+                carry_rate_period=float(snap.perp_funding_1h) * tf_h,
+                carry_interval_h=tf_h,
+                spread_bps=((float(snap.perp_ask) - float(snap.perp_bid)) / mid_perp) * 10_000.0,
+                provenance=snap.provenance,
+            )
+        return bars_at_ts
+
+    def _validate_prewarm_snapshot(self, snap: PairMarketSnapshot) -> tuple[bool, PlatformErrorCode, str]:
+        """Validate a historical pre-warming snapshot without rejecting past timestamps against wall clock."""
+        spot_present = snap.spot_bid is not None and snap.spot_ask is not None and snap.spot_ts_ms is not None
+        perp_present = (
+            snap.perp_bid is not None
+            and snap.perp_ask is not None
+            and snap.perp_ts_ms is not None
+            and snap.perp_funding_1h is not None
+        )
+        if not (spot_present and perp_present):
+            return False, PlatformErrorCode.UNPAIRED_LEG, f"Missing spot or perp leg for prewarm {snap.coin}"
+        if not all(_is_pos_finite(x) for x in (snap.spot_bid, snap.spot_ask, snap.perp_bid, snap.perp_ask)):
+            return False, PlatformErrorCode.NON_FINITE_DATA, f"Non-finite/non-positive prewarm BBO for {snap.coin}"
+        if not _is_finite(snap.perp_funding_1h):
+            return False, PlatformErrorCode.NON_FINITE_DATA, f"Non-finite prewarm funding rate for {snap.coin}"
+        if snap.spot_bid_qty is not None and not _is_pos_finite(snap.spot_bid_qty):
+            return False, PlatformErrorCode.NON_FINITE_DATA, f"Invalid prewarm spot_bid_qty for {snap.coin}"
+        if snap.spot_ask_qty is not None and not _is_pos_finite(snap.spot_ask_qty):
+            return False, PlatformErrorCode.NON_FINITE_DATA, f"Invalid prewarm spot_ask_qty for {snap.coin}"
+        if snap.perp_mark is not None and not _is_pos_finite(snap.perp_mark):
+            return False, PlatformErrorCode.NON_FINITE_DATA, f"Invalid prewarm perp_mark for {snap.coin}"
+        if snap.perp_oracle is not None and not _is_pos_finite(snap.perp_oracle):
+            return False, PlatformErrorCode.NON_FINITE_DATA, f"Invalid prewarm perp_oracle for {snap.coin}"
+        if snap.dvol is not None and not _is_pos_finite(snap.dvol):
+            return False, PlatformErrorCode.NON_FINITE_DATA, f"Invalid prewarm dvol for {snap.coin}"
+
+        s_bid = float(snap.spot_bid)
+        s_ask = float(snap.spot_ask)
+        p_bid = float(snap.perp_bid)
+        p_ask = float(snap.perp_ask)
+        if not (math.isfinite(s_bid) and math.isfinite(s_ask) and math.isfinite(p_bid) and math.isfinite(p_ask)):
+            return False, PlatformErrorCode.NON_FINITE_DATA, f"Non-finite prewarm quotes for {snap.coin}"
+        if s_bid >= s_ask or p_bid >= p_ask:
+            return False, PlatformErrorCode.CROSSED_BOOK, f"Crossed book in prewarm snapshot for {snap.coin}"
+
+        for ts_name, ts_val in (
+            ("ts_observe_ms", snap.ts_observe_ms),
+            ("spot_ts_ms", snap.spot_ts_ms),
+            ("perp_ts_ms", snap.perp_ts_ms),
+        ):
+            if (
+                ts_val is None
+                or isinstance(ts_val, bool)
+                or not isinstance(ts_val, (int, float))
+                or not math.isfinite(float(ts_val))
+                or int(ts_val) < _MIN_VALID_EPOCH_MS
+                or int(ts_val) > _MAX_VALID_EPOCH_MS
+            ):
+                return False, PlatformErrorCode.NON_FINITE_DATA, f"Invalid prewarm {ts_name} for {snap.coin}"
+
+        obs_ms = int(snap.ts_observe_ms)
+        spot_ts = int(snap.spot_ts_ms)
+        perp_ts = int(snap.perp_ts_ms)
+        if self.config.enforce_wall_clock_bounds:
+            wall_ms = utc_now_ms()
+            if (obs_ms - wall_ms) > self.config.max_future_skew_ms:
+                return False, PlatformErrorCode.CLOCK_SKEW, f"Future prewarm ts_observe_ms for {snap.coin}"
+        if (spot_ts - obs_ms) > self.config.max_future_skew_ms or (perp_ts - obs_ms) > self.config.max_future_skew_ms:
+            return False, PlatformErrorCode.CLOCK_SKEW, f"Future prewarm quote timestamp for {snap.coin}"
+        if (obs_ms - spot_ts) > self.config.max_stale_ms or (obs_ms - perp_ts) > self.config.max_stale_ms:
+            return False, PlatformErrorCode.STALE_QUOTE, f"Stale prewarm leg quote for {snap.coin}"
+        if abs(spot_ts - perp_ts) > self.config.max_leg_desync_ms:
+            return False, PlatformErrorCode.LEG_DESYNC, f"Prewarm leg desync for {snap.coin}"
+        return True, PlatformErrorCode.OK, "OK"
+
+    def _coerce_prewarm_snapshot(self, raw: Any, *, fallback_coin: str | None = None) -> PairMarketSnapshot | None:
+        """Coerce a PairMarketSnapshot or serialized/minimal dict into a PairMarketSnapshot (fail-closed)."""
+        if isinstance(raw, PairMarketSnapshot):
+            norm_coin = _normalize_coin_symbol(raw.coin or (fallback_coin or ""))
+            if not norm_coin:
+                return None
+            if norm_coin == raw.coin:
+                return raw
+            return PairMarketSnapshot(
+                coin=norm_coin,
+                ts_observe_ms=raw.ts_observe_ms,
+                spot_bid=raw.spot_bid,
+                spot_ask=raw.spot_ask,
+                spot_bid_qty=raw.spot_bid_qty,
+                spot_ask_qty=raw.spot_ask_qty,
+                spot_ts_ms=raw.spot_ts_ms,
+                perp_bid=raw.perp_bid,
+                perp_ask=raw.perp_ask,
+                perp_mark=raw.perp_mark,
+                perp_oracle=raw.perp_oracle,
+                perp_funding_1h=raw.perp_funding_1h,
+                perp_ts_ms=raw.perp_ts_ms,
+                perp_l2_bids=raw.perp_l2_bids,
+                perp_l2_asks=raw.perp_l2_asks,
+                dvol=raw.dvol,
+                spot_source=raw.spot_source,
+                perp_source=raw.perp_source,
+                provenance=raw.provenance,
+            )
+        if not isinstance(raw, dict):
+            return None
+
+        coin_raw = raw.get("coin") or raw.get("symbol") or fallback_coin
+        if not coin_raw or not isinstance(coin_raw, str):
+            return None
+        coin = _normalize_coin_symbol(coin_raw)
+        if not coin:
+            return None
+
+        ts_raw = next(
+            (raw.get(k) for k in ("ts_observe_ms", "ts_ms", "ts_event_ms", "timestamp_ms") if raw.get(k) is not None),
+            None,
+        )
+        if ts_raw is None or isinstance(ts_raw, bool) or not _is_pos_finite(ts_raw):
+            return None
+        obs_ms = int(ts_raw)
+
+        s_bid: float | None = None
+        s_ask: float | None = None
+        if "spot_bid" in raw or "spot_ask" in raw:
+            if not (_is_pos_finite(raw.get("spot_bid")) and _is_pos_finite(raw.get("spot_ask"))):
+                return None
+            s_bid = float(raw["spot_bid"])
+            s_ask = float(raw["spot_ask"])
+        else:
+            s_mid_raw = next((raw.get(k) for k in ("spot_mid", "spot_close", "spot_price") if raw.get(k) is not None), None)
+            if not _is_pos_finite(s_mid_raw):
+                return None
+            sm = float(s_mid_raw)
+            half_s = sm * 0.00005
+            s_bid = sm - half_s
+            s_ask = sm + half_s
+
+        p_bid: float | None = None
+        p_ask: float | None = None
+        if "perp_bid" in raw or "perp_ask" in raw:
+            if not (_is_pos_finite(raw.get("perp_bid")) and _is_pos_finite(raw.get("perp_ask"))):
+                return None
+            p_bid = float(raw["perp_bid"])
+            p_ask = float(raw["perp_ask"])
+        else:
+            p_mid_raw = next((raw.get(k) for k in ("perp_mid", "perp_close", "perp_price") if raw.get(k) is not None), None)
+            if not _is_pos_finite(p_mid_raw):
+                return None
+            pm = float(p_mid_raw)
+            half_p = pm * 0.00005
+            p_bid = pm - half_p
+            p_ask = pm + half_p
+
+        fund_raw = next(
+            (raw.get(k) for k in ("perp_funding_1h", "funding_1h", "funding_rate_1h") if raw.get(k) is not None),
+            None,
+        )
+        if fund_raw is None or not _is_finite(fund_raw):
+            return None
+
+        spot_ts_raw = raw.get("spot_ts_ms")
+        perp_ts_raw = raw.get("perp_ts_ms")
+        spot_ts_ms = int(spot_ts_raw) if (spot_ts_raw is not None and not isinstance(spot_ts_raw, bool) and _is_pos_finite(spot_ts_raw)) else obs_ms
+        perp_ts_ms = int(perp_ts_raw) if (perp_ts_raw is not None and not isinstance(perp_ts_raw, bool) and _is_pos_finite(perp_ts_raw)) else obs_ms
+
+        return PairMarketSnapshot(
+            coin=coin,
+            ts_observe_ms=obs_ms,
+            spot_bid=s_bid,
+            spot_ask=s_ask,
+            spot_bid_qty=raw.get("spot_bid_qty"),
+            spot_ask_qty=raw.get("spot_ask_qty"),
+            spot_ts_ms=spot_ts_ms,
+            perp_bid=p_bid,
+            perp_ask=p_ask,
+            perp_mark=raw.get("perp_mark"),
+            perp_oracle=raw.get("perp_oracle"),
+            perp_funding_1h=float(fund_raw),
+            perp_ts_ms=perp_ts_ms,
+            dvol=raw.get("dvol"),
+            spot_source=str(raw.get("spot_source", "prewarm")),
+            perp_source=str(raw.get("perp_source", "prewarm")),
+            provenance=str(raw.get("provenance", PROVENANCE_REAL)),
+        )
+
+    def _is_kernel_warm_ready(self) -> bool:
+        need = int(self.kernel.warmup_bars)
+        if self._prewarmed_bars >= need:
+            return True
+        st_map = self.kernel.export_state().get("states", {})
+        if isinstance(st_map, dict):
+            return any(
+                isinstance(s, dict) and int(s.get("bar_count", 0)) >= need
+                for s in st_map.values()
+            )
+        return False
+
+    def prewarm_from_bars(
+        self,
+        bar_frames: Sequence[dict[str, CanonicalBar] | tuple[int, dict[str, CanonicalBar]]],
+        *,
+        max_bars: int | None = None,
+    ) -> dict[str, Any]:
+        """Read-only historical CanonicalBar pre-warming (ZERO virtual trades, ticks, or audit-chain mutations)."""
+        if SHADOW_LIVE_EXECUTION_ENABLED:
+            raise RuntimeError(f"{PlatformErrorCode.LIVE_SWITCH_BLOCKED.value}: live execution forbidden")
+        if isinstance(bar_frames, (str, bytes, dict)):
+            raise TypeError("bar_frames must be a sequence of CanonicalBar frame mappings")
+        if max_bars is not None and (isinstance(max_bars, bool) or int(max_bars) < 0):
+            raise ValueError("max_bars must be a non-negative integer")
+
+        bucket_sec = max(60, int(self.config.kernel_bar_interval_sec))
+        bucket_ms = bucket_sec * 1000
+        primary_allowed_syms = {
+            sym
+            for coin in self._primary_coins
+            for sym in (spot_leg_symbol(coin), perp_leg_symbol(coin))
+        }
+        bucket_bars: dict[int, tuple[int, dict[str, CanonicalBar]]] = {}
+        rejected_frames = 0
+
+        for item in bar_frames:
+            explicit_ts: int | None = None
+            raw_map: Any = item
+            if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], dict):
+                if isinstance(item[0], bool) or not _is_pos_finite(item[0]):
+                    rejected_frames += 1
+                    continue
+                explicit_ts = int(item[0])
+                raw_map = item[1]
+            if not isinstance(raw_map, dict) or not raw_map:
+                rejected_frames += 1
+                continue
+
+            clean_map: dict[str, CanonicalBar] = {}
+            frame_ts: int | None = explicit_ts
+            invalid_found = False
+            for sym, bar in raw_map.items():
+                if not isinstance(bar, CanonicalBar):
+                    invalid_found = True
+                    continue
+                sym_u = str(sym).strip().upper()
+                if sym_u not in primary_allowed_syms:
+                    continue
+                if not (
+                    _is_pos_finite(bar.open)
+                    and _is_pos_finite(bar.high)
+                    and _is_pos_finite(bar.low)
+                    and _is_pos_finite(bar.close)
+                    and float(bar.high) >= float(bar.low)
+                    and _is_finite(bar.carry_rate_period)
+                    and not isinstance(bar.ts_event_ms, bool)
+                    and _MIN_VALID_EPOCH_MS <= int(bar.ts_event_ms) <= _MAX_VALID_EPOCH_MS
+                ):
+                    invalid_found = True
+                    continue
+                clean_map[sym_u] = bar
+                if frame_ts is None or int(bar.ts_event_ms) > frame_ts:
+                    frame_ts = int(bar.ts_event_ms)
+
+            if invalid_found and not clean_map:
+                rejected_frames += 1
+                continue
+            if not clean_map or frame_ts is None:
+                rejected_frames += 1
+                continue
+            if not (_MIN_VALID_EPOCH_MS <= frame_ts <= _MAX_VALID_EPOCH_MS):
+                rejected_frames += 1
+                continue
+            if self.config.enforce_wall_clock_bounds and (frame_ts - utc_now_ms()) > self.config.max_future_skew_ms:
+                rejected_frames += 1
+                continue
+            b_idx = int(frame_ts // bucket_ms)
+            prev = bucket_bars.get(b_idx)
+            if prev is None or frame_ts >= prev[0]:
+                bucket_bars[b_idx] = (frame_ts, clean_map)
+
+        sorted_buckets = sorted(bucket_bars.keys())
+        if max_bars is not None:
+            limit = int(max_bars)
+            sorted_buckets = sorted_buckets[-limit:] if limit > 0 else []
+
+        live_start_bucket = int(self._start_ts_ms // bucket_ms) if self._start_ts_ms is not None else None
+        added_bars = 0
+        last_prewarm_ts_ms: int | None = None
+        for b_idx in sorted_buckets:
+            if self._last_prewarm_bucket is not None and b_idx <= self._last_prewarm_bucket:
+                continue
+            if live_start_bucket is not None and b_idx >= live_start_bucket:
+                continue
+            b_ts_ms, b_map = bucket_bars[b_idx]
+            ctx: dict[str, Any] = {"margin_ratio": 1.0, "perp_margin_buffer_ratio": 1.0}
+            _ = self.kernel.on_bar_step(b_ts_ms, b_map, ctx)
+            self._prewarmed_bars += 1
+            self._last_prewarm_bucket = b_idx
+            added_bars += 1
+            last_prewarm_ts_ms = b_ts_ms
+
+        if added_bars > 0 and last_prewarm_ts_ms is not None:
+            self._persist_checkpoint_only(last_prewarm_ts_ms)
+            self._log_event(
+                trace_id=f"w3dn-prewarm-{uuid.uuid4().hex[:10]}",
+                event="SHADOW_PREWARM",
+                level="INFO",
+                payload={
+                    "source": "canonical_bars",
+                    "prewarmed_bars_added": added_bars,
+                    "prewarmed_bars_total": self._prewarmed_bars,
+                    "rejected_frames": rejected_frames,
+                    "kernel_warmup_bars": int(self.kernel.warmup_bars),
+                    "last_prewarm_bucket": self._last_prewarm_bucket,
+                },
+            )
+
+        return {
+            "prewarmed_bars_added": added_bars,
+            "prewarmed_bars_total": self._prewarmed_bars,
+            "rejected_frames": rejected_frames,
+            "kernel_warmup_bars": int(self.kernel.warmup_bars),
+            "kernel_warm_ready": self._is_kernel_warm_ready(),
+            "executed_trades": self._executed_trades,
+            "total_ticks": self._total_ticks,
+            "live_execution_enabled": SHADOW_LIVE_EXECUTION_ENABLED,
+        }
+
+    def prewarm_from_snapshots(
+        self,
+        frames: Sequence[Any],
+        *,
+        max_bars: int | None = None,
+    ) -> dict[str, Any]:
+        """Read-only historical snapshot pre-warming closing the 144h-in-48h zero-trade warmup gap.
+
+        Accepts:
+          - Sequence[dict[str, PairMarketSnapshot]] (ReplayQuoteProvider format)
+          - Sequence[dict[str, dict]] (coin-keyed snapshot dicts)
+          - Flat Sequence[PairMarketSnapshot | dict]
+          - Sequence[dict[str, CanonicalBar]] (delegated to `prewarm_from_bars`)
+        Feeds kernel state causally without opening virtual positions, counting live ticks,
+        modifying cash/audit chain, or advancing `_start_ts_ms`/`_last_kernel_bucket`.
+        """
+        if SHADOW_LIVE_EXECUTION_ENABLED:
+            raise RuntimeError(f"{PlatformErrorCode.LIVE_SWITCH_BLOCKED.value}: live execution forbidden")
+        if isinstance(frames, (str, bytes, dict)):
+            raise TypeError("frames must be a sequence of historical snapshot frames")
+        if max_bars is not None and (isinstance(max_bars, bool) or int(max_bars) < 0):
+            raise ValueError("max_bars must be a non-negative integer")
+
+        frame_list = list(frames)
+        if frame_list:
+            first = frame_list[0]
+            if isinstance(first, dict) and first and all(isinstance(v, CanonicalBar) for v in first.values()):
+                return self.prewarm_from_bars(frame_list, max_bars=max_bars)
+            if (
+                isinstance(first, tuple)
+                and len(first) == 2
+                and isinstance(first[1], dict)
+                and first[1]
+                and all(isinstance(v, CanonicalBar) for v in first[1].values())
+            ):
+                return self.prewarm_from_bars(frame_list, max_bars=max_bars)
+
+        bucket_sec = max(60, int(self.config.kernel_bar_interval_sec))
+        bucket_ms = bucket_sec * 1000
+        bucket_map: dict[int, dict[str, PairMarketSnapshot]] = {}
+        rejected_frames = 0
+        _single_snap_keys = frozenset(
+            {"coin", "symbol", "ts_observe_ms", "ts_ms", "ts_event_ms", "spot_bid", "spot_mid", "spot_close"}
+        )
+
+        def _ingest_one(raw_obj: Any, fallback_coin: str | None = None) -> None:
+            nonlocal rejected_frames
+            snap = self._coerce_prewarm_snapshot(raw_obj, fallback_coin=fallback_coin)
+            if snap is None:
+                rejected_frames += 1
+                return
+            coin = _normalize_coin_symbol(snap.coin)
+            if coin not in self._primary_coins:
+                return
+            ok, _code, _msg = self._validate_prewarm_snapshot(snap)
+            if not ok:
+                rejected_frames += 1
+                return
+            b_idx = int(snap.ts_observe_ms) // bucket_ms
+            b_snaps = bucket_map.setdefault(b_idx, {})
+            prev = b_snaps.get(coin)
+            if prev is None or int(snap.ts_observe_ms) >= int(prev.ts_observe_ms):
+                b_snaps[coin] = snap
+
+        for item in frame_list:
+            if isinstance(item, PairMarketSnapshot):
+                _ingest_one(item)
+            elif isinstance(item, dict):
+                if not item:
+                    rejected_frames += 1
+                    continue
+                is_coin_map = any(isinstance(v, (PairMarketSnapshot, dict)) for v in item.values())
+                if (not is_coin_map) and any(k in item for k in _single_snap_keys):
+                    _ingest_one(item)
+                else:
+                    for raw_k, raw_v in item.items():
+                        _ingest_one(raw_v, fallback_coin=str(raw_k))
+            else:
+                rejected_frames += 1
+
+        sorted_buckets = sorted(bucket_map.keys())
+        if max_bars is not None:
+            limit = int(max_bars)
+            sorted_buckets = sorted_buckets[-limit:] if limit > 0 else []
+
+        live_start_bucket = int(self._start_ts_ms // bucket_ms) if self._start_ts_ms is not None else None
+        added_bars = 0
+        last_prewarm_ts_ms: int | None = None
+        for b_idx in sorted_buckets:
+            if self._last_prewarm_bucket is not None and b_idx <= self._last_prewarm_bucket:
+                continue
+            if live_start_bucket is not None and b_idx >= live_start_bucket:
+                continue
+            b_snaps = bucket_map[b_idx]
+            if not b_snaps:
+                continue
+            b_ts_ms = max(int(s.ts_observe_ms) for s in b_snaps.values())
+            bars_at_ts = self._build_kernel_bars(b_snaps, b_ts_ms)
+            ctx: dict[str, Any] = {"margin_ratio": 1.0, "perp_margin_buffer_ratio": 1.0}
+            dvol_vals = [float(s.dvol) for s in b_snaps.values() if s.dvol is not None and _is_pos_finite(s.dvol)]
+            if dvol_vals:
+                ctx["dvol"] = dvol_vals[-1]
+            # Read-only kernel warm-up: discard trade decisions (zero virtual executions / zero live mutations)
+            _ = self.kernel.on_bar_step(b_ts_ms, bars_at_ts, ctx)
+            self._prewarmed_bars += 1
+            self._last_prewarm_bucket = b_idx
+            added_bars += 1
+            last_prewarm_ts_ms = b_ts_ms
+
+        if added_bars > 0 and last_prewarm_ts_ms is not None:
+            self._persist_checkpoint_only(last_prewarm_ts_ms)
+            self._log_event(
+                trace_id=f"w3dn-prewarm-{uuid.uuid4().hex[:10]}",
+                event="SHADOW_PREWARM",
+                level="INFO",
+                payload={
+                    "source": "snapshots",
+                    "prewarmed_bars_added": added_bars,
+                    "prewarmed_bars_total": self._prewarmed_bars,
+                    "rejected_frames": rejected_frames,
+                    "kernel_warmup_bars": int(self.kernel.warmup_bars),
+                    "last_prewarm_bucket": self._last_prewarm_bucket,
+                },
+            )
+
+        return {
+            "prewarmed_bars_added": added_bars,
+            "prewarmed_bars_total": self._prewarmed_bars,
+            "rejected_frames": rejected_frames,
+            "kernel_warmup_bars": int(self.kernel.warmup_bars),
+            "kernel_warm_ready": self._is_kernel_warm_ready(),
+            "executed_trades": self._executed_trades,
+            "total_ticks": self._total_ticks,
+            "live_execution_enabled": SHADOW_LIVE_EXECUTION_ENABLED,
+        }
+
     def _resolve_mark_prices_for_coin(
         self,
         coin: str,
@@ -1343,6 +1937,7 @@ class W3DNShadowMonitor:
                     reason,
                 ),
             )
+        self._executed_trades += 1
 
     def _apply_atomic_target_pair(
         self,
@@ -1439,6 +2034,7 @@ class W3DNShadowMonitor:
                     reason,
                 ),
             )
+        self._executed_trades += 1
 
     def _accrue_funding(self, valid_snaps: dict[str, PairMarketSnapshot], ts_ms: int) -> float:
         accrued_total = 0.0
@@ -1478,6 +2074,11 @@ class W3DNShadowMonitor:
             "max_observed_abs_basis_bps": round(self._max_observed_abs_basis_bps, 4),
             "open_pairs": sorted(c for c, p in self._positions.items() if p.is_open),
             "last_chain_hash": self._last_chain_hash,
+            "executed_trades": self._executed_trades,
+            "prewarmed_bars": self._prewarmed_bars,
+            "non_vacuous": self._executed_trades > 0,
+            "non_vacuous_parity": self._executed_trades > 0,
+            "shadow_status": SHADOW_STATUS_ACTIVE if self._executed_trades > 0 else SHADOW_STATUS_VACUOUS,
         }
         _atomic_write_json(self.heartbeat_path, hb)
         if self.config.p16_heartbeat_url:
@@ -1972,50 +2573,7 @@ class W3DNShadowMonitor:
         # 3. Kernel decision evaluation on canonical bar bucket (reusing exact W3-DN kernel for G7 parity!)
         if not storm_triggered and (self._last_kernel_bucket is None or cur_bucket > self._last_kernel_bucket):
             self._last_kernel_bucket = cur_bucket
-            bars_at_ts: dict[str, CanonicalBar] = {}
-            tf_h = bucket_sec / 3600.0
-            for coin, snap in valid_snaps.items():
-                mid_spot = 0.5 * (float(snap.spot_bid) + float(snap.spot_ask))
-                mid_perp = 0.5 * (float(snap.perp_bid) + float(snap.perp_ask))
-                s_sym = spot_leg_symbol(coin)
-                p_sym = perp_leg_symbol(coin)
-                spot_vol = float(snap.spot_bid_qty or 1.0) * mid_spot
-                bars_at_ts[s_sym] = CanonicalBar(
-                    asset_class=ASSET_CLASS_CRYPTO_SPOT,
-                    venue="binance_spot",
-                    symbol=s_sym,
-                    timeframe_h=tf_h,
-                    timeframe_sec=bucket_sec,
-                    ts_event_ms=int(ts_ms),
-                    ts_avail_ms=int(ts_ms),
-                    open=mid_spot,
-                    high=float(snap.spot_ask),
-                    low=float(snap.spot_bid),
-                    close=mid_spot,
-                    volume_usd=spot_vol,
-                    carry_rate_period=0.0,
-                    carry_interval_h=tf_h,
-                    spread_bps=((float(snap.spot_ask) - float(snap.spot_bid)) / mid_spot) * 10_000.0,
-                    provenance=snap.provenance,
-                )
-                bars_at_ts[p_sym] = CanonicalBar(
-                    asset_class=ASSET_CLASS_CRYPTO_PERP,
-                    venue="hyperliquid",
-                    symbol=p_sym,
-                    timeframe_h=tf_h,
-                    timeframe_sec=bucket_sec,
-                    ts_event_ms=int(ts_ms),
-                    ts_avail_ms=int(ts_ms),
-                    open=mid_perp,
-                    high=float(snap.perp_ask),
-                    low=float(snap.perp_bid),
-                    close=mid_perp,
-                    volume_usd=float(self.config.capital_usd),
-                    carry_rate_period=float(snap.perp_funding_1h) * tf_h,
-                    carry_interval_h=tf_h,
-                    spread_bps=((float(snap.perp_ask) - float(snap.perp_bid)) / mid_perp) * 10_000.0,
-                    provenance=snap.provenance,
-                )
+            bars_at_ts = self._build_kernel_bars(valid_snaps, ts_ms)
 
             # RB-03: pass exact "margin_ratio" key expected by Web3DeltaNeutralCarryKernel
             ctx: dict[str, Any] = {
@@ -2122,6 +2680,49 @@ class W3DNShadowMonitor:
             else 0.0
         )
 
+        spike_threshold_bps = float(self.kernel.full_4leg_rt_cost_bps)
+        primary_rows = self.conn.fetch_all(
+            "SELECT coin, exec_4leg_cost_bps FROM shadow_ticks "
+            "WHERE guard_status = 'PASS' AND exec_4leg_cost_bps IS NOT NULL"
+        )
+        primary_all_costs: list[float] = []
+        primary_costs_by_coin: dict[str, list[float]] = {}
+        for r in primary_rows:
+            val = r["exec_4leg_cost_bps"]
+            if _is_finite(val):
+                fv = float(val)
+                primary_all_costs.append(fv)
+                primary_costs_by_coin.setdefault(str(r["coin"]), []).append(fv)
+        primary_dist = _compute_4leg_cost_distribution(primary_all_costs, spike_threshold_bps)
+
+        primary_coin_cost_stats: dict[str, dict[str, Any]] = {}
+        for c in sorted(set(self._primary_coins) | set(primary_costs_by_coin.keys())):
+            c_dist = _compute_4leg_cost_distribution(primary_costs_by_coin.get(c, ()), spike_threshold_bps)
+            if c_dist["count"] > 0:
+                primary_coin_cost_stats[c] = {
+                    "valid_ticks": c_dist["count"],
+                    "mean_4leg_cost_bps": c_dist["mean_bps"],
+                    "p95_4leg_cost_bps": c_dist["p95_bps"],
+                    "p99_4leg_cost_bps": c_dist["p99_bps"],
+                    "max_4leg_cost_bps": c_dist["max_bps"],
+                    "spike_count": c_dist["spike_count"],
+                    "spike_rate": c_dist["spike_rate"],
+                }
+
+        obs_rows = self.conn.fetch_all(
+            "SELECT coin, exec_4leg_cost_bps FROM shadow_ticks "
+            "WHERE guard_status = 'OBSERVE_ONLY' AND exec_4leg_cost_bps IS NOT NULL"
+        )
+        obs_costs_by_coin: dict[str, list[float]] = {}
+        for r in obs_rows:
+            val = r["exec_4leg_cost_bps"]
+            if _is_finite(val):
+                obs_costs_by_coin.setdefault(str(r["coin"]), []).append(float(val))
+
+        executed_trades = int(self._executed_trades)
+        non_vacuous = executed_trades > 0
+        parity_depth = SHADOW_STATUS_ACTIVE if non_vacuous else SHADOW_STATUS_VACUOUS
+
         blockers: list[str] = []
         hard_fail = False
         if SHADOW_LIVE_EXECUTION_ENABLED:
@@ -2142,27 +2743,48 @@ class W3DNShadowMonitor:
         if self._total_ticks > 0 and uptime < self.config.min_uptime_ratio:
             blockers.append(f"Uptime {uptime:.4f} < required {self.config.min_uptime_ratio:.4f}")
             hard_fail = True
+        if not non_vacuous:
+            blockers.append(
+                f"SHADOW_VACUOUS_ZERO_TRADES: executed_trades=0 "
+                f"(warmup_bars={self.kernel.warmup_bars}, prewarmed_bars={self._prewarmed_bars})"
+            )
 
         if hard_fail:
             verdict = "FAIL_CLOSED_BLOCKED"
+            shadow_status = SHADOW_STATUS_VACUOUS if not non_vacuous else "FAIL_CLOSED_BLOCKED"
+        elif not non_vacuous:
+            if elapsed_h < self.config.required_shadow_hours:
+                blockers.append(
+                    f"Observation elapsed {elapsed_h:.2f}h < required {self.config.required_shadow_hours:.1f}h"
+                )
+            verdict = SHADOW_STATUS_VACUOUS
+            shadow_status = SHADOW_STATUS_VACUOUS
         elif elapsed_h < self.config.required_shadow_hours:
             blockers.append(
                 f"Observation elapsed {elapsed_h:.2f}h < required {self.config.required_shadow_hours:.1f}h"
             )
             verdict = "SHADOW_OBSERVATION_IN_PROGRESS"
+            shadow_status = SHADOW_STATUS_ACTIVE
         else:
             verdict = "READY_FOR_OWNER_REVIEW"
+            shadow_status = SHADOW_STATUS_ACTIVE
 
         obs_stats_out: dict[str, dict[str, Any]] = {}
         for c, st in sorted(self._observe_only_stats.items()):
             cnt = int(st.get("count", 0.0))
             mean_obs = (float(st.get("cost_sum_bps", 0.0)) / cnt) if cnt > 0 else 0.0
+            c_obs_dist = _compute_4leg_cost_distribution(obs_costs_by_coin.get(c, ()), spike_threshold_bps)
             obs_stats_out[c] = {
                 "valid_ticks": cnt,
                 "fail_ticks": int(st.get("fail_count", 0.0)),
                 "mean_4leg_cost_bps": round(mean_obs, 4),
                 "max_abs_basis_bps": round(float(st.get("max_abs_basis_bps", 0.0)), 4),
                 "last_funding_apr_pct": round(float(st.get("last_funding_apr_pct", 0.0)), 4),
+                "p95_4leg_cost_bps": c_obs_dist["p95_bps"],
+                "p99_4leg_cost_bps": c_obs_dist["p99_bps"],
+                "max_4leg_cost_bps": c_obs_dist["max_bps"],
+                "spike_count": c_obs_dist["spike_count"],
+                "spike_rate": c_obs_dist["spike_rate"],
             }
 
         return ShadowReadinessReport(
@@ -2183,7 +2805,7 @@ class W3DNShadowMonitor:
             min_perp_margin_buffer_ratio=round(self._min_perp_margin_buffer_ratio, 6),
             margin_storm_exit_ratio=float(self.config.margin_storm_exit_ratio),
             mean_observed_4leg_cost_bps=round(mean_4leg, 4),
-            backtest_assumed_4leg_cost_bps=float(self.kernel.full_4leg_rt_cost_bps),
+            backtest_assumed_4leg_cost_bps=spike_threshold_bps,
             shadow_equity_usd=round(eq_now, 4),
             shadow_net_pnl_usd=round(eq_now - float(self.config.capital_usd), 4),
             shadow_funding_usd=round(self._total_funding_usd, 4),
@@ -2192,4 +2814,17 @@ class W3DNShadowMonitor:
             alert_suppressed_by_code=dict(sorted(self._alert_suppressed_counts.items())),
             blocking_reasons=blockers,
             observe_only_coin_stats=obs_stats_out,
+            executed_trades=executed_trades,
+            prewarmed_bars=self._prewarmed_bars,
+            non_vacuous=non_vacuous,
+            non_vacuous_parity=non_vacuous,
+            shadow_status=shadow_status,
+            parity_depth=parity_depth,
+            p95_observed_4leg_cost_bps=primary_dist["p95_bps"],
+            p99_observed_4leg_cost_bps=primary_dist["p99_bps"],
+            max_observed_4leg_cost_bps=primary_dist["max_bps"],
+            tail_cost_spike_threshold_bps=spike_threshold_bps,
+            tail_cost_spike_count=primary_dist["spike_count"],
+            tail_cost_spike_rate=primary_dist["spike_rate"],
+            primary_coin_cost_stats=primary_coin_cost_stats,
         )
