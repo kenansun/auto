@@ -38,6 +38,12 @@ from alphaloop.platform.core_engine.risk_allocator import (
     CausalRiskAllocator,
     RiskAllocatorConfig,
 )
+from alphaloop.platform.core_engine.std46_audit import (
+    audit_composite_portfolio,
+    build_std46_audit_report,
+    compute_dual_sharpe,
+    evaluate_static_ablation,
+)
 from alphaloop.platform.core_engine.validation import (
     EULER_MASCHERONI,
     BenchmarkGateReport,
@@ -158,4 +164,9 @@ __all__ = [
     "InstitutionalGateOutcome",
     "InstitutionalGateReport",
     "evaluate_8_gates",
+    # STD-46 Audit Layer
+    "compute_dual_sharpe",
+    "evaluate_static_ablation",
+    "audit_composite_portfolio",
+    "build_std46_audit_report",
 ]
