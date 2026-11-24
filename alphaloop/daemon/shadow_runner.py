@@ -61,6 +61,9 @@ from alphaloop.plugins.trend_cta_plugin import (
 logger = logging.getLogger(__name__)
 
 DAEMON_LIVE_EXECUTION_ENABLED: Final[bool] = False
+SHADOW_LIVE_EXECUTION_ENABLED: Final[bool] = False
+PARITY_DEPTH_ACTIVE: Final[str] = "ACTIVE_EXECUTION"
+PARITY_DEPTH_VACUOUS: Final[str] = "VACUOUS_ZERO_PLANS"
 TAKER_FEE_BPS_DEFAULT: Final[float] = 4.5
 
 
@@ -188,9 +191,100 @@ class ShadowParityRecord:
     kill_switch_engaged: bool
     status: str
     detail: str
+    parity_depth: str = PARITY_DEPTH_VACUOUS
+    non_vacuous_parity: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def validate_prewindow_funding_warmup(
+    market_store: MarketDataStore,
+    cfg: StrategyConfig,
+    window_start_ms: int,
+) -> dict[str, Any]:
+    """Validate pre-window funding history across required venues (both venue_a and venue_b for dual-venue carry)."""
+    if isinstance(window_start_ms, bool) or not isinstance(window_start_ms, int) or window_start_ms < 0:
+        raise ValueError("window_start_ms must be a non-negative integer")
+    lb_h = max(1, int(cfg.lookback_hours))
+    params = cfg.params or {}
+    vol_lb_h = _param_int(params, "vol_lookback_hours", 168) if params.get("vol_target_leverage_enabled") else 0
+    warm_h = max(lb_h, vol_lb_h) + 24
+    warmup_start_ms = max(0, int(window_start_ms) - warm_h * HOUR_MS)
+    req_oldest_ms = int(window_start_ms) - lb_h * HOUR_MS
+
+    req_venues = [cfg.venue_a, cfg.venue_b] if _is_dual_venue(cfg) else [cfg.venue_a]
+    symbols = list(cfg.symbols or [])
+
+    per_symbol: dict[str, dict[str, Any]] = {}
+    warmed_symbols: list[str] = []
+    unwarmed_symbols: list[str] = []
+    sym_obs_hours_list: list[float] = []
+
+    for sym in symbols:
+        venue_details: dict[str, dict[str, Any]] = {}
+        venue_obs_hours: list[float] = []
+        all_venues_ok = True
+        for venue in req_venues:
+            bars = market_store.load_funding(venue, sym, start_ms=warmup_start_ms, end_ms=int(window_start_ms))
+            valid_bars = [b for b in bars if _is_finite(b.funding_rate)]
+            if valid_bars:
+                oldest_ts: int | None = min(int(b.ts_ms) for b in valid_bars)
+                obs_h = max(0.0, (int(window_start_ms) - oldest_ts) / float(HOUR_MS))
+                v_ok = (lb_h <= 1) or (oldest_ts <= req_oldest_ms)
+            else:
+                oldest_ts = None
+                obs_h = 0.0
+                v_ok = lb_h <= 1
+            venue_obs_hours.append(obs_h)
+            if not v_ok:
+                all_venues_ok = False
+            venue_details[venue] = {
+                "bar_count": len(valid_bars),
+                "oldest_ts_ms": oldest_ts,
+                "observed_hours": round(obs_h, 2),
+                "sufficient": bool(v_ok),
+            }
+
+        sym_bottleneck_h = min(venue_obs_hours) if venue_obs_hours else 0.0
+        sym_obs_hours_list.append(sym_bottleneck_h)
+        if all_venues_ok:
+            warmed_symbols.append(sym)
+        else:
+            unwarmed_symbols.append(sym)
+        per_symbol[sym] = {
+            "sufficient": bool(all_venues_ok),
+            "observed_hours": round(sym_bottleneck_h, 2),
+            "required_hours": lb_h,
+            "coverage_ratio": round(min(1.0, sym_bottleneck_h / float(lb_h)), 4) if lb_h > 0 else 1.0,
+            "venues": venue_details,
+        }
+
+    sufficient = (lb_h <= 1) or bool(warmed_symbols)
+    best_obs_h = max(sym_obs_hours_list) if sym_obs_hours_list else 0.0
+    min_obs_h = min(sym_obs_hours_list) if sym_obs_hours_list else 0.0
+    cov_ratio = 1.0 if lb_h <= 1 else round(min(1.0, best_obs_h / float(lb_h)), 4)
+    sym_cov_ratio = round(len(warmed_symbols) / len(symbols), 4) if symbols else (1.0 if lb_h <= 1 else 0.0)
+    reason = "" if sufficient else "INSUFFICIENT_PREWINDOW_WARMUP"
+
+    return {
+        "sufficient": bool(sufficient),
+        "warmup_ok": bool(sufficient),
+        "warm_ok": bool(sufficient),
+        "reason": reason,
+        "warmup_start_ms": warmup_start_ms,
+        "window_start_ms": int(window_start_ms),
+        "required_hours": lb_h,
+        "vol_lookback_hours": vol_lb_h,
+        "observed_hours": round(best_obs_h, 2),
+        "min_symbol_observed_hours": round(min_obs_h, 2),
+        "coverage_ratio": cov_ratio,
+        "symbol_coverage_ratio": sym_cov_ratio,
+        "required_venues": req_venues,
+        "warmed_symbols": warmed_symbols,
+        "unwarmed_symbols": unwarmed_symbols,
+        "per_symbol": per_symbol,
+    }
 
 
 class ShadowParityAuditor:
@@ -420,51 +514,100 @@ class ShadowParityAuditor:
                 ),
             )
 
-    def _compute_prewindow_warmup(
+    def validate_prewindow_warmup(
         self,
         cfg: StrategyConfig,
         window_start_ms: int,
-    ) -> tuple[int | None, bool, str]:
-        """Return (warmup_start_ms, has_sufficient_history, reason) for apples-to-apples parity backtest."""
+    ) -> dict[str, Any]:
+        """Return structured pre-window warmup diagnostics for funding_carry and trend_cta parity backtests."""
         pid = str(cfg.plugin_id or "funding_carry").strip().lower()
-        params = cfg.params or {}
         if pid == "funding_carry":
-            lb_h = max(1, int(cfg.lookback_hours))
-            vol_lb = _param_int(params, "vol_lookback_hours", 168) if params.get("vol_target_leverage_enabled") else 0
-            warm_h = max(lb_h, vol_lb) + 24
-            warmup_start = max(0, int(window_start_ms) - warm_h * HOUR_MS)
-            if lb_h <= 1:
-                return warmup_start, True, ""
-            # Require pre-window funding history spanning at least lookback_hours before window_start_ms
-            req_oldest = int(window_start_ms) - lb_h * HOUR_MS
-            for sym in cfg.symbols:
-                bars = self.market_store.load_funding(cfg.venue_a, sym, start_ms=warmup_start, end_ms=window_start_ms)
-                if bars and bars[0].ts_ms <= req_oldest:
-                    return warmup_start, True, ""
-            return warmup_start, False, "INSUFFICIENT_PREWINDOW_WARMUP"
+            return validate_prewindow_funding_warmup(self.market_store, cfg, int(window_start_ms))
 
         if pid == "trend_cta":
             cp = parse_cta_params(cfg)
             tf_h = cp["tf_h"]
             tf_ms = cp["tf_ms"]
-            need_bars = max(cp["warmup_bars"], cp["ema_n"] * 3 if cp["ema_n"] > 0 else 0) + 10
+            req_bars = int(cp["warmup_bars"])
+            need_bars = max(req_bars, cp["ema_n"] * 3 if cp["ema_n"] > 0 else 0) + 10
             warmup_start = max(0, int(window_start_ms) - need_bars * tf_ms)
             eval_start_bucket = (int(window_start_ms) // tf_ms) * tf_ms
-            for sym in cfg.symbols:
+            symbols = list(cfg.symbols or [])
+            per_symbol: dict[str, dict[str, Any]] = {}
+            warmed_symbols: list[str] = []
+            unwarmed_symbols: list[str] = []
+            obs_bars_list: list[int] = []
+            for sym in symbols:
                 c1h = self.market_store.load_candles(cfg.venue_a, sym, start_ms=warmup_start, end_ms=eval_start_bucket)
-                if not c1h:
-                    continue
                 bcounts: dict[int, int] = {}
                 for c in c1h:
                     b = (int(c.ts_ms) // tf_ms) * tf_ms
                     if b < eval_start_bucket:
                         bcounts[b] = bcounts.get(b, 0) + 1
                 completed_n = sum(1 for cnt in bcounts.values() if cnt >= tf_h)
-                if completed_n >= cp["warmup_bars"]:
-                    return warmup_start, True, ""
-            return warmup_start, False, "INSUFFICIENT_PREWINDOW_WARMUP"
+                obs_bars_list.append(completed_n)
+                sym_ok = completed_n >= req_bars
+                if sym_ok:
+                    warmed_symbols.append(sym)
+                else:
+                    unwarmed_symbols.append(sym)
+                per_symbol[sym] = {
+                    "sufficient": bool(sym_ok),
+                    "observed_bars": int(completed_n),
+                    "required_bars": req_bars,
+                    "observed_hours": round(float(completed_n * tf_h), 2),
+                    "required_hours": int(req_bars * tf_h),
+                    "coverage_ratio": round(min(1.0, completed_n / float(req_bars)), 4) if req_bars > 0 else 1.0,
+                }
+            sufficient = bool(warmed_symbols) if req_bars > 0 else True
+            best_bars = max(obs_bars_list) if obs_bars_list else 0
+            min_bars = min(obs_bars_list) if obs_bars_list else 0
+            return {
+                "sufficient": bool(sufficient),
+                "warmup_ok": bool(sufficient),
+                "warm_ok": bool(sufficient),
+                "reason": "" if sufficient else "INSUFFICIENT_PREWINDOW_WARMUP",
+                "warmup_start_ms": warmup_start,
+                "window_start_ms": int(window_start_ms),
+                "required_bars": req_bars,
+                "observed_bars": int(best_bars),
+                "required_hours": int(req_bars * tf_h),
+                "observed_hours": round(float(best_bars * tf_h), 2),
+                "min_symbol_observed_hours": round(float(min_bars * tf_h), 2),
+                "coverage_ratio": round(min(1.0, best_bars / float(req_bars)), 4) if req_bars > 0 else 1.0,
+                "symbol_coverage_ratio": round(len(warmed_symbols) / len(symbols), 4) if symbols else 0.0,
+                "required_venues": [cfg.venue_a],
+                "warmed_symbols": warmed_symbols,
+                "unwarmed_symbols": unwarmed_symbols,
+                "per_symbol": per_symbol,
+            }
 
-        return None, True, ""
+        return {
+            "sufficient": True,
+            "warmup_ok": True,
+            "warm_ok": True,
+            "reason": "",
+            "warmup_start_ms": None,
+            "window_start_ms": int(window_start_ms),
+            "required_hours": 0,
+            "observed_hours": 0.0,
+            "min_symbol_observed_hours": 0.0,
+            "coverage_ratio": 1.0,
+            "symbol_coverage_ratio": 1.0,
+            "required_venues": [cfg.venue_a],
+            "warmed_symbols": list(cfg.symbols or []),
+            "unwarmed_symbols": [],
+            "per_symbol": {},
+        }
+
+    def _compute_prewindow_warmup(
+        self,
+        cfg: StrategyConfig,
+        window_start_ms: int,
+    ) -> tuple[int | None, bool, str]:
+        """Return (warmup_start_ms, has_sufficient_history, reason) for apples-to-apples parity backtest."""
+        res = self.validate_prewindow_warmup(cfg, int(window_start_ms))
+        return res["warmup_start_ms"], bool(res["sufficient"]), str(res["reason"])
 
     def evaluate_strategy(
         self,
@@ -543,12 +686,18 @@ class ShadowParityAuditor:
             status = "DRIFT_EXCEEDED"
             detail_parts.append(f"DRIFT={drift_bps:+.1f}bp>|{max_drift_bps:.1f}bp|")
 
+        plans_created_int = int(plans_created)
+        non_vacuous = plans_created_int > 0
+        parity_depth = PARITY_DEPTH_ACTIVE if non_vacuous else PARITY_DEPTH_VACUOUS
+        if not non_vacuous:
+            detail_parts.append(PARITY_DEPTH_VACUOUS)
+
         snap_id = "PAR-" + sha256_obj({
             "sid": cfg.strategy_id,
             "ver": cfg.version,
             "ts": int(window_end_ms),
             "eq": round(shadow_equity_usd, 4),
-            "plans": int(plans_created),
+            "plans": plans_created_int,
         })[:14]
 
         rec = ShadowParityRecord(
@@ -568,7 +717,7 @@ class ShadowParityAuditor:
             live_median_half_spread_bps=round(med_half_spread, 4),
             assumed_slippage_bps=round(assumed_slip, 4),
             spread_ratio=round(spread_ratio, 4),
-            plans_created=int(plans_created),
+            plans_created=plans_created_int,
             plans_blocked=int(plans_blocked),
             open_positions=int(open_positions),
             bbo_freshness_sec=round(float(bbo_freshness_sec), 2),
@@ -576,6 +725,8 @@ class ShadowParityAuditor:
             kill_switch_engaged=bool(kill_switch_engaged),
             status=status,
             detail="; ".join(detail_parts) if detail_parts else "OK",
+            parity_depth=parity_depth,
+            non_vacuous_parity=non_vacuous,
         )
         self.save_snapshot(rec)
         return rec
@@ -608,7 +759,7 @@ class ShadowPortfolioDaemon:
         drift_check_min_hours: float = 24.0,
         bbo_symbols: list[str] | None = None,
     ) -> None:
-        if LIVE_EXECUTION_ENABLED or DAEMON_LIVE_EXECUTION_ENABLED:
+        if LIVE_EXECUTION_ENABLED or DAEMON_LIVE_EXECUTION_ENABLED or SHADOW_LIVE_EXECUTION_ENABLED:
             raise RuntimeError("ShadowPortfolioDaemon refuses non-shadow execution mode")
 
         self.data_dir = Path(data_dir)
@@ -1122,7 +1273,7 @@ class ShadowPortfolioDaemon:
         parity_report_path: Path | None = None,
     ) -> dict[str, Any]:
         """Execute one deterministic SHADOW_DRY_RUN cycle and update parity scorecard."""
-        if LIVE_EXECUTION_ENABLED or DAEMON_LIVE_EXECUTION_ENABLED:
+        if LIVE_EXECUTION_ENABLED or DAEMON_LIVE_EXECUTION_ENABLED or SHADOW_LIVE_EXECUTION_ENABLED:
             raise RuntimeError("ShadowPortfolioDaemon forbids live execution")
 
         with self._lock:
@@ -1199,7 +1350,16 @@ class ShadowPortfolioDaemon:
             if live_ticks:
                 self.store.upsert_bbo_ticks(live_ticks)
                 for t in live_ticks:
-                    if t.bid > 0 and t.ask >= t.bid and _is_finite(t.bid) and _is_finite(t.ask):
+                    if (
+                        not isinstance(t.bid, bool)
+                        and not isinstance(t.ask, bool)
+                        and isinstance(t.bid, (int, float))
+                        and isinstance(t.ask, (int, float))
+                        and math.isfinite(float(t.bid))
+                        and math.isfinite(float(t.ask))
+                        and t.bid > 0
+                        and t.ask >= t.bid
+                    ):
                         prev_c = self._latest_bbo_cache.get((t.venue, t.symbol))
                         if prev_c is None or t.ts_ms >= prev_c.ts_ms:
                             self._latest_bbo_cache[(t.venue, t.symbol)] = t
@@ -1774,6 +1934,13 @@ class ShadowPortfolioDaemon:
         detail: str,
     ) -> dict[str, Any]:
         bridge_sum = self.bridge.summary()
+        total_plans_created = sum(max(0, int(r.plans_created)) for r in strategy_records)
+        non_vacuous_agg = total_plans_created > 0
+        parity_depth_agg = PARITY_DEPTH_ACTIVE if non_vacuous_agg else PARITY_DEPTH_VACUOUS
+        all_strategies_non_vacuous = bool(strategy_records) and all(
+            bool(r.non_vacuous_parity) for r in strategy_records
+        )
+        vacuous_strategies = [r.strategy_id for r in strategy_records if not r.non_vacuous_parity]
         payload: dict[str, Any] = {
             "valid": True,
             "run_mode": "SHADOW_DRY_RUN",
@@ -1782,6 +1949,11 @@ class ShadowPortfolioDaemon:
             "ts_ms": int(ts_ms),
             "status": status,
             "detail": detail,
+            "plans_created": total_plans_created,
+            "parity_depth": parity_depth_agg,
+            "non_vacuous_parity": non_vacuous_agg,
+            "all_strategies_non_vacuous": all_strategies_non_vacuous,
+            "vacuous_strategies": vacuous_strategies,
             "bbo_freshness_sec": round(float(bbo_freshness_sec), 2),
             "kill_switch": bridge_sum["kill_switch"],
             "audit_chain_valid": bridge_sum["audit_chain_valid"],
