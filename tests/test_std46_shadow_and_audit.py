@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import io
 import json
+import math
 import sqlite3
 import subprocess
 import sys
@@ -17,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from alphaloop.core.models import BBOTick, FundingRateBar, StrategyConfig
+from alphaloop.core.models import BBOTick, FundingRateBar, PriceBar, StrategyConfig
 from alphaloop.core.provenance import PROVENANCE_REAL
 from alphaloop.daemon.shadow_runner import (
     DAEMON_LIVE_EXECUTION_ENABLED,
@@ -29,13 +31,18 @@ from alphaloop.daemon.shadow_runner import (
     validate_prewindow_funding_warmup,
 )
 from alphaloop.data.bbo_collector import (
+    MAX_VALID_EPOCH_MS,
+    MIN_VALID_EPOCH_MS,
     TS_SOURCE_RECV_LOCAL,
     TS_SOURCE_VENUE,
     MultiVenueBBOCollector,
     TimestampedBBOTick,
     _http_json,
+    _parse_optional_nonneg_qty,
+    _parse_venue_ts_ms,
 )
 from alphaloop.data.store import MarketDataStore
+from alphaloop.execution import bridge as bridge_module
 from alphaloop.execution.bridge import LIVE_EXECUTION_ENABLED
 from alphaloop.platform.assets import ASSET_CLASS_CRYPTO_PERP, ASSET_CLASS_CRYPTO_SPOT
 from alphaloop.platform.core_engine import (
@@ -291,6 +298,151 @@ class TestBBOCollectorSTD46Hardening(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(proc.returncode, 0, f"STD-46 dataset gate failed: {proc.stdout}\n{proc.stderr}")
+
+    def test_parse_venue_ts_ms_epoch_bounds_and_signed_zero_qty(self) -> None:
+        # Valid boundary values
+        self.assertEqual(_parse_venue_ts_ms(MIN_VALID_EPOCH_MS), MIN_VALID_EPOCH_MS)
+        self.assertEqual(_parse_venue_ts_ms(MAX_VALID_EPOCH_MS), MAX_VALID_EPOCH_MS)
+        self.assertEqual(_parse_venue_ts_ms("1795000123456"), 1_795_000_123_456)
+        self.assertEqual(_parse_venue_ts_ms(1_795_000_123_456.7), 1_795_000_123_456)
+
+        # Fractional < MIN, monotonic, seconds, microseconds, > MAX, and 1e308 overflow MUST return None
+        for bad_ts in (
+            0.5,
+            "0.5",
+            1e-9,
+            0,
+            -1,
+            12345,
+            1_795_000_123,
+            1_795_000_123_456_000,
+            MIN_VALID_EPOCH_MS - 1,
+            MAX_VALID_EPOCH_MS + 1,
+            1e308,
+            "1e308",
+            float("nan"),
+            float("inf"),
+            True,
+            False,
+            None,
+            "",
+        ):
+            self.assertIsNone(_parse_venue_ts_ms(bad_ts), f"Expected None for out-of-bounds ts={bad_ts!r}")
+
+        # Out-of-bounds exchange timestamps fall back cleanly to RECV_LOCAL_ONLY and store without OverflowError
+        collector = MultiVenueBBOCollector(["BTC", "ETH"])
+        payload = {
+            "data": [
+                {"instId": "BTC-USDT-SWAP", "bidPx": "60000", "askPx": "60001", "bidSz": "-0.0", "askSz": "1", "ts": 0.5},
+                {"instId": "ETH-USDT-SWAP", "bidPx": "2500", "askPx": "2501", "bidSz": "1", "askSz": "1", "ts": 1e308},
+            ]
+        }
+        with patch("alphaloop.data.bbo_collector._http_json", return_value=(payload, 5.0)):
+            ticks = collector.fetch_okx_swap_bbo()
+        self.assertEqual(len(ticks), 2)
+        for tk in ticks:
+            self.assertIsNone(tk.venue_ts_ms)
+            self.assertEqual(tk.ts_source, TS_SOURCE_RECV_LOCAL)
+            self.assertEqual(tk.ts_ms, tk.recv_ts_ms)
+            self.assertGreaterEqual(tk.ts_ms, MIN_VALID_EPOCH_MS)
+        self.assertEqual(math.copysign(1.0, ticks[0].bid_qty), 1.0)
+        q_zero = _parse_optional_nonneg_qty(-0.0)
+        self.assertIsNotNone(q_zero)
+        assert q_zero is not None
+        self.assertEqual(math.copysign(1.0, q_zero), 1.0)
+        with tempfile.TemporaryDirectory(prefix="bbo_bounds_") as td:
+            store = MarketDataStore(Path(td) / "market.sqlite")
+            try:
+                self.assertEqual(store.upsert_bbo_ticks(ticks), 2)
+            finally:
+                store.close()
+
+    def test_http_json_nonstandard_constants_malformed_envelopes_and_dual_key_ts(self) -> None:
+        # 1. Non-standard bare NaN / Infinity in HTTP JSON body -> RuntimeError isolated by capture_round
+        class _FakeResp:
+            def __init__(self, body: bytes) -> None:
+                self._buf = io.BytesIO(body)
+
+            def read(self) -> bytes:
+                return self._buf.read()
+
+            def __enter__(self) -> _FakeResp:
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                return None
+
+        for raw_body in (b'{"bid": NaN}', b'{"bid": Infinity}', b'{"bid": -Infinity}'):
+            with patch("urllib.request.urlopen", return_value=_FakeResp(raw_body)):
+                with self.assertRaises(RuntimeError):
+                    _http_json("https://example.invalid/ticker", max_retries=1)
+
+        # 2. Malformed envelopes on OKX/Gate/Lighter do not crash fetch_* or abort capture_round()
+        collector = MultiVenueBBOCollector(["BTC"])
+        exch_ts = 1_795_000_222_333
+
+        with patch("alphaloop.data.bbo_collector._http_json", return_value=({"code": "50000", "data": None}, 4.0)):
+            self.assertEqual(collector.fetch_okx_swap_bbo(), [])
+        with patch("alphaloop.data.bbo_collector._http_json", return_value=({"data": [{"instId": ["BTC-USDT-SWAP"], "bidPx": "60000", "askPx": "60001"}]}, 4.0)):
+            self.assertEqual(collector.fetch_okx_swap_bbo(), [])
+
+        # Gate malformed row + dual-key TS fallback (ts_ms=None or ts_ms=0 -> time_ms)
+        gate_rows = [
+            {"contract": ["BTC_USDT"], "highest_bid": "60000", "lowest_ask": "60001"},
+            {"contract": "BTC_USDT", "highest_bid": "60000", "lowest_ask": "60001", "ts_ms": None, "time_ms": exch_ts},
+            {"contract": "BTC_USDT", "highest_bid": "60002", "lowest_ask": "60003", "ts_ms": 0, "time_ms": exch_ts + 100},
+        ]
+        with patch("alphaloop.data.bbo_collector._http_json", return_value=(gate_rows, 4.0)):
+            g_ticks = collector.fetch_gate_futures_bbo()
+        self.assertEqual(len(g_ticks), 2)
+        self.assertEqual(g_ticks[0].venue_ts_ms, exch_ts)
+        self.assertEqual(g_ticks[0].ts_source, TS_SOURCE_VENUE)
+        self.assertEqual(g_ticks[1].venue_ts_ms, exch_ts + 100)
+        self.assertEqual(g_ticks[1].ts_source, TS_SOURCE_VENUE)
+
+        # Lighter market discovery malformed rows + dual-key TS fallback (ts_ms=None/0 -> timestamp_ms)
+        bad_markets = {
+            "order_books": [
+                {"status": "active", "market_type": "perp", "symbol": "BAD1"},
+                {"status": "active", "market_type": "perp", "symbol": "BAD2", "market_id": "not-int"},
+                {"status": "active", "market_type": "perp", "symbol": "BAD3", "market_id": True},
+                {"status": "active", "market_type": "perp", "symbol": 123, "market_id": 2},
+                {"status": "active", "market_type": "perp", "symbol": "BTC", "market_id": 0},
+            ]
+        }
+        c_none = MultiVenueBBOCollector(["BTC"])
+        with patch("alphaloop.data.bbo_collector._http_json", return_value=({"order_books": None}, 3.0)):
+            self.assertEqual(c_none._ensure_lighter_markets(), {})
+        with patch("alphaloop.data.bbo_collector._http_json", return_value=(bad_markets, 3.0)):
+            self.assertEqual(c_none._ensure_lighter_markets(), {"BTC": 0})
+
+        lighter_book = {
+            "bids": [{"price": "60000", "remaining_base_amount": "1"}],
+            "asks": [{"price": "60001", "remaining_base_amount": "1"}],
+            "ts_ms": 0,
+            "timestamp_ms": exch_ts,
+        }
+        with patch("alphaloop.data.bbo_collector._http_json", return_value=(lighter_book, 3.0)):
+            lt = c_none.fetch_lighter_bbo()
+        self.assertEqual(len(lt), 1)
+        self.assertEqual(lt[0].venue_ts_ms, exch_ts)
+        self.assertEqual(lt[0].ts_source, TS_SOURCE_VENUE)
+
+        # capture_round isolates RuntimeError on one venue without aborting remaining venues
+        def _route_round(url: str, **_kw: Any) -> tuple[Any, float]:
+            if "okx.com" in url:
+                raise RuntimeError("okx bad json NaN")
+            if "gateio.ws" in url:
+                return gate_rows[1:2], 5.0
+            if "hyperliquid.xyz" in url:
+                return {"levels": [[{"px": "60000", "sz": "1"}], [{"px": "60001", "sz": "1"}]], "time": exch_ts}, 5.0
+            return {"order_books": None}, 5.0
+
+        c_round = MultiVenueBBOCollector(["BTC"])
+        with patch("alphaloop.data.bbo_collector._http_json", side_effect=_route_round):
+            all_ticks, errs = c_round.capture_round()
+        self.assertIn("okx", errs)
+        self.assertEqual(sorted(t.venue for t in all_ticks), ["gate", "hyperliquid"])
 
 
 class TestW3DNShadowMonitorSTD46Hardening(unittest.TestCase):
@@ -631,6 +783,280 @@ class TestW3DNShadowMonitorSTD46Hardening(unittest.TestCase):
                 self.assertGreaterEqual(rep2.max_observed_4leg_cost_bps, 82.7)
                 self.assertEqual(rep2.tail_cost_spike_count, 2)
 
+    def test_prewarm_hardening_leg_ts_post_live_noop_canonical_pairing_and_edge_cases(self) -> None:
+        t0 = 1_795_000_000_000
+        bar_ms = 12 * 3_600_000
+
+        # 1. Poisoned spot_ts_ms / perp_ts_ms in dict prewarm inputs MUST fail closed (never default to obs_ms)
+        poisoned_ts_frames: list[dict[str, Any]] = []
+        for idx, (s_ts, p_ts) in enumerate((
+            (float("nan"), t0 - bar_ms),
+            (float("inf"), t0 - bar_ms),
+            (-999, t0 - bar_ms),
+            (0, t0 - bar_ms),
+            (True, t0 - bar_ms),
+            (12345, t0 - bar_ms),
+            (t0 - bar_ms, "garbage"),
+        )):
+            poisoned_ts_frames.append(
+                {
+                    "coin": "BTC",
+                    "ts_observe_ms": t0 - (10 - idx) * bar_ms,
+                    "spot_bid": 60_000.0,
+                    "spot_ask": 60_001.0,
+                    "spot_ts_ms": s_ts,
+                    "perp_bid": 60_010.0,
+                    "perp_ask": 60_011.0,
+                    "perp_ts_ms": p_ts,
+                    "perp_funding_1h": 0.0001,
+                }
+            )
+        # Flat dict with nested metadata dict + absent leg timestamps (defaults to obs_ms cleanly)
+        flat_with_meta = [
+            {
+                "coin": "BTC",
+                "ts_observe_ms": t0 - bar_ms,
+                "spot_bid": 60_000.0,
+                "spot_ask": 60_001.0,
+                "perp_bid": 60_010.0,
+                "perp_ask": 60_011.0,
+                "perp_funding_1h": 0.0001,
+                "meta": {"source": "archive", "batch": 1},
+            }
+        ]
+        with tempfile.TemporaryDirectory(prefix="w3dn_hardening_") as td:
+            cfg = ShadowMonitorConfig(
+                state_dir=Path(td) / "m1",
+                coins=("BTC",),
+                kernel_bar_interval_sec=43_200,
+                enforce_wall_clock_bounds=False,
+            )
+            with W3DNShadowMonitor(cfg, provider=ReplayQuoteProvider([]), kernel=Web3DeltaNeutralCarryKernel(warmup_bars=3)) as mon:
+                r_bad = mon.prewarm_from_snapshots(poisoned_ts_frames)
+                self.assertEqual(r_bad["prewarmed_bars_added"], 0)
+                self.assertEqual(r_bad["rejected_frames"], len(poisoned_ts_frames))
+                self.assertFalse(r_bad["kernel_warm_ready"])
+
+                r_meta = mon.prewarm_from_snapshots(flat_with_meta)
+                self.assertEqual(r_meta["prewarmed_bars_added"], 1)
+                self.assertEqual(r_meta["rejected_frames"], 0)
+
+            # 2. enable_prewarm=True, prewarm_bars=0 MUST pre-warm 0 bars (not unlimited); prewarm_bars=-1 raises ValueError
+            hist_15 = [{"BTC": _make_pair_snap("BTC", t0 - (15 - i) * bar_ms)} for i in range(15)]
+            cfg_zero = ShadowMonitorConfig(
+                state_dir=Path(td) / "m_zero",
+                coins=("BTC",),
+                kernel_bar_interval_sec=43_200,
+                enforce_wall_clock_bounds=False,
+                enable_prewarm=True,
+                prewarm_bars=0,
+            )
+            with W3DNShadowMonitor(cfg_zero, provider=ReplayQuoteProvider([]), prewarm_frames=hist_15) as mon_z:
+                self.assertEqual(mon_z._prewarmed_bars, 0)
+                self.assertFalse(mon_z._is_kernel_warm_ready())
+
+            cfg_neg = ShadowMonitorConfig(
+                state_dir=Path(td) / "m_neg",
+                coins=("BTC",),
+                enable_prewarm=True,
+                prewarm_bars=-1,
+            )
+            with self.assertRaises(ValueError):
+                W3DNShadowMonitor(cfg_neg, provider=ReplayQuoteProvider([]))
+
+            # 3. Post-live prewarm MUST be a strict no-op (both direct call and restart with prewarm_frames)
+            live_dir = Path(td) / "m_live"
+            cfg_live = ShadowMonitorConfig(
+                state_dir=live_dir,
+                coins=("BTC",),
+                kernel_bar_interval_sec=43_200,
+                enforce_wall_clock_bounds=False,
+            )
+            live_snap = [{"BTC": _make_pair_snap("BTC", t0, funding_1h=-0.00001)}]
+            with W3DNShadowMonitor(cfg_live, provider=ReplayQuoteProvider(live_snap)) as mon_l:
+                mon_l.run_once()
+                st_before = mon_l.kernel.export_state()
+                ckpt_ts_before = mon_l.conn.fetch_one("SELECT updated_ts_ms FROM shadow_state_checkpoint WHERE id = 1")["updated_ts_ms"]
+                r_noop = mon_l.prewarm_from_snapshots(hist_15)
+                self.assertEqual(r_noop["prewarmed_bars_added"], 0)
+                self.assertEqual(mon_l.kernel.export_state(), st_before)
+                ckpt_ts_after = mon_l.conn.fetch_one("SELECT updated_ts_ms FROM shadow_state_checkpoint WHERE id = 1")["updated_ts_ms"]
+                self.assertEqual(ckpt_ts_after, ckpt_ts_before)
+
+            cfg_restart = ShadowMonitorConfig(
+                state_dir=live_dir,
+                coins=("BTC",),
+                kernel_bar_interval_sec=43_200,
+                enforce_wall_clock_bounds=False,
+                enable_prewarm=True,
+                prewarm_bars=12,
+            )
+            with W3DNShadowMonitor(cfg_restart, provider=ReplayQuoteProvider([]), prewarm_frames=hist_15) as mon_r:
+                self.assertEqual(mon_r._prewarmed_bars, 0)
+                self.assertEqual(mon_r.kernel.export_state(), st_before)
+                ckpt_ts_restart = mon_r.conn.fetch_one("SELECT updated_ts_ms FROM shadow_state_checkpoint WHERE id = 1")["updated_ts_ms"]
+                self.assertEqual(ckpt_ts_restart, ckpt_ts_before)
+                db_null_test = mon_r.db_path
+
+            # 4. Null prewarmed_bars in checkpoint hydrates cleanly to 0 without TypeError
+            con = sqlite3.connect(str(db_null_test), timeout=5.0)
+            try:
+                con.execute("PRAGMA journal_mode=WAL;")
+                row = con.execute("SELECT state_json FROM shadow_state_checkpoint WHERE id = 1").fetchone()
+                st = json.loads(row[0])
+                st["prewarmed_bars"] = None
+                con.execute(
+                    "UPDATE shadow_state_checkpoint SET state_json = ? WHERE id = 1",
+                    (json.dumps(st, allow_nan=False),),
+                )
+                con.commit()
+            finally:
+                con.close()
+            with W3DNShadowMonitor(cfg_live, provider=ReplayQuoteProvider([])) as mon_null:
+                self.assertEqual(mon_null._prewarmed_bars, 0)
+
+            # 5. CanonicalBar unpaired legs, NaN ts_event_ms, and leading {} delegation
+            def _mk_bar(sym: str, ts_val: Any, open_px: float = 60_000.0, is_perp: bool = False) -> CanonicalBar:
+                return CanonicalBar(
+                    asset_class=ASSET_CLASS_CRYPTO_PERP if is_perp else ASSET_CLASS_CRYPTO_SPOT,
+                    venue="hyperliquid" if is_perp else "binance_spot",
+                    symbol=sym,
+                    timeframe_h=12.0,
+                    timeframe_sec=43_200,
+                    ts_event_ms=ts_val,
+                    ts_avail_ms=t0 - bar_ms,
+                    open=open_px,
+                    high=60_005.0,
+                    low=59_995.0,
+                    close=60_000.0,
+                    volume_usd=1_000_000.0,
+                    carry_rate_period=0.0012 if is_perp else 0.0,
+                    carry_interval_h=12.0,
+                    spread_bps=1.0,
+                    provenance=PROVENANCE_REAL,
+                )
+
+            unpaired_frames = [
+                {
+                    spot_leg_symbol("BTC"): _mk_bar(spot_leg_symbol("BTC"), t0 - (12 - i) * bar_ms),
+                    perp_leg_symbol("BTC"): _mk_bar(perp_leg_symbol("BTC"), t0 - (12 - i) * bar_ms, open_px=float("nan"), is_perp=True),
+                }
+                for i in range(12)
+            ]
+            nan_ts_frame = [
+                {
+                    spot_leg_symbol("BTC"): _mk_bar(spot_leg_symbol("BTC"), float("nan")),
+                    perp_leg_symbol("BTC"): _mk_bar(perp_leg_symbol("BTC"), t0 - bar_ms, is_perp=True),
+                }
+            ]
+            valid_12_bars = [
+                {
+                    spot_leg_symbol("BTC"): _mk_bar(spot_leg_symbol("BTC"), t0 - (12 - i) * bar_ms),
+                    perp_leg_symbol("BTC"): _mk_bar(perp_leg_symbol("BTC"), t0 - (12 - i) * bar_ms, is_perp=True),
+                }
+                for i in range(12)
+            ]
+
+            cfg_bars = ShadowMonitorConfig(
+                state_dir=Path(td) / "m_bars",
+                coins=("BTC",),
+                kernel_bar_interval_sec=43_200,
+                enforce_wall_clock_bounds=False,
+            )
+            with W3DNShadowMonitor(cfg_bars, provider=ReplayQuoteProvider([]), kernel=Web3DeltaNeutralCarryKernel(warmup_bars=12)) as mon_b:
+                r_unp = mon_b.prewarm_from_bars(unpaired_frames)
+                self.assertEqual(r_unp["prewarmed_bars_added"], 0)
+                self.assertEqual(r_unp["rejected_frames"], 12)
+                self.assertFalse(r_unp["kernel_warm_ready"])
+                self.assertEqual(mon_b.kernel.export_state()["states"], {})
+
+                r_nants = mon_b.prewarm_from_bars(nan_ts_frame)
+                self.assertEqual(r_nants["prewarmed_bars_added"], 0)
+                self.assertEqual(r_nants["rejected_frames"], 1)
+
+                r_lead_empty = mon_b.prewarm_from_snapshots([{}] + valid_12_bars)
+                self.assertEqual(r_lead_empty["prewarmed_bars_added"], 12)
+                self.assertEqual(r_lead_empty["rejected_frames"], 1)
+                self.assertTrue(r_lead_empty["kernel_warm_ready"])
+
+            # 6. Staggered multi-coin bars (6 BTC + 6 ETH with warmup_bars=12) MUST NOT claim kernel_warm_ready
+            cfg_stag = ShadowMonitorConfig(
+                state_dir=Path(td) / "m_stag",
+                coins=("BTC", "ETH"),
+                kernel_bar_interval_sec=43_200,
+                enforce_wall_clock_bounds=False,
+            )
+            staggered_snaps = [
+                {"BTC": _make_pair_snap("BTC", t0 - (12 - i) * bar_ms)}
+                if i < 6
+                else {"ETH": _make_pair_snap("ETH", t0 - (12 - i) * bar_ms, spot_mid=2_500.0)}
+                for i in range(12)
+            ]
+            with W3DNShadowMonitor(cfg_stag, provider=ReplayQuoteProvider([]), kernel=Web3DeltaNeutralCarryKernel(warmup_bars=12)) as mon_s:
+                r_st = mon_s.prewarm_from_snapshots(staggered_snaps)
+                self.assertEqual(r_st["prewarmed_bars_added"], 12)
+                self.assertFalse(r_st["kernel_warm_ready"])
+
+            # 7. Overflow-safe midpoint on 1e308 quotes & fail-closed on inf basis ratio
+            extreme_ok = PairMarketSnapshot(
+                coin="BTC",
+                ts_observe_ms=t0,
+                spot_bid=1e308,
+                spot_ask=1.5e308,
+                spot_bid_qty=10.0,
+                spot_ask_qty=10.0,
+                spot_ts_ms=t0,
+                perp_bid=1e308,
+                perp_ask=1.5e308,
+                perp_mark=1.25e308,
+                perp_oracle=1.25e308,
+                perp_funding_1h=0.0001,
+                perp_ts_ms=t0,
+                dvol=55.0,
+                provenance=PROVENANCE_REAL,
+            )
+            cfg_ext = ShadowMonitorConfig(
+                state_dir=Path(td) / "m_ext",
+                coins=("BTC",),
+                kernel_bar_interval_sec=43_200,
+                enforce_wall_clock_bounds=False,
+            )
+            with W3DNShadowMonitor(cfg_ext, provider=ReplayQuoteProvider([{"BTC": extreme_ok}])) as mon_ext:
+                res_ext = mon_ext.run_once()
+                self.assertEqual(res_ext["status"], "HEALTHY")
+                serialized_ext = json.dumps(res_ext, allow_nan=False)
+                self.assertIn("BTC", serialized_ext)
+
+    def test_waterfall_provider_handles_json_null_without_type_error(self) -> None:
+        class _NullClient:
+            def fetch_json(self, url: str, method: str = "GET", json_payload: Any = None, **_kw: Any) -> Any:
+                if "host1" in url:
+                    return {"bidPrice": None, "askPrice": "60001", "bidQty": "1", "askQty": "1"}
+                if "host2" in url:
+                    return {"bidPrice": "60000", "askPrice": "60001", "bidQty": None, "askQty": "1"}
+                if "host3" in url:
+                    return {"bidPrice": "60000", "askPrice": "60001", "bidQty": "2", "askQty": "3"}
+                if json_payload and json_payload.get("type") == "metaAndAssetCtxs":
+                    return [{"universe": [{"name": "BTC"}]}, [{"markPx": "60005", "oraclePx": "60005", "funding": "0.0001"}]]
+                if json_payload and json_payload.get("type") == "l2Book":
+                    return {"levels": [[{"px": None, "sz": "1.0"}], [{"px": "60010", "sz": None}]], "time": None}
+                return {"result": {"data": []}}
+
+        prov = PublicRestWaterfallQuoteProvider(
+            client=_NullClient(),  # type: ignore[arg-type]
+            spot_bases=("https://host1.invalid", "https://host2.invalid", "https://host3.invalid"),
+        )
+        spot = prov._fetch_binance_spot_bbo("BTC")
+        self.assertIsNotNone(spot)
+        assert spot is not None
+        self.assertEqual(spot[5], "https://host3.invalid")
+
+        snaps = prov.fetch_snapshots(("BTC",), trace_id="test-null-failover")
+        self.assertIn("BTC", snaps)
+        self.assertAlmostEqual(snaps["BTC"].spot_bid, 60_000.0)
+        self.assertIsNone(snaps["BTC"].perp_bid)
+        self.assertIsNone(snaps["BTC"].perp_ask)
+
 
 class TestShadowRunnerSTD46Hardening(unittest.TestCase):
     """F5.4: non-vacuous parity_depth, dual-venue pre-window funding warmup validator & finite BBO guard."""
@@ -761,26 +1187,154 @@ class TestShadowRunnerSTD46Hardening(unittest.TestCase):
     def test_daemon_finalize_report_fields_and_nan_bbo_rejection(self) -> None:
         now_ms = 1_795_400_000_000
         with tempfile.TemporaryDirectory(prefix="runner_daemon_") as td:
-            daemon = ShadowPortfolioDaemon(Path(td), bbo_symbols=["BTC"])
+            daemon = ShadowPortfolioDaemon(Path(td) / "d1", bbo_symbols=["BTC"])
             try:
                 poison_ticks = [
                     BBOTick("hyperliquid", "BTC", now_ms, float("nan"), 60_001.0, 1.0, 1.0, 5.0, PROVENANCE_REAL),
                     BBOTick("hyperliquid", "BTC", now_ms, 60_000.0, float("inf"), 1.0, 1.0, 5.0, PROVENANCE_REAL),
                     BBOTick("gate", "BTC", now_ms, True, 60_001.0, 1.0, 1.0, 5.0, PROVENANCE_REAL),  # type: ignore[arg-type]
+                    BBOTick("gate", "BTC", now_ms, None, 60_001.0, 1.0, 1.0, 5.0, PROVENANCE_REAL),  # type: ignore[arg-type]
+                    BBOTick("gate", "BTC", now_ms, 1e308, 1e308, 1.0, 1.0, 5.0, PROVENANCE_REAL),
+                    BBOTick("gate", "BTC", now_ms, 60_000.0, 60_001.0, float("nan"), 1.0, 5.0, PROVENANCE_REAL),
+                    BBOTick("gate", "BTC", now_ms, 60_000.0, 60_001.0, 1.0, 1.0, float("inf"), PROVENANCE_REAL),
+                    BBOTick("gate", "BTC", True, 60_000.0, 60_001.0, 1.0, 1.0, 5.0, PROVENANCE_REAL),  # type: ignore[arg-type]
                 ]
                 rep = daemon.run_once(now_ms=now_ms, live_ticks=poison_ticks, collect_live=False)
                 self.assertEqual(rep["status"], "DEGRADED_HALT")
+                self.assertEqual(rep["detail"], "NO_BBO_TICKS_AVAILABLE")
                 self.assertEqual(rep["plans_created"], 0)
                 self.assertEqual(rep["parity_depth"], PARITY_DEPTH_VACUOUS)
                 self.assertFalse(rep["non_vacuous_parity"])
                 self.assertFalse(rep["all_strategies_non_vacuous"])
                 self.assertEqual(daemon._latest_bbo_cache, {})
-                disk_report = json.loads((Path(td) / "shadow_parity_report.json").read_text(encoding="utf-8"))
+                self.assertIsNone(daemon.store.load_latest_bbo_tick("gate", "BTC"))
+                self.assertIsNone(daemon.store.load_latest_bbo_tick("hyperliquid", "BTC"))
+                disk_report = json.loads((Path(td) / "d1" / "shadow_parity_report.json").read_text(encoding="utf-8"))
                 self.assertEqual(disk_report["parity_depth"], PARITY_DEPTH_VACUOUS)
                 self.assertFalse(disk_report["non_vacuous_parity"])
                 self.assertEqual(disk_report["plans_created"], 0)
+
+                # Valid hyperliquid + poisoned bool gate MUST still fail closed (never persist bid=1.0!)
+                mixed_ticks = [
+                    BBOTick("hyperliquid", "BTC", now_ms, 60_000.0, 60_001.0, 1.0, 1.0, 5.0, PROVENANCE_REAL),
+                    BBOTick("gate", "BTC", now_ms, True, 60_001.0, 1.0, 1.0, 5.0, PROVENANCE_REAL),  # type: ignore[arg-type]
+                ]
+                rep_mix = daemon.run_once(now_ms=now_ms, live_ticks=mixed_ticks, collect_live=False)
+                self.assertEqual(rep_mix["status"], "DEGRADED_HALT")
+                self.assertEqual(rep_mix["detail"], "MISSING_VENUE_BBO(gate)")
+                self.assertIsNone(daemon.store.load_latest_bbo_tick("gate", "BTC"))
+
+                # collect_live=True filters collected ticks before upsert and does NOT double-upsert
+                collected_batch = [
+                    BBOTick("hyperliquid", "BTC", now_ms + 1_000, 60_010.0, 60_011.0, 1.0, 1.0, 5.0, PROVENANCE_REAL),
+                    BBOTick("gate", "BTC", now_ms + 1_000, 60_010.0, 60_011.0, 1.0, 1.0, 5.0, PROVENANCE_REAL),
+                    BBOTick("gate", "BTC", now_ms + 1_000, True, 60_011.0, 1.0, 1.0, 5.0, PROVENANCE_REAL),  # type: ignore[arg-type]
+                ]
+                with (
+                    patch.object(daemon._collector, "capture_round", return_value=(collected_batch, {})),
+                    patch.object(daemon.store, "upsert_bbo_ticks", wraps=daemon.store.upsert_bbo_ticks) as spy_upsert,
+                ):
+                    rep_live = daemon.run_once(now_ms=now_ms + 1_000, collect_live=True)
+                self.assertEqual(rep_live["status"], "PARITY_OK")
+                self.assertEqual(spy_upsert.call_count, 1)
+                self.assertEqual(len(spy_upsert.call_args[0][0]), 2)
             finally:
                 daemon.close()
+
+            # Dynamic bridge.LIVE_EXECUTION_ENABLED monkeypatch after init MUST raise RuntimeError on run_once()
+            daemon2 = ShadowPortfolioDaemon(Path(td) / "d2", bbo_symbols=["BTC"])
+            try:
+                with patch.object(bridge_module, "LIVE_EXECUTION_ENABLED", True):
+                    with self.assertRaises(RuntimeError):
+                        daemon2.run_once(now_ms=now_ms, live_ticks=[], collect_live=False)
+            finally:
+                daemon2.close()
+
+    def test_shadow_auditor_window_validation_cta_ohlc_filter_and_bool_counter_rejection(self) -> None:
+        cfg_carry = self._make_carry_cfg(lookback_hours=24)
+        cfg_cta = StrategyConfig(
+            strategy_id="trend_cta_test",
+            version="v1",
+            family="trend_cta",
+            status="SHADOW_LIVE",
+            plugin_id="trend_cta",
+            venue_a="hyperliquid",
+            venue_b="",
+            mode="perp",
+            symbols=["BTC"],
+            capital_usd=10_000.0,
+            lookback_hours=24,
+            slippage_per_leg_bps=3.0,
+            params={"timeframe_hours": 4},
+        )
+        win_start = 1_795_000_000_000
+        win_start_bucket = (win_start // (4 * 3_600_000)) * (4 * 3_600_000)
+        hour_ms = 3_600_000
+
+        with tempfile.TemporaryDirectory(prefix="runner_cta_hard_") as td:
+            store = MarketDataStore(Path(td) / "market.sqlite")
+            auditor = ShadowParityAuditor(Path(td) / "parity.sqlite", store)
+            try:
+                # 1. Invalid window_start_ms rejected for BOTH funding_carry and trend_cta (no bool/float/str coercion)
+                for bad_win in (True, False, -1, 1.5, "1795000000000"):
+                    with self.assertRaises(ValueError):
+                        auditor.validate_prewindow_warmup(cfg_carry, bad_win)  # type: ignore[arg-type]
+                    with self.assertRaises(ValueError):
+                        auditor.validate_prewindow_warmup(cfg_cta, bad_win)  # type: ignore[arg-type]
+
+                # 2. trend_cta warmup rejects NaN/Inf/inverted OHLC candles inside 31 x 4h buckets
+                poison_candles: list[PriceBar] = []
+                for b in range(1, 32):
+                    bts = win_start_bucket - b * 4 * hour_ms
+                    for h in range(3):
+                        poison_candles.append(
+                            PriceBar("hyperliquid", "BTC", bts + h * hour_ms, 60_000.0, 60_100.0, 59_900.0, 60_050.0, 100.0, PROVENANCE_REAL)
+                        )
+                    # 4th candle in every bucket is poisoned (Inf / 'NaN' stored in SQLite, or inverted OHLC)
+                    if b % 2 == 1:
+                        poison_candles.append(
+                            PriceBar("hyperliquid", "BTC", bts + 3 * hour_ms, float("inf"), float("inf"), float("-inf"), "NaN", 100.0, PROVENANCE_REAL)  # type: ignore[arg-type]
+                        )
+                    else:
+                        poison_candles.append(
+                            PriceBar("hyperliquid", "BTC", bts + 3 * hour_ms, 60_000.0, 59_000.0, 61_000.0, 60_000.0, 100.0, PROVENANCE_REAL)
+                        )
+                store.upsert_candles(poison_candles)
+                res_poison = auditor.validate_prewindow_warmup(cfg_cta, win_start)
+                self.assertFalse(res_poison["sufficient"])
+                self.assertEqual(res_poison["observed_bars"], 0)
+
+                # Replace 4th candle in each bucket with finite valid OHLC -> warmed (31/31)!
+                valid_4th = [
+                    PriceBar("hyperliquid", "BTC", (win_start_bucket - b * 4 * hour_ms) + 3 * hour_ms, 60_000.0, 60_100.0, 59_900.0, 60_050.0, 100.0, PROVENANCE_REAL)
+                    for b in range(1, 32)
+                ]
+                store.upsert_candles(valid_4th)
+                res_valid = auditor.validate_prewindow_warmup(cfg_cta, win_start)
+                self.assertTrue(res_valid["sufficient"])
+                self.assertEqual(res_valid["observed_bars"], 31)
+
+                # 3. evaluate_strategy rejects bool plans_created / plans_blocked / open_positions
+                for bad_kw in (
+                    {"plans_created": True, "plans_blocked": 0, "open_positions": 0},
+                    {"plans_created": 0, "plans_blocked": False, "open_positions": 0},
+                    {"plans_created": 0, "plans_blocked": 0, "open_positions": True},
+                ):
+                    with self.assertRaises(ValueError):
+                        auditor.evaluate_strategy(
+                            cfg_carry,
+                            window_start_ms=win_start,
+                            window_end_ms=win_start + 2 * hour_ms,
+                            shadow_equity_usd=10_000.0,
+                            live_half_spreads_bps=[1.0],
+                            bbo_freshness_sec=5.0,
+                            audit_chain_valid=True,
+                            kill_switch_engaged=False,
+                            **bad_kw,  # type: ignore[arg-type]
+                        )
+            finally:
+                auditor.close()
+                store.close()
 
 
 class TestSTD46AuditLayerAndImmutability(unittest.TestCase):
@@ -1040,6 +1594,150 @@ class TestSTD46AuditLayerAndImmutability(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(proc_sh.returncode, 1)
+
+    def test_std46_audit_contradictory_sleeves_half_vacuous_fx_bool_and_apples_to_apples_ablation(self) -> None:
+        self.assertTrue(_SCHQ_GATE_SCRIPT.is_file(), f"Missing SCHQ verifier CLI: {_SCHQ_GATE_SCRIPT}")
+
+        # 1. Contradictory sleeve indicators MUST fail closed
+        contradictory_sleeves = [
+            {"sleeve_id": "CONTRA_1", "gates_passed": 8, "passed_8_of_8": False, "currency": "USD"},
+            {"sleeve_id": "CONTRA_2", "gates_passed": 8, "gates": "7/8", "currency": "USD"},
+            {"sleeve_id": "CONTRA_3", "gates_passed": 8, "classification": "STATIC_ALLOCATION_DOMINATED", "currency": "USD"},
+            {"sleeve_id": "CONTRA_4", "gates_passed": 9, "gates_total": 8, "currency": "USD"},
+            {"sleeve_id": "CONTRA_5", "gates_passed": 8, "eligible_for_production": False, "currency": "USD"},
+            {"sleeve_id": "CONTRA_6", "gates_passed": 8, "dominated_by_static": True, "currency": "USD"},
+            {"sleeve_id": "CONTRA_7", "gates_passed": 8, "weight": 0.5, "weight_final": -0.9, "currency": "USD"},
+        ]
+        res_contra = audit_composite_portfolio(contradictory_sleeves, {"USD"}, fx_hedged=False)
+        self.assertFalse(res_contra["eligible_for_production"])
+        self.assertEqual(res_contra["classification"], "DIAGNOSTIC_HYPOTHETICAL_ONLY")
+        self.assertEqual(
+            res_contra["failing_sleeves"],
+            ["CONTRA_1", "CONTRA_2", "CONTRA_3", "CONTRA_4", "CONTRA_5", "CONTRA_6", "CONTRA_7"],
+        )
+
+        # Dual consistent weight aliases (weight == weight_final == 0.5) must NOT double-count above 1.0
+        dual_w_ok = [
+            {"sleeve_id": "W_A", "gates_passed": 8, "gates_total": 8, "weight": 0.5, "weight_final": 0.5, "currency": "USD"},
+            {"sleeve_id": "W_B", "gates_passed": 8, "gates_total": 8, "weight": 0.5, "weight_final": 0.5, "currency": "USD"},
+        ]
+        res_dw = audit_composite_portfolio(dual_w_ok, {"USD"}, fx_hedged=False)
+        self.assertTrue(res_dw["eligible_for_production"])
+        self.assertEqual(res_dw["classification"], "PRODUCTION_ELIGIBLE")
+
+        # 2. build_std46_audit_report rejects string fx_hedged="false" and malformed non-list sleeves
+        with self.assertRaises(ValueError):
+            build_std46_audit_report(
+                report_name="bad_fx_str",
+                composites=[
+                    {
+                        "portfolio_id": "c_bad_fx",
+                        "currencies": ["USD", "RMB"],
+                        "fx_hedged": "false",
+                        "cagr_pct": 8.0,
+                        "ann_vol_pct": 2.0,
+                        "sleeves": [{"sleeve_id": "S1", "gates_passed": 8, "gates_total": 8, "currency": "USD"}],
+                    }
+                ],
+            )
+        with self.assertRaises(ValueError):
+            build_std46_audit_report(
+                report_name="bad_sleeves_str",
+                composites=[
+                    {
+                        "portfolio_id": "c_bad_sleeves",
+                        "currencies": ["USD"],
+                        "fx_hedged": False,
+                        "sleeves": "bad",
+                        "status": "PRODUCTION",
+                    }
+                ],
+            )
+
+        # 3. Half-vacuous shadows, alias-gate production composite & apples-to-apples ablation pass SCHQ --mode report
+        rep = build_std46_audit_report(
+            report_name="std46_iter2_parity_report",
+            strategies=[
+                {
+                    "strategy_id": "RAW_BEAT_STATIC",
+                    "currency": "USD",
+                    "cagr_pct": 5.0,
+                    "ann_vol_pct": 5.5556,
+                    "raw_sharpe": 0.90,
+                    "max_dd_pct": 5.0,
+                    "calmar": 1.0,
+                    "static_metrics": {"cagr_pct": 5.0, "sharpe": 0.85, "max_dd_pct": 5.0, "calmar": 1.0},
+                }
+            ],
+            composites=[
+                {
+                    "portfolio_id": "prod_alias_gates",
+                    "currencies": ["USD"],
+                    "fx_hedged": False,
+                    "cagr_pct": 10.0,
+                    "ann_vol_pct": 3.0,
+                    "sleeves": [
+                        {"sleeve_id": "S1", "passed_gates": 8, "total_gates": 8, "currency": "USD"},
+                        {"sleeve_id": "S2", "passed_8_of_8": True, "currency": "USD"},
+                    ],
+                },
+                {
+                    "portfolio_id": "diag_contra_sleeve",
+                    "currencies": ["USD"],
+                    "fx_hedged": False,
+                    "cagr_pct": 9.0,
+                    "ann_vol_pct": 3.0,
+                    "sleeves": [
+                        {"sleeve_id": "BAD_CAP", "gates_passed": 8, "gates_total": 8, "verdict_cap": "STATIC_ALLOCATION_DOMINATED", "currency": "USD"},
+                    ],
+                },
+            ],
+            shadows=[
+                {"shadow_id": "sh_plans_gt0_trades_0", "plans_created": 5, "executed_trades": 0, "status": "SHADOW_READY"},
+                {"shadow_id": "sh_plans_0_trades_gt0", "plans_created": 0, "executed_trades": 3, "status": "PARITY_OK"},
+                {"shadow_id": "sh_alias_vacuous", "orders_planned": 2, "fills": 0, "status": "SHADOW_READY"},
+                {"shadow_id": "sh_bool_counter", "plans_created": True, "executed_trades": 2, "status": "SHADOW_READY"},
+                {"shadow_id": "sh_missing_counters", "status": "SHADOW_READY"},
+            ],
+        )
+
+        # Apples-to-apples ablation check: raw_sharpe=0.90 > static sharpe=0.85 -> NOT dominated
+        self.assertFalse(rep["strategies"][0]["static_ablation"]["dominated_by_static"])
+        self.assertAlmostEqual(rep["strategies"][0]["static_ablation"]["deltas"]["sharpe"], 0.05, places=6)
+
+        # Canonicalized sleeve gates on production composite
+        prod_c = rep["composites"][0]
+        self.assertTrue(prod_c["eligible_for_production"])
+        self.assertEqual(prod_c["sleeves"][0]["gates_passed"], 8)
+        self.assertEqual(prod_c["sleeves"][0]["gates_total"], 8)
+        self.assertEqual(prod_c["sleeves"][1]["gates_passed"], 8)
+        self.assertEqual(prod_c["sleeves"][1]["gates_total"], 8)
+
+        # Disqualifying verdict_cap synced into sleeve verdict/status
+        diag_c = rep["composites"][1]
+        self.assertFalse(diag_c["eligible_for_production"])
+        self.assertEqual(diag_c["sleeves"][0]["verdict"], "STATIC_ALLOCATION_DOMINATED")
+
+        # All 5 vacuous/half-vacuous shadows capped properly
+        self.assertEqual(rep["shadows"][0]["status"], "SHADOW_VACUOUS_ZERO_TRADES")
+        self.assertFalse(rep["shadows"][0]["non_vacuous_parity"])
+        self.assertEqual(rep["shadows"][1]["status"], "VACUOUS_ZERO_PLANS")
+        self.assertFalse(rep["shadows"][1]["non_vacuous_parity"])
+        self.assertEqual(rep["shadows"][2]["status"], "SHADOW_VACUOUS_ZERO_TRADES")
+        self.assertEqual(rep["shadows"][3]["status"], "VACUOUS_ZERO_PLANS")
+        self.assertEqual(rep["shadows"][4]["status"], "VACUOUS_ZERO_PLANS")
+
+        with tempfile.TemporaryDirectory(prefix="std46_iter2_gate_") as td:
+            rp = Path(td) / "iter2_report.json"
+            rp.write_text(json.dumps(rep, indent=2, allow_nan=False), encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, "-B", str(_SCHQ_GATE_SCRIPT), "--mode", "report", str(rp), "--json"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, f"SCHQ --mode report failed:\n{proc.stdout}\n{proc.stderr}")
+            self.assertEqual(json.loads(proc.stdout)["status"], "PASS")
 
 
 if __name__ == "__main__":
