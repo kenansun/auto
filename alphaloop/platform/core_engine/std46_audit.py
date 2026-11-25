@@ -66,6 +66,12 @@ _VACUOUS_FORBIDDEN_CLAIMS: Final[frozenset[str]] = frozenset(
     }
 )
 
+_SHADOW_PLAN_KEYS: Final[tuple[str, ...]] = ("plans_created", "orders_planned", "execution_plans")
+_SHADOW_TRADE_KEYS: Final[tuple[str, ...]] = ("executed_trades", "trades_executed", "virtual_trades", "fills")
+_VER04_BAD_SLEEVE_TOKENS: Final[frozenset[str]] = frozenset(
+    {"REJECTED", "FAIL", "CONDITIONAL_RESEARCH", "STATIC_ALLOCATION_DOMINATED"}
+)
+
 
 def _require_finite_float(val: Any, name: str) -> float:
     """Validate and coerce a strictly finite numeric value, rejecting None/bool/NaN/Inf."""
@@ -145,51 +151,140 @@ def _normalize_currency_tokens(raw: Any) -> set[str]:
     raise ValueError(f"Unsupported currencies container type: {type(raw).__name__}")
 
 
-def _parse_sleeve_gate_status(sleeve: dict[str, Any]) -> tuple[bool, str]:
-    """Parse per-sleeve 8/8 gate eligibility from canonical Platform v4 / STD-46 schemas (fail-closed)."""
-    if "gates_passed" in sleeve and sleeve["gates_passed"] is not None:
-        gp_raw = sleeve["gates_passed"]
-        gt_raw = sleeve.get("gates_total", 8)
-        if isinstance(gp_raw, bool) or not isinstance(gp_raw, int) or gp_raw < 0:
-            return False, f"invalid gates_passed={gp_raw!r}"
-        if isinstance(gt_raw, bool) or not isinstance(gt_raw, int) or gt_raw <= 0:
-            return False, f"invalid gates_total={gt_raw!r}"
-        if gp_raw < 8 or gp_raw < gt_raw:
-            return False, f"gates {gp_raw}/{gt_raw} < 8/8"
-        return True, f"gates {gp_raw}/{gt_raw}"
+def _inspect_sleeve_gates(sleeve: dict[str, Any]) -> tuple[bool, str, int | None, int | None]:
+    """Evaluate EVERY present gate indicator on a sleeve (fail-closed on any failure or contradiction)."""
+    found_any = False
+    failures: list[str] = []
+    passing_ratios: list[tuple[int, int]] = []
+    failing_ratios: list[tuple[int, int]] = []
 
-    if "passed_gates" in sleeve and sleeve["passed_gates"] is not None:
-        gp_raw = sleeve["passed_gates"]
-        gt_raw = sleeve.get("total_gates", 8)
+    def _check_int_pair(gp_key: str, gt_key: str) -> None:
+        nonlocal found_any
+        has_gp = gp_key in sleeve and sleeve[gp_key] is not None
+        has_gt = gt_key in sleeve and sleeve[gt_key] is not None
+        if not has_gp:
+            if has_gt:
+                gt_only = sleeve[gt_key]
+                if isinstance(gt_only, bool) or not isinstance(gt_only, int) or gt_only <= 0:
+                    found_any = True
+                    failures.append(f"invalid {gt_key}={gt_only!r}")
+            return
+        found_any = True
+        gp_raw = sleeve[gp_key]
+        gt_raw = sleeve[gt_key] if has_gt else 8
         if isinstance(gp_raw, bool) or not isinstance(gp_raw, int) or gp_raw < 0:
-            return False, f"invalid passed_gates={gp_raw!r}"
+            failures.append(f"invalid {gp_key}={gp_raw!r}")
+            return
         if isinstance(gt_raw, bool) or not isinstance(gt_raw, int) or gt_raw <= 0:
-            return False, f"invalid total_gates={gt_raw!r}"
+            failures.append(f"invalid {gt_key}={gt_raw!r}")
+            return
+        if gp_raw > gt_raw:
+            failures.append(f"invalid gates {gp_raw}/{gt_raw} ({gp_key} > {gt_key})")
+            failing_ratios.append((gp_raw, gt_raw))
+            return
         if gp_raw < 8 or gp_raw < gt_raw:
-            return False, f"gates {gp_raw}/{gt_raw} < 8/8"
-        return True, f"gates {gp_raw}/{gt_raw}"
+            failures.append(f"gates {gp_raw}/{gt_raw} < 8/8")
+            failing_ratios.append((gp_raw, gt_raw))
+            return
+        passing_ratios.append((gp_raw, gt_raw))
+
+    _check_int_pair("gates_passed", "gates_total")
+    _check_int_pair("passed_gates", "total_gates")
 
     for key in ("gates", "gate_score"):
-        raw = sleeve.get(key)
-        if isinstance(raw, str):
+        if key in sleeve and sleeve[key] is not None:
+            found_any = True
+            raw = sleeve[key]
+            if not isinstance(raw, str):
+                failures.append(f"malformed {key}={raw!r}")
+                continue
             m = _GATE_RATIO_RE.match(raw)
             if not m:
-                return False, f"malformed {key}={raw!r}"
+                failures.append(f"malformed {key}={raw!r}")
+                continue
             gp = int(m.group(1))
             gt = int(m.group(2))
-            if gt <= 0 or gp < 8 or gp < gt:
-                return False, f"gates {gp}/{gt} < 8/8"
-            return True, f"gates {gp}/{gt}"
+            if gt <= 0:
+                failures.append(f"invalid {key}={raw!r}")
+            elif gp > gt:
+                failures.append(f"invalid gates {gp}/{gt} ({key} passed > total)")
+                failing_ratios.append((gp, gt))
+            elif gp < 8 or gp < gt:
+                failures.append(f"gates {gp}/{gt} < 8/8")
+                failing_ratios.append((gp, gt))
+            else:
+                passing_ratios.append((gp, gt))
 
     if "passed_8_of_8" in sleeve and sleeve["passed_8_of_8"] is not None:
+        found_any = True
         flag = sleeve["passed_8_of_8"]
         if not isinstance(flag, bool):
-            return False, f"invalid passed_8_of_8={flag!r}"
-        if not flag:
-            return False, "passed_8_of_8=False"
-        return True, "passed_8_of_8=True"
+            failures.append(f"invalid passed_8_of_8={flag!r}")
+        elif not flag:
+            failures.append("passed_8_of_8=False")
 
-    return False, "missing 8/8 gate evidence"
+    if not found_any:
+        return False, "missing 8/8 gate evidence", None, 8
+    if failures:
+        if failing_ratios:
+            fgp, fgt = failing_ratios[0]
+            return False, "; ".join(failures), fgp, fgt
+        return False, "; ".join(failures), None, 8
+
+    if passing_ratios:
+        gp_ok, gt_ok = passing_ratios[0]
+        return True, f"gates {gp_ok}/{gt_ok}", gp_ok, gt_ok
+    return True, "passed_8_of_8=True", 8, 8
+
+
+def _parse_sleeve_gate_status(sleeve: dict[str, Any]) -> tuple[bool, str]:
+    """Parse per-sleeve 8/8 gate eligibility from canonical Platform v4 / STD-46 schemas (fail-closed)."""
+    ok, detail, _gp, _gt = _inspect_sleeve_gates(sleeve)
+    return ok, detail
+
+
+def _is_positive_int_counter(val: Any) -> bool:
+    """Return True iff val is a strictly positive non-bool integer counter."""
+    return (not isinstance(val, bool)) and isinstance(val, int) and val > 0
+
+
+def _canonicalize_sleeve_for_report(sleeve: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize sleeve gate and disqualifying status fields for 1:1 SCHQ `--mode report` parity."""
+    sl = dict(sleeve)
+    gate_ok, _detail, gp, gt = _inspect_sleeve_gates(sl)
+    if gate_ok:
+        sl["gates_passed"] = gp if gp is not None else 8
+        sl["gates_total"] = gt if gt is not None else 8
+    else:
+        if gp is not None and gt is not None and (gp < 8 or gp < gt):
+            sl["gates_passed"] = gp
+            sl["gates_total"] = gt
+        else:
+            cur_v = str(sl.get("verdict") or "").strip().upper()
+            if cur_v not in _VER04_BAD_SLEEVE_TOKENS:
+                sl["verdict"] = "FAIL"
+
+    disq_token: str | None = None
+    for status_key in ("verdict", "status", "verdict_cap", "classification"):
+        raw_st = sl.get(status_key)
+        if isinstance(raw_st, str):
+            norm_st = raw_st.strip().upper()
+            if norm_st in _DISQUALIFYING_SLEEVE_STATUSES:
+                disq_token = norm_st if norm_st in _VER04_BAD_SLEEVE_TOKENS else "FAIL"
+                break
+    if disq_token is None and sl.get("dominated_by_static") is True:
+        disq_token = VERDICT_CAP_DOMINATED
+    elif disq_token is None and sl.get("eligible_for_production") is False:
+        disq_token = "FAIL"
+
+    if disq_token is not None:
+        cur_v = str(sl.get("verdict") or "").strip().upper()
+        cur_s = str(sl.get("status") or "").strip().upper()
+        if cur_v not in _VER04_BAD_SLEEVE_TOKENS:
+            sl["verdict"] = disq_token
+        if cur_s not in _VER04_BAD_SLEEVE_TOKENS:
+            sl["status"] = disq_token
+    return sl
 
 
 def compute_dual_sharpe(
@@ -360,11 +455,24 @@ def audit_composite_portfolio(
         if not gate_ok:
             sl_failures.append(gate_detail)
 
-        for status_key in ("status", "verdict", "verdict_cap"):
+        for status_key in ("status", "verdict", "verdict_cap", "classification"):
             raw_st = sl.get(status_key)
             if isinstance(raw_st, str) and raw_st.strip().upper() in _DISQUALIFYING_SLEEVE_STATUSES:
                 sl_failures.append(f"{status_key}={raw_st.strip().upper()}")
 
+        if "eligible_for_production" in sl and sl["eligible_for_production"] is not None:
+            if not isinstance(sl["eligible_for_production"], bool):
+                sl_failures.append(f"invalid eligible_for_production={sl['eligible_for_production']!r}")
+            elif sl["eligible_for_production"] is False:
+                sl_failures.append("eligible_for_production=False")
+
+        if "dominated_by_static" in sl and sl["dominated_by_static"] is not None:
+            if not isinstance(sl["dominated_by_static"], bool):
+                sl_failures.append(f"invalid dominated_by_static={sl['dominated_by_static']!r}")
+            elif sl["dominated_by_static"] is True:
+                sl_failures.append("dominated_by_static=True")
+
+        sleeve_weights: list[float] = []
         for w_key in ("weight", "weight_final"):
             if w_key in sl and sl[w_key] is not None:
                 has_weights = True
@@ -375,12 +483,13 @@ def audit_composite_portfolio(
                     sl_failures.append(f"invalid {w_key}")
                     continue
                 if w_val < 0.0:
-                    msg = f"negative weight on {sid}: {w_val}"
+                    msg = f"negative {w_key} on {sid}: {w_val}"
                     capital_errors.append(msg)
                     sl_failures.append(msg)
                 else:
-                    weight_sum += w_val
-                break
+                    sleeve_weights.append(w_val)
+        if sleeve_weights:
+            weight_sum += max(sleeve_weights)
 
         if "allocated_capital" in sl and sl["allocated_capital"] is not None:
             try:
@@ -466,7 +575,23 @@ def build_std46_audit_report(
                 )
                 item.update(dual)
         if "static_ablation" not in item and isinstance(item.get("static_metrics"), dict):
-            item["static_ablation"] = evaluate_static_ablation(item, item["static_metrics"])
+            static_m = item["static_metrics"]
+            strat_for_ablation = dict(item)
+            if "excess_sharpe" not in static_m:
+                for bare_sr_key in ("sharpe", "sharpe_ratio"):
+                    if (
+                        bare_sr_key in static_m
+                        and static_m[bare_sr_key] is not None
+                        and bare_sr_key not in strat_for_ablation
+                    ):
+                        raw_sr_candidate = raw_s.get(bare_sr_key)
+                        if raw_sr_candidate is None:
+                            raw_sr_candidate = raw_s.get("raw_sharpe")
+                        if raw_sr_candidate is None:
+                            raw_sr_candidate = item.get("raw_sharpe")
+                        if raw_sr_candidate is not None:
+                            strat_for_ablation[bare_sr_key] = raw_sr_candidate
+            item["static_ablation"] = evaluate_static_ablation(strat_for_ablation, static_m)
         ab = item.get("static_ablation")
         if isinstance(ab, dict) and ab.get("dominated_by_static") is True:
             item["status"] = VERDICT_CAP_DOMINATED
@@ -492,10 +617,12 @@ def build_std46_audit_report(
                     raw_sharpe=item.get("raw_sharpe"),
                 )
                 item.update(dual)
-        if "sleeves" in item and isinstance(item["sleeves"], (list, tuple)):
+        if "sleeves" in item:
             currencies = item.get("currencies") or item.get("currency") or ()
-            fx_hedged = bool(item.get("fx_hedged", False))
+            raw_fx = item.get("fx_hedged")
+            fx_hedged = False if raw_fx is None else raw_fx
             audit = audit_composite_portfolio(item["sleeves"], currencies, fx_hedged=fx_hedged)
+            item["sleeves"] = [_canonicalize_sleeve_for_report(sl) for sl in item["sleeves"]]
             item["eligible_for_production"] = audit["eligible_for_production"]
             item["classification"] = audit["classification"]
             item["failing_sleeves"] = audit["failing_sleeves"]
@@ -514,13 +641,24 @@ def build_std46_audit_report(
         if not isinstance(raw_sh, dict):
             raise ValueError("Each shadow entry must be a dict")
         item = dict(raw_sh)
-        plans = item.get("plans_created")
-        trades = item.get("executed_trades")
-        has_active_plans = isinstance(plans, int) and not isinstance(plans, bool) and plans > 0
-        has_active_trades = isinstance(trades, int) and not isinstance(trades, bool) and trades > 0
-        is_vacuous = not (has_active_plans or has_active_trades)
+        present_plan_vals = [item[k] for k in _SHADOW_PLAN_KEYS if k in item and item[k] is not None]
+        present_trade_vals = [item[k] for k in _SHADOW_TRADE_KEYS if k in item and item[k] is not None]
+        plans_present = bool(present_plan_vals)
+        trades_present = bool(present_trade_vals)
+        plans_all_pos = plans_present and all(_is_positive_int_counter(v) for v in present_plan_vals)
+        trades_all_pos = trades_present and all(_is_positive_int_counter(v) for v in present_trade_vals)
+
+        is_vacuous = (
+            (not plans_present and not trades_present)
+            or (plans_present and not plans_all_pos)
+            or (trades_present and not trades_all_pos)
+        )
         if is_vacuous:
-            vac_label = "SHADOW_VACUOUS_ZERO_TRADES" if trades is not None else "VACUOUS_ZERO_PLANS"
+            vac_label = (
+                "SHADOW_VACUOUS_ZERO_TRADES"
+                if (trades_present and not trades_all_pos)
+                else "VACUOUS_ZERO_PLANS"
+            )
             item["non_vacuous_parity"] = False
             item["parity_depth"] = vac_label
             item["shadow_status"] = vac_label
