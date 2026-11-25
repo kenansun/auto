@@ -135,6 +135,11 @@ def _is_finite(x: Any) -> bool:
     return math.isfinite(v)
 
 
+def _safe_midpoint(bid: float, ask: float) -> float:
+    """Compute overflow-safe midpoint `bid + 0.5 * (ask - bid)` avoiding `(bid + ask)` overflow near 1e308."""
+    return bid + 0.5 * (ask - bid)
+
+
 def _percentile_nearest_rank(sorted_vals: Sequence[float], q: float) -> float:
     """Deterministic nearest-rank percentile on a pre-sorted finite sequence."""
     if not sorted_vals:
@@ -459,7 +464,7 @@ class PublicRestWaterfallQuoteProvider:
                 raw_ask = payload["askPrice"]
                 raw_bid_qty = payload.get("bidQty", 0.0)
                 raw_ask_qty = payload.get("askQty", 0.0)
-                if any(isinstance(v, bool) for v in (raw_bid, raw_ask, raw_bid_qty, raw_ask_qty)):
+                if any(v is None or isinstance(v, bool) for v in (raw_bid, raw_ask, raw_bid_qty, raw_ask_qty)):
                     continue
                 bid = float(raw_bid)
                 ask = float(raw_ask)
@@ -469,11 +474,13 @@ class PublicRestWaterfallQuoteProvider:
                 if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0.0 and ask > 0.0 and bid < ask):
                     logger.warning("Spot waterfall endpoint %s returned invalid BBO for %s: %s/%s", base, sym, bid, ask)
                     continue
+                if not math.isfinite(_safe_midpoint(bid, ask)):
+                    continue
                 if not (math.isfinite(bid_qty) and math.isfinite(ask_qty) and bid_qty > 0.0 and ask_qty > 0.0):
                     continue
                 ts_ms = utc_now_ms()
                 return bid, ask, bid_qty, ask_qty, ts_ms, base
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, KeyError, ValueError) as exc:
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, KeyError, ValueError, TypeError) as exc:
                 logger.warning("Spot waterfall endpoint %s failed for %s: %s", base, sym, exc)
                 continue
         return None
@@ -517,18 +524,45 @@ class PublicRestWaterfallQuoteProvider:
         if not isinstance(levels, list) or len(levels) < 2:
             return None
         raw_bids, raw_asks = levels[0], levels[1]
-        bids = tuple(
-            (float(lv["px"]), float(lv["sz"]))
-            for lv in raw_bids[:5]
-            if isinstance(lv, dict) and "px" in lv and "sz" in lv
-        )
-        asks = tuple(
-            (float(lv["px"]), float(lv["sz"]))
-            for lv in raw_asks[:5]
-            if isinstance(lv, dict) and "px" in lv and "sz" in lv
-        )
-        ts_ms = int(payload.get("time") or utc_now_ms())
-        return bids, asks, ts_ms
+        if not isinstance(raw_bids, list) or not isinstance(raw_asks, list):
+            return None
+        bids_list: list[tuple[float, float]] = []
+        for lv in raw_bids[:5]:
+            if not isinstance(lv, dict) or "px" not in lv or "sz" not in lv:
+                continue
+            raw_px, raw_sz = lv["px"], lv["sz"]
+            if raw_px is None or raw_sz is None or isinstance(raw_px, bool) or isinstance(raw_sz, bool):
+                continue
+            try:
+                px, sz = float(raw_px), float(raw_sz)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(px) and math.isfinite(sz) and px > 0.0 and sz >= 0.0:
+                bids_list.append((px, sz))
+        asks_list: list[tuple[float, float]] = []
+        for lv in raw_asks[:5]:
+            if not isinstance(lv, dict) or "px" not in lv or "sz" not in lv:
+                continue
+            raw_px, raw_sz = lv["px"], lv["sz"]
+            if raw_px is None or raw_sz is None or isinstance(raw_px, bool) or isinstance(raw_sz, bool):
+                continue
+            try:
+                px, sz = float(raw_px), float(raw_sz)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(px) and math.isfinite(sz) and px > 0.0 and sz >= 0.0:
+                asks_list.append((px, sz))
+        raw_ts = payload.get("time")
+        if (
+            raw_ts is not None
+            and not isinstance(raw_ts, bool)
+            and _is_pos_finite(raw_ts)
+            and _MIN_VALID_EPOCH_MS <= float(raw_ts) <= _MAX_VALID_EPOCH_MS
+        ):
+            ts_ms = int(float(raw_ts))
+        else:
+            ts_ms = utc_now_ms()
+        return tuple(bids_list), tuple(asks_list), ts_ms
 
     def _fetch_dvol_cached(self) -> float | None:
         now_mono = time.monotonic()
@@ -555,7 +589,7 @@ class PublicRestWaterfallQuoteProvider:
                     self._last_dvol = val
                     self._last_dvol_fetch_mono = now_mono
                     return val
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, KeyError) as exc:
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
             logger.warning("Deribit DVOL fetch failed: %s", exc)
         # RB-16: expire cached DVOL after max_dvol_stale_sec rather than reusing indefinitely
         if self._last_dvol is not None and (now_mono - self._last_dvol_fetch_mono) <= self.max_dvol_stale_sec:
@@ -568,7 +602,7 @@ class PublicRestWaterfallQuoteProvider:
         hl_ctxs: dict[str, dict[str, Any]] = {}
         try:
             hl_ctxs = self._fetch_hl_meta_and_ctxs()
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError) as exc:
             logger.warning("Hyperliquid metaAndAssetCtxs failed: %s", exc)
 
         dvol_val = self._fetch_dvol_cached()
@@ -581,7 +615,7 @@ class PublicRestWaterfallQuoteProvider:
             l2 = None
             try:
                 l2 = self._fetch_hl_l2_book(coin)
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError) as exc:
                 logger.warning("Hyperliquid l2Book failed for %s: %s", coin, exc)
 
             # Capture observation timestamp AFTER fetching this coin's quotes (prevents false CLOCK_SKEW on retry)
@@ -873,8 +907,12 @@ class W3DNShadowMonitor:
 
         self._hydrate_checkpoint()
 
-        if prewarm_frames is not None and self._prewarmed_bars == 0:
-            cap = int(self.config.prewarm_bars) if (self.config.enable_prewarm and int(self.config.prewarm_bars) > 0) else None
+        if self.config.enable_prewarm:
+            if isinstance(self.config.prewarm_bars, bool) or not isinstance(self.config.prewarm_bars, int) or self.config.prewarm_bars < 0:
+                raise ValueError("ShadowMonitorConfig.prewarm_bars must be a non-negative integer")
+
+        if prewarm_frames is not None and self._prewarmed_bars == 0 and not self._has_live_execution_started():
+            cap: int | None = int(self.config.prewarm_bars) if self.config.enable_prewarm else None
             self.prewarm_from_snapshots(prewarm_frames, max_bars=cap)
 
     def __enter__(self) -> W3DNShadowMonitor:
@@ -1086,7 +1124,8 @@ class W3DNShadowMonitor:
                 "SELECT COUNT(*) AS cnt FROM shadow_events WHERE action IN ('VIRTUAL_OPEN_PAIR', 'VIRTUAL_CLOSE_PAIR')"
             )
             self._executed_trades = int(cnt_row["cnt"]) if cnt_row is not None else 0
-        self._prewarmed_bars = max(0, int(st.get("prewarmed_bars", 0)))
+        raw_pw = st.get("prewarmed_bars")
+        self._prewarmed_bars = max(0, int(raw_pw)) if raw_pw is not None else 0
         raw_lpw = st.get("last_prewarm_bucket")
         self._last_prewarm_bucket = int(raw_lpw) if raw_lpw is not None else None
         if isinstance(st.get("kernel_state"), dict):
@@ -1252,6 +1291,27 @@ class W3DNShadowMonitor:
                 f"Perp crossed book {snap.coin}: bid={snap.perp_bid} >= ask={snap.perp_ask}",
             )
 
+        mid_spot = _safe_midpoint(float(snap.spot_bid), float(snap.spot_ask))
+        mid_perp = _safe_midpoint(float(snap.perp_bid), float(snap.perp_ask))
+        mark_perp = float(snap.perp_mark) if snap.perp_mark is not None else mid_perp
+        spot_spread = float(snap.spot_ask) - float(snap.spot_bid)
+        perp_spread = float(snap.perp_ask) - float(snap.perp_bid)
+        basis_mid_bps = ((mid_perp / mid_spot) - 1.0) * 10_000.0 if mid_spot > 0.0 else float("nan")
+        basis_mark_bps = ((mark_perp / mid_spot) - 1.0) * 10_000.0 if mid_spot > 0.0 else float("nan")
+        if (
+            not all(
+                math.isfinite(v)
+                for v in (mid_spot, mid_perp, mark_perp, spot_spread, perp_spread, basis_mid_bps, basis_mark_bps)
+            )
+            or mid_spot <= 0.0
+            or mid_perp <= 0.0
+        ):
+            return (
+                False,
+                PlatformErrorCode.NON_FINITE_DATA,
+                f"Non-finite derived midpoint/basis for {snap.coin}",
+            )
+
         # RB-D03: strictly validate epoch timestamps against None/bool/NaN/Inf/non-positive BEFORE int()
         for ts_name, ts_val in (
             ("ts_observe_ms", snap.ts_observe_ms),
@@ -1314,11 +1374,12 @@ class W3DNShadowMonitor:
         tf_h = bucket_sec / 3600.0
         bars_at_ts: dict[str, CanonicalBar] = {}
         for coin, snap in valid_snaps.items():
-            mid_spot = 0.5 * (float(snap.spot_bid) + float(snap.spot_ask))
-            mid_perp = 0.5 * (float(snap.perp_bid) + float(snap.perp_ask))
+            mid_spot = _safe_midpoint(float(snap.spot_bid), float(snap.spot_ask))
+            mid_perp = _safe_midpoint(float(snap.perp_bid), float(snap.perp_ask))
             s_sym = spot_leg_symbol(coin)
             p_sym = perp_leg_symbol(coin)
-            spot_vol = float(snap.spot_bid_qty) * mid_spot if snap.spot_bid_qty is not None else mid_spot
+            raw_spot_vol = float(snap.spot_bid_qty) * mid_spot if snap.spot_bid_qty is not None else mid_spot
+            spot_vol = raw_spot_vol if math.isfinite(raw_spot_vol) else mid_spot
             bars_at_ts[s_sym] = CanonicalBar(
                 asset_class=ASSET_CLASS_CRYPTO_SPOT,
                 venue="binance_spot",
@@ -1391,6 +1452,22 @@ class W3DNShadowMonitor:
             return False, PlatformErrorCode.NON_FINITE_DATA, f"Non-finite prewarm quotes for {snap.coin}"
         if s_bid >= s_ask or p_bid >= p_ask:
             return False, PlatformErrorCode.CROSSED_BOOK, f"Crossed book in prewarm snapshot for {snap.coin}"
+        mid_spot = _safe_midpoint(s_bid, s_ask)
+        mid_perp = _safe_midpoint(p_bid, p_ask)
+        mark_perp = float(snap.perp_mark) if snap.perp_mark is not None else mid_perp
+        spot_spread = s_ask - s_bid
+        perp_spread = p_ask - p_bid
+        basis_mid_bps = ((mid_perp / mid_spot) - 1.0) * 10_000.0 if mid_spot > 0.0 else float("nan")
+        basis_mark_bps = ((mark_perp / mid_spot) - 1.0) * 10_000.0 if mid_spot > 0.0 else float("nan")
+        if (
+            not all(
+                math.isfinite(v)
+                for v in (mid_spot, mid_perp, mark_perp, spot_spread, perp_spread, basis_mid_bps, basis_mark_bps)
+            )
+            or mid_spot <= 0.0
+            or mid_perp <= 0.0
+        ):
+            return False, PlatformErrorCode.NON_FINITE_DATA, f"Non-finite derived prewarm midpoint/basis for {snap.coin}"
 
         for ts_name, ts_val in (
             ("ts_observe_ms", snap.ts_observe_ms),
@@ -1467,7 +1544,10 @@ class W3DNShadowMonitor:
         )
         if ts_raw is None or isinstance(ts_raw, bool) or not _is_pos_finite(ts_raw):
             return None
-        obs_ms = int(ts_raw)
+        obs_f = float(ts_raw)
+        if not (_MIN_VALID_EPOCH_MS <= obs_f <= _MAX_VALID_EPOCH_MS):
+            return None
+        obs_ms = int(obs_f)
 
         s_bid: float | None = None
         s_ask: float | None = None
@@ -1484,6 +1564,8 @@ class W3DNShadowMonitor:
             half_s = sm * 0.00005
             s_bid = sm - half_s
             s_ask = sm + half_s
+            if not (_is_pos_finite(s_bid) and _is_pos_finite(s_ask)):
+                return None
 
         p_bid: float | None = None
         p_ask: float | None = None
@@ -1500,6 +1582,8 @@ class W3DNShadowMonitor:
             half_p = pm * 0.00005
             p_bid = pm - half_p
             p_ask = pm + half_p
+            if not (_is_pos_finite(p_bid) and _is_pos_finite(p_ask)):
+                return None
 
         fund_raw = next(
             (raw.get(k) for k in ("perp_funding_1h", "funding_1h", "funding_rate_1h") if raw.get(k) is not None),
@@ -1509,9 +1593,26 @@ class W3DNShadowMonitor:
             return None
 
         spot_ts_raw = raw.get("spot_ts_ms")
+        if spot_ts_raw is None:
+            spot_ts_ms = obs_ms
+        else:
+            if isinstance(spot_ts_raw, bool) or not _is_pos_finite(spot_ts_raw):
+                return None
+            spot_ts_f = float(spot_ts_raw)
+            if not (_MIN_VALID_EPOCH_MS <= spot_ts_f <= _MAX_VALID_EPOCH_MS):
+                return None
+            spot_ts_ms = int(spot_ts_f)
+
         perp_ts_raw = raw.get("perp_ts_ms")
-        spot_ts_ms = int(spot_ts_raw) if (spot_ts_raw is not None and not isinstance(spot_ts_raw, bool) and _is_pos_finite(spot_ts_raw)) else obs_ms
-        perp_ts_ms = int(perp_ts_raw) if (perp_ts_raw is not None and not isinstance(perp_ts_raw, bool) and _is_pos_finite(perp_ts_raw)) else obs_ms
+        if perp_ts_raw is None:
+            perp_ts_ms = obs_ms
+        else:
+            if isinstance(perp_ts_raw, bool) or not _is_pos_finite(perp_ts_raw):
+                return None
+            perp_ts_f = float(perp_ts_raw)
+            if not (_MIN_VALID_EPOCH_MS <= perp_ts_f <= _MAX_VALID_EPOCH_MS):
+                return None
+            perp_ts_ms = int(perp_ts_f)
 
         return PairMarketSnapshot(
             coin=coin,
@@ -1533,15 +1634,25 @@ class W3DNShadowMonitor:
             provenance=str(raw.get("provenance", PROVENANCE_REAL)),
         )
 
+    def _has_live_execution_started(self) -> bool:
+        """Return True once any live tick, live start timestamp, or live kernel bucket has been recorded."""
+        return (
+            self._start_ts_ms is not None
+            or self._last_kernel_bucket is not None
+            or self._total_ticks > 0
+        )
+
     def _is_kernel_warm_ready(self) -> bool:
         need = int(self.kernel.warmup_bars)
-        if self._prewarmed_bars >= need:
+        if need <= 0:
             return True
         st_map = self.kernel.export_state().get("states", {})
         if isinstance(st_map, dict):
             return any(
-                isinstance(s, dict) and int(s.get("bar_count", 0)) >= need
-                for s in st_map.values()
+                coin in st_map
+                and isinstance(st_map[coin], dict)
+                and int(st_map[coin].get("bar_count", 0)) >= need
+                for coin in self._primary_coins
             )
         return False
 
@@ -1559,6 +1670,18 @@ class W3DNShadowMonitor:
         if max_bars is not None and (isinstance(max_bars, bool) or int(max_bars) < 0):
             raise ValueError("max_bars must be a non-negative integer")
 
+        if self._has_live_execution_started():
+            return {
+                "prewarmed_bars_added": 0,
+                "prewarmed_bars_total": self._prewarmed_bars,
+                "rejected_frames": 0,
+                "kernel_warmup_bars": int(self.kernel.warmup_bars),
+                "kernel_warm_ready": self._is_kernel_warm_ready(),
+                "executed_trades": self._executed_trades,
+                "total_ticks": self._total_ticks,
+                "live_execution_enabled": SHADOW_LIVE_EXECUTION_ENABLED,
+            }
+
         bucket_sec = max(60, int(self.config.kernel_bar_interval_sec))
         bucket_ms = bucket_sec * 1000
         primary_allowed_syms = {
@@ -1573,17 +1696,20 @@ class W3DNShadowMonitor:
             explicit_ts: int | None = None
             raw_map: Any = item
             if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], dict):
-                if isinstance(item[0], bool) or not _is_pos_finite(item[0]):
+                if (
+                    isinstance(item[0], bool)
+                    or not _is_pos_finite(item[0])
+                    or not (_MIN_VALID_EPOCH_MS <= float(item[0]) <= _MAX_VALID_EPOCH_MS)
+                ):
                     rejected_frames += 1
                     continue
-                explicit_ts = int(item[0])
+                explicit_ts = int(float(item[0]))
                 raw_map = item[1]
             if not isinstance(raw_map, dict) or not raw_map:
                 rejected_frames += 1
                 continue
 
-            clean_map: dict[str, CanonicalBar] = {}
-            frame_ts: int | None = explicit_ts
+            candidate_map: dict[str, CanonicalBar] = {}
             invalid_found = False
             for sym, bar in raw_map.items():
                 if not isinstance(bar, CanonicalBar):
@@ -1592,6 +1718,14 @@ class W3DNShadowMonitor:
                 sym_u = str(sym).strip().upper()
                 if sym_u not in primary_allowed_syms:
                     continue
+                ts_ev_raw = bar.ts_event_ms
+                if (
+                    isinstance(ts_ev_raw, bool)
+                    or not _is_pos_finite(ts_ev_raw)
+                    or not (_MIN_VALID_EPOCH_MS <= float(ts_ev_raw) <= _MAX_VALID_EPOCH_MS)
+                ):
+                    invalid_found = True
+                    continue
                 if not (
                     _is_pos_finite(bar.open)
                     and _is_pos_finite(bar.high)
@@ -1599,18 +1733,26 @@ class W3DNShadowMonitor:
                     and _is_pos_finite(bar.close)
                     and float(bar.high) >= float(bar.low)
                     and _is_finite(bar.carry_rate_period)
-                    and not isinstance(bar.ts_event_ms, bool)
-                    and _MIN_VALID_EPOCH_MS <= int(bar.ts_event_ms) <= _MAX_VALID_EPOCH_MS
                 ):
                     invalid_found = True
                     continue
-                clean_map[sym_u] = bar
-                if frame_ts is None or int(bar.ts_event_ms) > frame_ts:
-                    frame_ts = int(bar.ts_event_ms)
+                candidate_map[sym_u] = bar
 
-            if invalid_found and not clean_map:
-                rejected_frames += 1
-                continue
+            # Enforce atomic pair completeness per primary coin ({COIN}_SPOT and {COIN}_PERP BOTH valid)
+            clean_map: dict[str, CanonicalBar] = {}
+            frame_ts: int | None = explicit_ts
+            for coin in self._primary_coins:
+                s_sym = spot_leg_symbol(coin)
+                p_sym = perp_leg_symbol(coin)
+                if s_sym in candidate_map and p_sym in candidate_map:
+                    clean_map[s_sym] = candidate_map[s_sym]
+                    clean_map[p_sym] = candidate_map[p_sym]
+                    pair_ts = max(int(float(candidate_map[s_sym].ts_event_ms)), int(float(candidate_map[p_sym].ts_event_ms)))
+                    if frame_ts is None or pair_ts > frame_ts:
+                        frame_ts = pair_ts
+                elif s_sym in candidate_map or p_sym in candidate_map:
+                    invalid_found = True
+
             if not clean_map or frame_ts is None:
                 rejected_frames += 1
                 continue
@@ -1620,6 +1762,8 @@ class W3DNShadowMonitor:
             if self.config.enforce_wall_clock_bounds and (frame_ts - utc_now_ms()) > self.config.max_future_skew_ms:
                 rejected_frames += 1
                 continue
+            if invalid_found:
+                rejected_frames += 1
             b_idx = int(frame_ts // bucket_ms)
             prev = bucket_bars.get(b_idx)
             if prev is None or frame_ts >= prev[0]:
@@ -1630,13 +1774,10 @@ class W3DNShadowMonitor:
             limit = int(max_bars)
             sorted_buckets = sorted_buckets[-limit:] if limit > 0 else []
 
-        live_start_bucket = int(self._start_ts_ms // bucket_ms) if self._start_ts_ms is not None else None
         added_bars = 0
         last_prewarm_ts_ms: int | None = None
         for b_idx in sorted_buckets:
             if self._last_prewarm_bucket is not None and b_idx <= self._last_prewarm_bucket:
-                continue
-            if live_start_bucket is not None and b_idx >= live_start_bucket:
                 continue
             b_ts_ms, b_map = bucket_bars[b_idx]
             ctx: dict[str, Any] = {"margin_ratio": 1.0, "perp_margin_buffer_ratio": 1.0}
@@ -1696,26 +1837,61 @@ class W3DNShadowMonitor:
         if max_bars is not None and (isinstance(max_bars, bool) or int(max_bars) < 0):
             raise ValueError("max_bars must be a non-negative integer")
 
+        if self._has_live_execution_started():
+            return {
+                "prewarmed_bars_added": 0,
+                "prewarmed_bars_total": self._prewarmed_bars,
+                "rejected_frames": 0,
+                "kernel_warmup_bars": int(self.kernel.warmup_bars),
+                "kernel_warm_ready": self._is_kernel_warm_ready(),
+                "executed_trades": self._executed_trades,
+                "total_ticks": self._total_ticks,
+                "live_execution_enabled": SHADOW_LIVE_EXECUTION_ENABLED,
+            }
+
         frame_list = list(frames)
-        if frame_list:
-            first = frame_list[0]
-            if isinstance(first, dict) and first and all(isinstance(v, CanonicalBar) for v in first.values()):
-                return self.prewarm_from_bars(frame_list, max_bars=max_bars)
+
+        def _is_canonical_bar_frame(elem: Any) -> bool:
+            if isinstance(elem, dict) and elem and all(isinstance(v, CanonicalBar) for v in elem.values()):
+                return True
             if (
-                isinstance(first, tuple)
-                and len(first) == 2
-                and isinstance(first[1], dict)
-                and first[1]
-                and all(isinstance(v, CanonicalBar) for v in first[1].values())
+                isinstance(elem, tuple)
+                and len(elem) == 2
+                and isinstance(elem[1], dict)
+                and elem[1]
+                and all(isinstance(v, CanonicalBar) for v in elem[1].values())
             ):
-                return self.prewarm_from_bars(frame_list, max_bars=max_bars)
+                return True
+            return False
+
+        if any(_is_canonical_bar_frame(elem) for elem in frame_list) and not any(
+            isinstance(elem, PairMarketSnapshot) for elem in frame_list
+        ):
+            return self.prewarm_from_bars(frame_list, max_bars=max_bars)
 
         bucket_sec = max(60, int(self.config.kernel_bar_interval_sec))
         bucket_ms = bucket_sec * 1000
         bucket_map: dict[int, dict[str, PairMarketSnapshot]] = {}
         rejected_frames = 0
         _single_snap_keys = frozenset(
-            {"coin", "symbol", "ts_observe_ms", "ts_ms", "ts_event_ms", "spot_bid", "spot_mid", "spot_close"}
+            {
+                "coin",
+                "symbol",
+                "ts_observe_ms",
+                "ts_ms",
+                "ts_event_ms",
+                "timestamp_ms",
+                "spot_bid",
+                "spot_ask",
+                "spot_mid",
+                "spot_close",
+                "spot_price",
+                "perp_bid",
+                "perp_ask",
+                "perp_mid",
+                "perp_close",
+                "perp_price",
+            }
         )
 
         def _ingest_one(raw_obj: Any, fallback_coin: str | None = None) -> None:
@@ -1744,12 +1920,13 @@ class W3DNShadowMonitor:
                 if not item:
                     rejected_frames += 1
                     continue
-                is_coin_map = any(isinstance(v, (PairMarketSnapshot, dict)) for v in item.values())
-                if (not is_coin_map) and any(k in item for k in _single_snap_keys):
+                if any(k in item for k in _single_snap_keys):
                     _ingest_one(item)
-                else:
+                elif any(isinstance(v, (PairMarketSnapshot, dict)) for v in item.values()):
                     for raw_k, raw_v in item.items():
                         _ingest_one(raw_v, fallback_coin=str(raw_k))
+                else:
+                    _ingest_one(item)
             else:
                 rejected_frames += 1
 
@@ -1758,13 +1935,10 @@ class W3DNShadowMonitor:
             limit = int(max_bars)
             sorted_buckets = sorted_buckets[-limit:] if limit > 0 else []
 
-        live_start_bucket = int(self._start_ts_ms // bucket_ms) if self._start_ts_ms is not None else None
         added_bars = 0
         last_prewarm_ts_ms: int | None = None
         for b_idx in sorted_buckets:
             if self._last_prewarm_bucket is not None and b_idx <= self._last_prewarm_bucket:
-                continue
-            if live_start_bucket is not None and b_idx >= live_start_bucket:
                 continue
             b_snaps = bucket_map[b_idx]
             if not b_snaps:
@@ -2048,7 +2222,7 @@ class W3DNShadowMonitor:
             dt_hours = min(24.0, dt_ms / 3_600_000.0)
             if dt_hours <= 0.0:
                 continue
-            perp_mark = float(snap.perp_mark or (0.5 * (float(snap.perp_bid) + float(snap.perp_ask))))
+            perp_mark = float(snap.perp_mark) if snap.perp_mark is not None else _safe_midpoint(float(snap.perp_bid), float(snap.perp_ask))
             cashflow = (-pos.perp_qty) * perp_mark * float(snap.perp_funding_1h) * dt_hours
             self._cash_usd += cashflow
             self._perp_realized_pnl_usd += cashflow
@@ -2144,8 +2318,8 @@ class W3DNShadowMonitor:
                 out[coin] = {"mode": "OBSERVE_ONLY", "status": "FAIL_CLOSED", "error_code": code.value}
                 continue
 
-            mid_spot = 0.5 * (float(snap.spot_bid) + float(snap.spot_ask))
-            mid_perp = 0.5 * (float(snap.perp_bid) + float(snap.perp_ask))
+            mid_spot = _safe_midpoint(float(snap.spot_bid), float(snap.spot_ask))
+            mid_perp = _safe_midpoint(float(snap.perp_bid), float(snap.perp_ask))
             mark_perp = float(snap.perp_mark) if snap.perp_mark is not None else mid_perp
             basis_mid_bps = ((mid_perp / mid_spot) - 1.0) * 10_000.0
             basis_mark_bps = ((mark_perp / mid_spot) - 1.0) * 10_000.0
@@ -2352,8 +2526,8 @@ class W3DNShadowMonitor:
             if snap.dvol is not None:
                 dvol_obs = float(snap.dvol)
 
-            mid_spot = 0.5 * (float(snap.spot_bid) + float(snap.spot_ask))
-            mid_perp = 0.5 * (float(snap.perp_bid) + float(snap.perp_ask))
+            mid_spot = _safe_midpoint(float(snap.spot_bid), float(snap.spot_ask))
+            mid_perp = _safe_midpoint(float(snap.perp_bid), float(snap.perp_ask))
             mark_perp = float(snap.perp_mark) if snap.perp_mark is not None else mid_perp
             basis_mid_bps = ((mid_perp / mid_spot) - 1.0) * 10_000.0
             basis_mark_bps = ((mark_perp / mid_spot) - 1.0) * 10_000.0
@@ -2542,8 +2716,8 @@ class W3DNShadowMonitor:
                     self._basis_cooldown_until_bucket[c_open] = cur_bucket + 1
         else:
             for coin, snap in valid_snaps.items():
-                mid_spot = 0.5 * (float(snap.spot_bid) + float(snap.spot_ask))
-                mid_perp = 0.5 * (float(snap.perp_bid) + float(snap.perp_ask))
+                mid_spot = _safe_midpoint(float(snap.spot_bid), float(snap.spot_ask))
+                mid_perp = _safe_midpoint(float(snap.perp_bid), float(snap.perp_ask))
                 mark_perp = float(snap.perp_mark) if snap.perp_mark is not None else mid_perp
                 b_mid = ((mid_perp / mid_spot) - 1.0) * 10_000.0
                 b_mark = ((mark_perp / mid_spot) - 1.0) * 10_000.0
