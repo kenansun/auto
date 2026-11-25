@@ -66,23 +66,42 @@ SHADOW_LIVE_EXECUTION_ENABLED: Final[bool] = False
 PARITY_DEPTH_ACTIVE: Final[str] = "ACTIVE_EXECUTION"
 PARITY_DEPTH_VACUOUS: Final[str] = "VACUOUS_ZERO_PLANS"
 TAKER_FEE_BPS_DEFAULT: Final[float] = 4.5
+_MIN_VALID_EPOCH_MS: Final[int] = 1_577_836_800_000
 _MAX_VALID_EPOCH_MS: Final[int] = 4_102_444_800_000
+_FORBIDDEN_BBO_PROVENANCE: Final[frozenset[str]] = frozenset({
+    "L4_SYNTHETIC_OR_MOCK",
+    "MOCK",
+    "SYNTHETIC",
+})
 
 
 def _is_finite(val: Any) -> bool:
-    return (not isinstance(val, bool)) and isinstance(val, (int, float)) and math.isfinite(float(val))
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(val))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _is_valid_bbo_tick(tick: Any) -> bool:
-    """Validate a BBOTick strictly before SQLite upsert or cache update (STD-46 DQ-U02/U03)."""
+    """Validate a BBOTick strictly before SQLite upsert or cache update (STD-46 DQ-U01/U02/U03)."""
     if tick is None:
         return False
     venue = getattr(tick, "venue", None)
     symbol = getattr(tick, "symbol", None)
     if not isinstance(venue, str) or not venue.strip() or not isinstance(symbol, str) or not symbol.strip():
         return False
+    prov = getattr(tick, "provenance", None)
+    if not isinstance(prov, str) or not prov.strip() or prov.strip().upper() in _FORBIDDEN_BBO_PROVENANCE:
+        return False
     ts_ms = getattr(tick, "ts_ms", None)
-    if isinstance(ts_ms, bool) or not isinstance(ts_ms, int) or ts_ms <= 0 or ts_ms > _MAX_VALID_EPOCH_MS:
+    if (
+        isinstance(ts_ms, bool)
+        or not isinstance(ts_ms, int)
+        or ts_ms < _MIN_VALID_EPOCH_MS
+        or ts_ms > _MAX_VALID_EPOCH_MS
+    ):
         return False
     bid_raw = getattr(tick, "bid", None)
     ask_raw = getattr(tick, "ask", None)
@@ -92,11 +111,14 @@ def _is_valid_bbo_tick(tick: Any) -> bool:
     for raw in (bid_raw, ask_raw, bid_qty_raw, ask_qty_raw, lat_raw):
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
             return False
-    bid = float(bid_raw)
-    ask = float(ask_raw)
-    bid_qty = float(bid_qty_raw)
-    ask_qty = float(ask_qty_raw)
-    latency_ms = float(lat_raw)
+    try:
+        bid = float(bid_raw)
+        ask = float(ask_raw)
+        bid_qty = float(bid_qty_raw)
+        ask_qty = float(ask_qty_raw)
+        latency_ms = float(lat_raw)
+    except (TypeError, ValueError, OverflowError):
+        return False
     if not (
         math.isfinite(bid)
         and math.isfinite(ask)
@@ -972,6 +994,8 @@ class ShadowPortfolioDaemon:
                 completed_buckets: dict[int, list[Any]] = {}
                 cur_open_closed_1h: list[Any] = []
                 for c in candles:
+                    if not _is_valid_ohlc_candle(c):
+                        continue
                     c_ts = int(c.ts_ms)
                     b = (c_ts // tf_ms) * tf_ms
                     if b < current_open_bucket:
@@ -1113,11 +1137,37 @@ class ShadowPortfolioDaemon:
             rmap = hourly_log_rets.setdefault(sym, {})
             if dual and cfg.venue_b:
                 for c in self.store.load_candles(cfg.venue_b, sym, start_ms=start_ms, end_ms=last_closed_bar_ts):
-                    if c.ts_ms <= last_closed_bar_ts and c.open > 0 and c.close > 0:
-                        rmap[int(c.ts_ms)] = math.log(float(c.close) / float(c.open))
+                    if (
+                        c.ts_ms <= last_closed_bar_ts
+                        and _is_finite(c.open)
+                        and _is_finite(c.close)
+                        and _is_finite(c.high)
+                        and _is_finite(c.low)
+                        and float(c.open) > 0.0
+                        and float(c.close) > 0.0
+                    ):
+                        try:
+                            log_ret = math.log(float(c.close) / float(c.open))
+                        except (ValueError, ZeroDivisionError, OverflowError):
+                            continue
+                        if math.isfinite(log_ret):
+                            rmap[int(c.ts_ms)] = log_ret
             for c in self.store.load_candles(cfg.venue_a, sym, start_ms=start_ms, end_ms=last_closed_bar_ts):
-                if c.ts_ms <= last_closed_bar_ts and c.open > 0 and c.close > 0:
-                    rmap[int(c.ts_ms)] = math.log(float(c.close) / float(c.open))
+                if (
+                    c.ts_ms <= last_closed_bar_ts
+                    and _is_finite(c.open)
+                    and _is_finite(c.close)
+                    and _is_finite(c.high)
+                    and _is_finite(c.low)
+                    and float(c.open) > 0.0
+                    and float(c.close) > 0.0
+                ):
+                    try:
+                        log_ret = math.log(float(c.close) / float(c.open))
+                    except (ValueError, ZeroDivisionError, OverflowError):
+                        continue
+                    if math.isfinite(log_ret):
+                        rmap[int(c.ts_ms)] = log_ret
             cutoff_r = last_closed_bar_ts - (vol_lb_h + 48) * HOUR_MS
             if len(rmap) > vol_lb_h + 72:
                 for old_t in [t for t in rmap if int(t) < cutoff_r]:

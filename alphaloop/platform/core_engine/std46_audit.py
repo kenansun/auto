@@ -74,7 +74,7 @@ _VER04_BAD_SLEEVE_TOKENS: Final[frozenset[str]] = frozenset(
 
 
 def _require_finite_float(val: Any, name: str) -> float:
-    """Validate and coerce a strictly finite numeric value, rejecting None/bool/NaN/Inf."""
+    """Validate and coerce a strictly finite numeric value, rejecting None/bool/NaN/Inf/Overflow."""
     if val is None or isinstance(val, bool):
         raise ValueError(f"{name} must be a finite real number, got {val!r}")
     if not isinstance(val, (int, float)):
@@ -84,12 +84,15 @@ def _require_finite_float(val: Any, name: str) -> float:
                 raise ValueError(f"{name} must be a finite real number, got empty string")
             try:
                 out = float(text)
-            except ValueError as exc:
+            except (ValueError, OverflowError) as exc:
                 raise ValueError(f"{name} must be a finite real number, got {val!r}") from exc
         else:
             raise ValueError(f"{name} must be a finite real number, got {type(val).__name__}")
     else:
-        out = float(val)
+        try:
+            out = float(val)
+        except OverflowError as exc:
+            raise ValueError(f"{name} overflows IEEE-754 float64, got {val!r}") from exc
     if not math.isfinite(out):
         raise ValueError(f"{name} must be finite, got {val!r}")
     return out
@@ -158,26 +161,41 @@ def _inspect_sleeve_gates(sleeve: dict[str, Any]) -> tuple[bool, str, int | None
     passing_ratios: list[tuple[int, int]] = []
     failing_ratios: list[tuple[int, int]] = []
 
+    explicit_totals: dict[str, int] = {}
+    for gt_key in ("gates_total", "total_gates"):
+        if gt_key in sleeve and sleeve[gt_key] is not None:
+            gt_val = sleeve[gt_key]
+            if isinstance(gt_val, bool) or not isinstance(gt_val, int) or gt_val <= 0:
+                found_any = True
+                failures.append(f"invalid {gt_key}={gt_val!r}")
+            else:
+                explicit_totals[gt_key] = gt_val
+
+    if len(set(explicit_totals.values())) > 1:
+        found_any = True
+        failures.append(f"contradictory gate totals {explicit_totals}")
+
+    effective_shared_total: int | None = max(explicit_totals.values()) if explicit_totals else None
+
     def _check_int_pair(gp_key: str, gt_key: str) -> None:
         nonlocal found_any
         has_gp = gp_key in sleeve and sleeve[gp_key] is not None
-        has_gt = gt_key in sleeve and sleeve[gt_key] is not None
         if not has_gp:
-            if has_gt:
-                gt_only = sleeve[gt_key]
-                if isinstance(gt_only, bool) or not isinstance(gt_only, int) or gt_only <= 0:
-                    found_any = True
-                    failures.append(f"invalid {gt_key}={gt_only!r}")
             return
         found_any = True
         gp_raw = sleeve[gp_key]
-        gt_raw = sleeve[gt_key] if has_gt else 8
         if isinstance(gp_raw, bool) or not isinstance(gp_raw, int) or gp_raw < 0:
             failures.append(f"invalid {gp_key}={gp_raw!r}")
             return
-        if isinstance(gt_raw, bool) or not isinstance(gt_raw, int) or gt_raw <= 0:
-            failures.append(f"invalid {gt_key}={gt_raw!r}")
+        if gt_key in explicit_totals:
+            gt_raw = explicit_totals[gt_key]
+        elif gt_key in sleeve and sleeve[gt_key] is not None:
+            # Already recorded invalid gt_key above
             return
+        elif effective_shared_total is not None:
+            gt_raw = effective_shared_total
+        else:
+            gt_raw = 8
         if gp_raw > gt_raw:
             failures.append(f"invalid gates {gp_raw}/{gt_raw} ({gp_key} > {gt_key})")
             failing_ratios.append((gp_raw, gt_raw))
@@ -222,6 +240,15 @@ def _inspect_sleeve_gates(sleeve: dict[str, Any]) -> tuple[bool, str, int | None
             failures.append(f"invalid passed_8_of_8={flag!r}")
         elif not flag:
             failures.append("passed_8_of_8=False")
+
+    if len(set(passing_ratios)) > 1:
+        failures.append(f"contradictory passing gate ratios {passing_ratios}")
+    elif effective_shared_total is not None and passing_ratios:
+        for gp_ok, gt_ok in passing_ratios:
+            if gt_ok != effective_shared_total:
+                failures.append(
+                    f"contradictory gate ratio {gp_ok}/{gt_ok} vs explicit total {effective_shared_total}"
+                )
 
     if not found_any:
         return False, "missing 8/8 gate evidence", None, 8
@@ -562,11 +589,13 @@ def build_std46_audit_report(
         if not isinstance(raw_s, dict):
             raise ValueError("Each strategy entry must be a dict")
         item = dict(raw_s)
-        if "excess_sharpe" not in item or "raw_sharpe" not in item:
-            if "cagr_pct" in item and "ann_vol_pct" in item:
+        if item.get("excess_sharpe") is None or item.get("raw_sharpe") is None:
+            if item.get("cagr_pct") is not None and item.get("ann_vol_pct") is not None:
                 cur_tokens = _normalize_currency_tokens(item.get("currency") or item.get("currencies"))
                 default_rf = DEFAULT_RMB_RF_PCT if cur_tokens == {"RMB"} else DEFAULT_USD_RF_PCT
-                rf_val = item.get("rf_pct", default_rf)
+                rf_val = item.get("rf_pct")
+                if rf_val is None:
+                    rf_val = default_rf
                 dual = compute_dual_sharpe(
                     cagr_pct=item["cagr_pct"],
                     ann_vol_pct=item["ann_vol_pct"],
@@ -605,11 +634,13 @@ def build_std46_audit_report(
         if not isinstance(raw_c, dict):
             raise ValueError("Each composite entry must be a dict")
         item = dict(raw_c)
-        if "excess_sharpe" not in item or "raw_sharpe" not in item:
-            if "cagr_pct" in item and "ann_vol_pct" in item:
+        if item.get("excess_sharpe") is None or item.get("raw_sharpe") is None:
+            if item.get("cagr_pct") is not None and item.get("ann_vol_pct") is not None:
                 cur_tokens = _normalize_currency_tokens(item.get("currencies") or item.get("currency"))
                 default_rf = DEFAULT_RMB_RF_PCT if cur_tokens == {"RMB"} else DEFAULT_USD_RF_PCT
-                rf_val = item.get("rf_pct", default_rf)
+                rf_val = item.get("rf_pct")
+                if rf_val is None:
+                    rf_val = default_rf
                 dual = compute_dual_sharpe(
                     cagr_pct=item["cagr_pct"],
                     ann_vol_pct=item["ann_vol_pct"],

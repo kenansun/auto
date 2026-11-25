@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -1738,6 +1739,273 @@ class TestSTD46AuditLayerAndImmutability(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, f"SCHQ --mode report failed:\n{proc.stdout}\n{proc.stderr}")
             self.assertEqual(json.loads(proc.stdout)["status"], "PASS")
+
+
+class TestTier5AutoAdversarialHardening(unittest.TestCase):
+    """Tier-5 adversarial regression tests for GAP-C2-04..08 (zero touch on validation.py)."""
+
+    def test_gap_c2_04_w3_dn_multithread_wal_audit_chain_integrity(self) -> None:
+        base_ts = 1_795_000_000_000
+        frames = [
+            {"BTC": _make_pair_snap("BTC", base_ts + i * 60_000, spot_mid=90_000.0, basis_bps=1.0)}
+            for i in range(65)
+        ]
+        with tempfile.TemporaryDirectory(prefix="w3dn_mt_chain_") as td:
+            cfg = ShadowMonitorConfig(
+                state_dir=Path(td),
+                coins=("BTC",),
+                observe_only_coins=(),
+                enforce_wall_clock_bounds=False,
+                enable_prewarm=False,
+            )
+            mon = W3DNShadowMonitor(config=cfg, provider=ReplayQuoteProvider(frames))
+            try:
+                errors: list[str] = []
+                barrier = threading.Barrier(4)
+
+                def _worker() -> None:
+                    barrier.wait()
+                    for _ in range(15):
+                        try:
+                            mon.run_once()
+                            mon.evaluate_48h_readiness()
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(f"{type(exc).__name__}: {exc}")
+
+                threads = [threading.Thread(target=_worker) for _ in range(4)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=30.0)
+
+                self.assertEqual(errors, [])
+                chain_ok, chain_len = mon.verify_audit_chain()
+                self.assertTrue(chain_ok)
+                self.assertEqual(chain_len, 60)
+                readiness = mon.evaluate_48h_readiness()
+                self.assertTrue(readiness.audit_chain_intact)
+                self.assertEqual(readiness.audit_chain_length, 60)
+                self.assertEqual(readiness.total_ticks, 60)
+            finally:
+                mon.close()
+
+    def test_gap_c2_05_310_digit_int_overflow_inf_candles_and_bbo_tick_bounds(self) -> None:
+        from alphaloop.daemon import shadow_runner as sr
+        from alphaloop.data import bbo_collector as bc
+        from alphaloop.platform.shadow import w3_dn_shadow_monitor as w3
+
+        huge_int = 10**310 - 1
+        self.assertIsNone(bc._parse_finite_float(huge_int))
+        self.assertFalse(sr._is_finite(huge_int))
+        self.assertFalse(w3._is_pos_finite(huge_int))
+        self.assertFalse(w3._is_finite(huge_int))
+        with self.assertRaises(ValueError):
+            compute_dual_sharpe(cagr_pct=huge_int, ann_vol_pct=10.0)
+
+        # bbo_collector capture_round survives 310-digit RFC-8259 JSON integer from upstream without crashing
+        collector = MultiVenueBBOCollector(symbols=["BTC"])
+        def _fake_http(url: str, *args: Any, **kwargs: Any) -> Any:
+            if "okx.com" in url:
+                return ({"code": "0", "data": [{"instId": "BTC-USDT-SWAP", "bidPx": huge_int, "askPx": 90001.0, "bidSz": 1.0, "askSz": 1.0, "ts": 1_795_000_000_000}]}, 5.0)
+            if "gateio.ws" in url:
+                return ([{"contract": "BTC_USDT", "highest_bid": "90000.0", "lowest_ask": "90001.0", "highest_size": "1.0", "lowest_size": "1.0"}], 5.0)
+            if "hyperliquid.xyz" in url:
+                return ([{"universe": [{"name": "BTC"}]}, [{"impactPxs": ["90000.0", "90001.0"]}]], 5.0)
+            if "lighter" in url:
+                return ({"order_books": []}, 5.0)
+            return ({}, 5.0)
+
+        with patch.object(bc, "_http_json", side_effect=_fake_http):
+            ticks, _stats = collector.capture_round()
+        self.assertGreaterEqual(len(ticks), 1)
+        self.assertTrue(all(math.isfinite(t.bid) and math.isfinite(t.ask) for t in ticks))
+
+        # _is_valid_bbo_tick enforces _MIN_VALID_EPOCH_MS, catches OverflowError, and rejects synthetic provenance
+        now_ms = 1_795_000_000_000
+        self.assertTrue(sr._is_valid_bbo_tick(BBOTick("hyperliquid", "BTC", now_ms, 90000.0, 90001.0, 1.0, 1.0, 5.0, PROVENANCE_REAL)))
+        self.assertFalse(sr._is_valid_bbo_tick(BBOTick("hyperliquid", "BTC", now_ms, huge_int, 90001.0, 1.0, 1.0, 5.0, PROVENANCE_REAL)))  # type: ignore[arg-type]
+        self.assertFalse(sr._is_valid_bbo_tick(BBOTick("hyperliquid", "BTC", 1, 90000.0, 90001.0, 1.0, 1.0, 5.0, PROVENANCE_REAL)))
+        self.assertFalse(sr._is_valid_bbo_tick(BBOTick("hyperliquid", "BTC", 1_795_000_000, 90000.0, 90001.0, 1.0, 1.0, 5.0, PROVENANCE_REAL)))
+        for bad_prov in ("", "   ", None, 123, "L4_SYNTHETIC_OR_MOCK", "MOCK", "synthetic"):
+            self.assertFalse(
+                sr._is_valid_bbo_tick(BBOTick("hyperliquid", "BTC", now_ms, 90000.0, 90001.0, 1.0, 1.0, 5.0, bad_prov))  # type: ignore[arg-type]
+            )
+
+        # Unfiltered inf candles must NEVER poison CTA warmup or carry hourly_log_rets (save_runtime_state allow_nan=False)
+        with tempfile.TemporaryDirectory(prefix="sr_inf_candle_") as td:
+            data_dir = Path(td)
+            store = MarketDataStore(data_dir / "market_data.sqlite")
+            t_hour = (now_ms // 3_600_000) * 3_600_000
+            good_and_inf = [
+                PriceBar("hyperliquid", "BTC", t_hour - 5 * 3_600_000, float("inf"), float("inf"), float("inf"), float("inf"), 1.0, PROVENANCE_REAL),
+                PriceBar("hyperliquid", "BTC", t_hour - 4 * 3_600_000, 100.0, 101.0, 99.0, 100.5, 10.0, PROVENANCE_REAL),
+                PriceBar("hyperliquid", "BTC", t_hour - 3 * 3_600_000, 100.5, 102.0, 100.0, 101.0, 10.0, PROVENANCE_REAL),
+                PriceBar("hyperliquid", "BTC", t_hour - 2 * 3_600_000, 101.0, 102.5, 100.5, 101.5, 10.0, PROVENANCE_REAL),
+                PriceBar("hyperliquid", "BTC", t_hour - 1 * 3_600_000, 101.5, 103.0, 101.0, 102.0, 10.0, PROVENANCE_REAL),
+            ]
+            store.upsert_candles(good_and_inf)
+            store.close()
+            cfg_carry = StrategyConfig(
+                strategy_id="carry_inf_test",
+                version="v1",
+                family="funding_carry",
+                status="active",
+                mode="shadow",
+                plugin_id="funding_carry",
+                venue_a="hyperliquid",
+                venue_b="gate",
+                symbols=("BTC",),
+                capital_usd=1000.0,
+                params={"vol_target_leverage_enabled": True, "vol_lookback_hours": 24},
+            )
+            cfg_cta = StrategyConfig(
+                strategy_id="cta_inf_test",
+                version="v1",
+                family="trend_cta",
+                status="active",
+                mode="shadow",
+                plugin_id="trend_cta",
+                venue_a="hyperliquid",
+                venue_b="",
+                symbols=("BTC",),
+                capital_usd=1000.0,
+                params={"timeframe_hours": 4, "entry_lookback": 1, "atr_period": 2, "ema_period": 2},
+            )
+            daemon = ShadowPortfolioDaemon(data_dir=data_dir)
+            try:
+                carry_state: dict[str, Any] = {}
+                daemon._refresh_carry_hourly_log_rets(cfg_carry, carry_state, t_hour + 60_000)
+                rmap = carry_state.get("hourly_log_rets", {}).get("BTC", {})
+                self.assertNotIn(t_hour - 5 * 3_600_000, rmap)
+                self.assertTrue(all(math.isfinite(v) for v in rmap.values()))
+                json.dumps(carry_state, allow_nan=False)
+
+                cta_state: dict[str, Any] = {}
+                daemon._warmup_plugin_state_from_candles(cfg_cta, "sha_cta_test", cta_state, t_hour + 60_000)
+                json.dumps(cta_state, allow_nan=False)
+                daemon.parity.save_runtime_state(
+                    cfg_carry.strategy_id,
+                    started_ts_ms=t_hour,
+                    realized_pnl_usd=0.0,
+                    plans_created=0,
+                    plans_blocked=0,
+                    open_positions={},
+                    updated_ts_ms=t_hour + 60_000,
+                    plugin_state=carry_state,
+                )
+                daemon.parity.save_runtime_state(
+                    cfg_cta.strategy_id,
+                    started_ts_ms=t_hour,
+                    realized_pnl_usd=0.0,
+                    plans_created=0,
+                    plans_blocked=0,
+                    open_positions={},
+                    updated_ts_ms=t_hour + 60_000,
+                    plugin_state=cta_state,
+                )
+            finally:
+                daemon.close()
+
+    def test_gap_c2_06_std46_audit_mixed_family_gates_and_none_sentinels(self) -> None:
+        bad_sleeves = [
+            {"sleeve_id": "S_MIX1", "gates_passed": 8, "total_gates": 10, "currency": "USD"},
+            {"sleeve_id": "S_MIX2", "passed_gates": 8, "gates_total": 10, "currency": "USD"},
+            {"sleeve_id": "S_CONTRA_TOT", "gates_passed": 8, "gates_total": 8, "total_gates": 10, "currency": "USD"},
+            {"sleeve_id": "S_CONTRA_RATIO", "gates_passed": 8, "gates_total": 8, "gates": "10/10", "currency": "USD"},
+        ]
+        for sl in bad_sleeves:
+            res = audit_composite_portfolio([sl], {"USD"}, fx_hedged=False)
+            self.assertFalse(res["eligible_for_production"], msg=f"Must reject {sl}")
+            self.assertEqual(res["classification"], "DIAGNOSTIC_HYPOTHETICAL_ONLY")
+
+        rep = build_std46_audit_report(
+            report_name="none_sentinel_test",
+            strategies=[
+                {"strategy_id": "S1", "cagr_pct": 12.0, "ann_vol_pct": 10.0, "currency": "USD", "excess_sharpe": None, "raw_sharpe": None},
+            ],
+            composites=[
+                {
+                    "portfolio_id": "C1",
+                    "currencies": ["USD"],
+                    "fx_hedged": False,
+                    "cagr_pct": 12.0,
+                    "ann_vol_pct": 10.0,
+                    "raw_sharpe": None,
+                    "excess_sharpe": None,
+                    "sleeves": [{"sleeve_id": "S1", "gates_passed": 8, "gates_total": 8, "currency": "USD"}],
+                },
+            ],
+        )
+        self.assertIsNotNone(rep["strategies"][0]["excess_sharpe"])
+        self.assertIsNotNone(rep["strategies"][0]["raw_sharpe"])
+        self.assertIsNotNone(rep["composites"][0]["excess_sharpe"])
+        self.assertIsNotNone(rep["composites"][0]["raw_sharpe"])
+
+        with tempfile.TemporaryDirectory(prefix="std46_c2_06_") as td:
+            rp = Path(td) / "none_sentinel_report.json"
+            rp.write_text(json.dumps(rep, indent=2, allow_nan=False), encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, "-B", str(_SCHQ_GATE_SCRIPT), "--mode", "report", str(rp), "--json"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"SCHQ --mode report failed: {proc.stdout}\n{proc.stderr}")
+
+    def test_gap_c2_07_deribit_null_result_bool_dvol_and_p8_bool_bid(self) -> None:
+        from alphaloop.platform.shadow.w3_dn_shadow_monitor import P8MDGatewayFileQuoteProvider
+
+        class _StubClient:
+            def __init__(self, payloads: list[Any]) -> None:
+                self._payloads = list(payloads)
+                self._idx = 0
+
+            def fetch_json(self, *_a: Any, **_kw: Any) -> Any:
+                val = self._payloads[min(self._idx, len(self._payloads) - 1)]
+                self._idx += 1
+                return val
+
+        # Deribit {"result": null} must not raise AttributeError
+        prov_null = PublicRestWaterfallQuoteProvider(client=_StubClient([{"result": None}]))  # type: ignore[arg-type]
+        self.assertIsNone(prov_null._fetch_dvol_cached())
+
+        # Deribit bool DVOL True must be rejected (never coerced to 1.0)
+        prov_bool = PublicRestWaterfallQuoteProvider(client=_StubClient([{"result": {"data": [[1, 2, 3, 4, True]]}}]))  # type: ignore[arg-type]
+        self.assertIsNone(prov_bool._fetch_dvol_cached())
+
+        # P8 JSONL bool bid/ask/ts must be rejected
+        with tempfile.TemporaryDirectory(prefix="p8_bool_") as td:
+            feed = Path(td) / "p8.jsonl"
+            feed.write_text(
+                "\n".join([
+                    json.dumps({"symbol": "BTC", "bid": True, "ask": 2.0, "bid_qty": 1.0, "ask_qty": 1.0, "ts_ms": 1_795_000_000_000}, allow_nan=False),
+                    json.dumps({"symbol": "ETH", "bid": 3000.0, "ask": 3001.0, "bid_qty": True, "ask_qty": 1.0, "ts_ms": 1_795_000_000_000}, allow_nan=False),
+                    json.dumps({"symbol": "SOL", "bid": 150.0, "ask": 151.0, "bid_qty": 1.0, "ask_qty": 1.0, "ts_ms": True}, allow_nan=False),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            p8 = P8MDGatewayFileQuoteProvider(p8_feed_path=feed, perp_provider=prov_null)
+            parsed = p8._read_latest_p8_spot_bbo(["BTC", "ETH", "SOL"])
+            self.assertEqual(parsed, {})
+
+    def test_gap_c2_08_prewarm_max_bars_strict_int_validation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="w3dn_max_bars_") as td:
+            cfg = ShadowMonitorConfig(
+                state_dir=Path(td),
+                coins=("BTC",),
+                observe_only_coins=(),
+                enforce_wall_clock_bounds=False,
+                enable_prewarm=False,
+            )
+            mon = W3DNShadowMonitor(config=cfg, provider=ReplayQuoteProvider([]))
+            try:
+                for bad_mb in (1.9, "5", float("inf"), float("nan"), {}, True, -1):
+                    with self.assertRaises(ValueError, msg=f"prewarm_from_snapshots must reject {bad_mb!r}"):
+                        mon.prewarm_from_snapshots([], max_bars=bad_mb)  # type: ignore[arg-type]
+                    with self.assertRaises(ValueError, msg=f"prewarm_from_bars must reject {bad_mb!r}"):
+                        mon.prewarm_from_bars([], max_bars=bad_mb)  # type: ignore[arg-type]
+            finally:
+                mon.close()
 
 
 if __name__ == "__main__":

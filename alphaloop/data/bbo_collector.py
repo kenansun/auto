@@ -43,12 +43,12 @@ class TimestampedBBOTick(BBOTick):
 
 
 def _parse_finite_float(raw: Any) -> float | None:
-    """Parse a finite float, rejecting None, bool, non-numeric values, NaN, and +/-Inf."""
+    """Parse a finite float, rejecting None, bool, non-numeric values, NaN, +/-Inf, and Overflow."""
     if raw is None or isinstance(raw, bool):
         return None
     try:
         val = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(val):
         return None

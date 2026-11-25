@@ -35,6 +35,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -120,7 +121,7 @@ def _is_pos_finite(x: Any) -> bool:
         return False
     try:
         v = float(x)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
     return math.isfinite(v) and v > 0.0
 
@@ -130,9 +131,19 @@ def _is_finite(x: Any) -> bool:
         return False
     try:
         v = float(x)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
     return math.isfinite(v)
+
+
+def _parse_optional_finite_float(x: Any) -> float | None:
+    if x is None or isinstance(x, bool):
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return v if math.isfinite(v) else None
 
 
 def _safe_midpoint(bid: float, ask: float) -> float:
@@ -480,7 +491,15 @@ class PublicRestWaterfallQuoteProvider:
                     continue
                 ts_ms = utc_now_ms()
                 return bid, ask, bid_qty, ask_qty, ts_ms, base
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, KeyError, ValueError, TypeError) as exc:
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                KeyError,
+                ValueError,
+                TypeError,
+                OverflowError,
+            ) as exc:
                 logger.warning("Spot waterfall endpoint %s failed for %s: %s", base, sym, exc)
                 continue
         return None
@@ -535,7 +554,7 @@ class PublicRestWaterfallQuoteProvider:
                 continue
             try:
                 px, sz = float(raw_px), float(raw_sz)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if math.isfinite(px) and math.isfinite(sz) and px > 0.0 and sz >= 0.0:
                 bids_list.append((px, sz))
@@ -548,7 +567,7 @@ class PublicRestWaterfallQuoteProvider:
                 continue
             try:
                 px, sz = float(raw_px), float(raw_sz)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if math.isfinite(px) and math.isfinite(sz) and px > 0.0 and sz >= 0.0:
                 asks_list.append((px, sz))
@@ -582,14 +601,24 @@ class PublicRestWaterfallQuoteProvider:
                 max_retries=2,
                 min_interval_sec=0.25,
             )
-            data = payload.get("result", {}).get("data", []) if isinstance(payload, dict) else []
-            if data and isinstance(data[-1], list) and len(data[-1]) >= 5:
-                val = float(data[-1][4])
-                if _is_pos_finite(val):
+            result = payload.get("result") if isinstance(payload, dict) else None
+            data = result.get("data") if isinstance(result, dict) else None
+            if isinstance(data, list) and data and isinstance(data[-1], list) and len(data[-1]) >= 5:
+                raw_dvol = data[-1][4]
+                if _is_pos_finite(raw_dvol):
+                    val = float(raw_dvol)
                     self._last_dvol = val
                     self._last_dvol_fetch_mono = now_mono
                     return val
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            ValueError,
+            KeyError,
+            TypeError,
+            OverflowError,
+        ) as exc:
             logger.warning("Deribit DVOL fetch failed: %s", exc)
         # RB-16: expire cached DVOL after max_dvol_stale_sec rather than reusing indefinitely
         if self._last_dvol is not None and (now_mono - self._last_dvol_fetch_mono) <= self.max_dvol_stale_sec:
@@ -602,7 +631,7 @@ class PublicRestWaterfallQuoteProvider:
         hl_ctxs: dict[str, dict[str, Any]] = {}
         try:
             hl_ctxs = self._fetch_hl_meta_and_ctxs()
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError) as exc:
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError, OverflowError) as exc:
             logger.warning("Hyperliquid metaAndAssetCtxs failed: %s", exc)
 
         dvol_val = self._fetch_dvol_cached()
@@ -615,7 +644,7 @@ class PublicRestWaterfallQuoteProvider:
             l2 = None
             try:
                 l2 = self._fetch_hl_l2_book(coin)
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError) as exc:
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError, OverflowError) as exc:
                 logger.warning("Hyperliquid l2Book failed for %s: %s", coin, exc)
 
             # Capture observation timestamp AFTER fetching this coin's quotes (prevents false CLOCK_SKEW on retry)
@@ -626,14 +655,9 @@ class PublicRestWaterfallQuoteProvider:
             perp_oracle: float | None = None
             perp_funding_1h: float | None = None
             if ctx:
-                try:
-                    perp_mark = float(ctx["markPx"]) if ctx.get("markPx") is not None else None
-                    perp_oracle = float(ctx["oraclePx"]) if ctx.get("oraclePx") is not None else None
-                    perp_funding_1h = float(ctx["funding"]) if ctx.get("funding") is not None else None
-                except (TypeError, ValueError):
-                    perp_mark = None
-                    perp_oracle = None
-                    perp_funding_1h = None
+                perp_mark = _parse_optional_finite_float(ctx.get("markPx"))
+                perp_oracle = _parse_optional_finite_float(ctx.get("oraclePx"))
+                perp_funding_1h = _parse_optional_finite_float(ctx.get("funding"))
 
             out[coin] = PairMarketSnapshot(
                 coin=coin,
@@ -713,14 +737,30 @@ class P8MDGatewayFileQuoteProvider:
                 if ts_raw is None or str(ts_raw).strip() == "":
                     continue
                 try:
-                    latest[sym] = (
-                        float(row["bid"]),
-                        float(row["ask"]),
-                        float(row.get("bid_qty", 1.0)),
-                        float(row.get("ask_qty", 1.0)),
-                        int(ts_raw),
-                    )
-                except (KeyError, TypeError, ValueError):
+                    raw_bid = row["bid"]
+                    raw_ask = row["ask"]
+                    raw_bq = row.get("bid_qty", 1.0)
+                    raw_aq = row.get("ask_qty", 1.0)
+                    if any(isinstance(v, bool) for v in (raw_bid, raw_ask, raw_bq, raw_aq, ts_raw)):
+                        continue
+                    bid_v = float(raw_bid)
+                    ask_v = float(raw_ask)
+                    bq_v = float(raw_bq)
+                    aq_v = float(raw_aq)
+                    ts_v = int(ts_raw)
+                    if not (
+                        math.isfinite(bid_v)
+                        and math.isfinite(ask_v)
+                        and math.isfinite(bq_v)
+                        and math.isfinite(aq_v)
+                        and bid_v > 0.0
+                        and ask_v > 0.0
+                        and bq_v >= 0.0
+                        and aq_v >= 0.0
+                    ):
+                        continue
+                    latest[sym] = (bid_v, ask_v, bq_v, aq_v, ts_v)
+                except (KeyError, TypeError, ValueError, OverflowError):
                     continue
         else:
             for line in lines:
@@ -737,14 +777,33 @@ class P8MDGatewayFileQuoteProvider:
                 if "ts_ms" not in obj or obj["ts_ms"] is None:
                     continue
                 try:
-                    latest[sym] = (
-                        float(obj["bid"]),
-                        float(obj["ask"]),
-                        float(obj.get("bid_qty", 1.0)),
-                        float(obj.get("ask_qty", 1.0)),
-                        int(obj["ts_ms"]),
-                    )
-                except (KeyError, TypeError, ValueError):
+                    raw_bid = obj["bid"]
+                    raw_ask = obj["ask"]
+                    raw_bq = obj.get("bid_qty", 1.0)
+                    raw_aq = obj.get("ask_qty", 1.0)
+                    raw_ts = obj["ts_ms"]
+                    if any(isinstance(v, bool) for v in (raw_bid, raw_ask, raw_bq, raw_aq, raw_ts)):
+                        continue
+                    bid_v = float(raw_bid)
+                    ask_v = float(raw_ask)
+                    bq_v = float(raw_bq)
+                    aq_v = float(raw_aq)
+                    if not _is_pos_finite(raw_ts):
+                        continue
+                    ts_v = int(raw_ts)
+                    if not (
+                        math.isfinite(bid_v)
+                        and math.isfinite(ask_v)
+                        and math.isfinite(bq_v)
+                        and math.isfinite(aq_v)
+                        and bid_v > 0.0
+                        and ask_v > 0.0
+                        and bq_v >= 0.0
+                        and aq_v >= 0.0
+                    ):
+                        continue
+                    latest[sym] = (bid_v, ask_v, bq_v, aq_v, ts_v)
+                except (KeyError, TypeError, ValueError, OverflowError):
                     continue
         return latest
 
@@ -755,7 +814,7 @@ class P8MDGatewayFileQuoteProvider:
         hl_ctxs: dict[str, dict[str, Any]] = {}
         try:
             hl_ctxs = self.perp_provider._fetch_hl_meta_and_ctxs()
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError):
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError, OverflowError):
             hl_ctxs = {}
         dvol_val = self.perp_provider._fetch_dvol_cached()
 
@@ -767,7 +826,7 @@ class P8MDGatewayFileQuoteProvider:
             l2 = None
             try:
                 l2 = self.perp_provider._fetch_hl_l2_book(coin)
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError):
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError, OverflowError):
                 l2 = None
 
             perp_bids = l2[0] if l2 else ()
@@ -782,9 +841,9 @@ class P8MDGatewayFileQuoteProvider:
                 spot_ts_ms=sp[4] if sp else None,
                 perp_bid=perp_bids[0][0] if perp_bids else None,
                 perp_ask=perp_asks[0][0] if perp_asks else None,
-                perp_mark=float(ctx["markPx"]) if (ctx and ctx.get("markPx") is not None) else None,
-                perp_oracle=float(ctx["oraclePx"]) if (ctx and ctx.get("oraclePx") is not None) else None,
-                perp_funding_1h=float(ctx["funding"]) if (ctx and ctx.get("funding") is not None) else None,
+                perp_mark=_parse_optional_finite_float(ctx.get("markPx")) if ctx else None,
+                perp_oracle=_parse_optional_finite_float(ctx.get("oraclePx")) if ctx else None,
+                perp_funding_1h=_parse_optional_finite_float(ctx.get("funding")) if ctx else None,
                 perp_ts_ms=l2[2] if l2 else (obs_ms if ctx else None),
                 perp_l2_bids=perp_bids,
                 perp_l2_asks=perp_asks,
@@ -867,6 +926,9 @@ class W3DNShadowMonitor:
         self._init_schema()
         self._log_handler: RotatingFileHandler | None = None
         self._trace_logger = self._init_rotating_logger()
+
+        # Instance RLock serializing multi-thread WAL ticks, audit-chain writes, prewarm & readiness reads
+        self._lock = threading.RLock()
 
         # Virtual accounting & telemetry state (hydrated from SQLite checkpoint if restarting — RB-01)
         self._cash_usd: float = float(config.capital_usd)
@@ -1162,46 +1224,51 @@ class W3DNShadowMonitor:
     ) -> str:
         """Atomically append tamper-evident audit hash AND persist state checkpoint in one WAL txn (RB-01)."""
         payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        preimage = f"{self._last_chain_hash}|{int(ts_ms)}|{trace_id}|{payload_json}".encode("utf-8")
-        chain_hash = hashlib.sha256(preimage).hexdigest()
-        state_json = json.dumps(self._build_checkpoint_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
-        with transaction(self.conn):
-            self.conn.execute(
-                """
-                INSERT INTO shadow_audit_chain (ts_ms, trace_id, prev_hash, payload_json, chain_hash)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (int(ts_ms), trace_id, self._last_chain_hash, payload_json, chain_hash),
+        with self._lock:
+            state_json = json.dumps(
+                self._build_checkpoint_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False
             )
-            self.conn.execute(
-                """
-                INSERT INTO shadow_state_checkpoint (id, updated_ts_ms, state_json)
-                VALUES (1, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET updated_ts_ms=excluded.updated_ts_ms, state_json=excluded.state_json
-                """,
-                (int(ts_ms), state_json),
-            )
-        self._last_chain_hash = chain_hash
-        return chain_hash
+            with transaction(self.conn):
+                prev_hash = self._last_chain_hash
+                preimage = f"{prev_hash}|{int(ts_ms)}|{trace_id}|{payload_json}".encode("utf-8")
+                chain_hash = hashlib.sha256(preimage).hexdigest()
+                self.conn.execute(
+                    """
+                    INSERT INTO shadow_audit_chain (ts_ms, trace_id, prev_hash, payload_json, chain_hash)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (int(ts_ms), trace_id, prev_hash, payload_json, chain_hash),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO shadow_state_checkpoint (id, updated_ts_ms, state_json)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET updated_ts_ms=excluded.updated_ts_ms, state_json=excluded.state_json
+                    """,
+                    (int(ts_ms), state_json),
+                )
+            self._last_chain_hash = chain_hash
+            return chain_hash
 
     def verify_audit_chain(self) -> tuple[bool, int]:
         """Verify complete SHA-256 tamper-evident audit chain integrity from genesis."""
-        rows = self.conn.fetch_all(
-            "SELECT seq, ts_ms, trace_id, prev_hash, payload_json, chain_hash "
-            "FROM shadow_audit_chain ORDER BY seq ASC"
-        )
-        expected_prev = "0" * 64
-        for r in rows:
-            if str(r["prev_hash"]) != expected_prev:
-                return False, len(rows)
-            preimage = (
-                f"{expected_prev}|{int(r['ts_ms'])}|{str(r['trace_id'])}|{str(r['payload_json'])}"
-            ).encode("utf-8")
-            calc = hashlib.sha256(preimage).hexdigest()
-            if calc != str(r["chain_hash"]):
-                return False, len(rows)
-            expected_prev = calc
-        return True, len(rows)
+        with self._lock:
+            rows = self.conn.fetch_all(
+                "SELECT seq, ts_ms, trace_id, prev_hash, payload_json, chain_hash "
+                "FROM shadow_audit_chain ORDER BY seq ASC"
+            )
+            expected_prev = "0" * 64
+            for r in rows:
+                if str(r["prev_hash"]) != expected_prev:
+                    return False, len(rows)
+                preimage = (
+                    f"{expected_prev}|{int(r['ts_ms'])}|{str(r['trace_id'])}|{str(r['payload_json'])}"
+                ).encode("utf-8")
+                calc = hashlib.sha256(preimage).hexdigest()
+                if calc != str(r["chain_hash"]):
+                    return False, len(rows)
+                expected_prev = calc
+            return True, len(rows)
 
     def _emit_alert(
         self,
@@ -1322,8 +1389,7 @@ class W3DNShadowMonitor:
                 ts_val is None
                 or isinstance(ts_val, bool)
                 or not isinstance(ts_val, (int, float))
-                or not math.isfinite(float(ts_val))
-                or float(ts_val) <= 0.0
+                or not _is_pos_finite(ts_val)
             ):
                 return (
                     False,
@@ -1478,7 +1544,7 @@ class W3DNShadowMonitor:
                 ts_val is None
                 or isinstance(ts_val, bool)
                 or not isinstance(ts_val, (int, float))
-                or not math.isfinite(float(ts_val))
+                or not _is_pos_finite(ts_val)
                 or int(ts_val) < _MIN_VALID_EPOCH_MS
                 or int(ts_val) > _MAX_VALID_EPOCH_MS
             ):
@@ -1663,11 +1729,20 @@ class W3DNShadowMonitor:
         max_bars: int | None = None,
     ) -> dict[str, Any]:
         """Read-only historical CanonicalBar pre-warming (ZERO virtual trades, ticks, or audit-chain mutations)."""
+        with self._lock:
+            return self._prewarm_from_bars_locked(bar_frames, max_bars=max_bars)
+
+    def _prewarm_from_bars_locked(
+        self,
+        bar_frames: Sequence[dict[str, CanonicalBar] | tuple[int, dict[str, CanonicalBar]]],
+        *,
+        max_bars: int | None = None,
+    ) -> dict[str, Any]:
         if SHADOW_LIVE_EXECUTION_ENABLED:
             raise RuntimeError(f"{PlatformErrorCode.LIVE_SWITCH_BLOCKED.value}: live execution forbidden")
         if isinstance(bar_frames, (str, bytes, dict)):
             raise TypeError("bar_frames must be a sequence of CanonicalBar frame mappings")
-        if max_bars is not None and (isinstance(max_bars, bool) or int(max_bars) < 0):
+        if max_bars is not None and (isinstance(max_bars, bool) or not isinstance(max_bars, int) or max_bars < 0):
             raise ValueError("max_bars must be a non-negative integer")
 
         if self._has_live_execution_started():
@@ -1830,11 +1905,20 @@ class W3DNShadowMonitor:
         Feeds kernel state causally without opening virtual positions, counting live ticks,
         modifying cash/audit chain, or advancing `_start_ts_ms`/`_last_kernel_bucket`.
         """
+        with self._lock:
+            return self._prewarm_from_snapshots_locked(frames, max_bars=max_bars)
+
+    def _prewarm_from_snapshots_locked(
+        self,
+        frames: Sequence[Any],
+        *,
+        max_bars: int | None = None,
+    ) -> dict[str, Any]:
         if SHADOW_LIVE_EXECUTION_ENABLED:
             raise RuntimeError(f"{PlatformErrorCode.LIVE_SWITCH_BLOCKED.value}: live execution forbidden")
         if isinstance(frames, (str, bytes, dict)):
             raise TypeError("frames must be a sequence of historical snapshot frames")
-        if max_bars is not None and (isinstance(max_bars, bool) or int(max_bars) < 0):
+        if max_bars is not None and (isinstance(max_bars, bool) or not isinstance(max_bars, int) or max_bars < 0):
             raise ValueError("max_bars must be a non-negative integer")
 
         if self._has_live_execution_started():
@@ -2409,6 +2493,10 @@ class W3DNShadowMonitor:
 
     def run_once(self) -> dict[str, Any]:
         """Execute one deterministic read-only shadow observation, risk check, and paper tick."""
+        with self._lock:
+            return self._run_once_locked()
+
+    def _run_once_locked(self) -> dict[str, Any]:
         if SHADOW_LIVE_EXECUTION_ENABLED:
             raise RuntimeError(f"{PlatformErrorCode.LIVE_SWITCH_BLOCKED.value}: live execution forbidden")
 
@@ -2839,6 +2927,10 @@ class W3DNShadowMonitor:
 
     def evaluate_48h_readiness(self) -> ShadowReadinessReport:
         """Compute machine-verifiable >=48h blind-run readiness verdict (never auto-enables live)."""
+        with self._lock:
+            return self._evaluate_48h_readiness_locked()
+
+    def _evaluate_48h_readiness_locked(self) -> ShadowReadinessReport:
         elapsed_h = (
             max(0.0, (float(self._last_ts_ms) - float(self._start_ts_ms)) / 3_600_000.0)
             if (self._start_ts_ms is not None and self._last_ts_ms is not None)
