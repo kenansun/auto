@@ -2007,7 +2007,7 @@ class TestTier5AutoAdversarialHardening(unittest.TestCase):
             finally:
                 mon.close()
 
-    def test_gap_c2r2_01_static_ablation_forbids_incompatible_units_and_sharpe_families(self) -> None:
+    def test_gap_c2r2_01_static_ablation_forbids_incompatible_metric_families(self) -> None:
         # 1. raw_sharpe vs excess_sharpe MUST raise ValueError (no apples-to-oranges Sharpe bypass)
         with self.assertRaises(ValueError):
             evaluate_static_ablation(
