@@ -41,6 +41,21 @@ def validate_human_token(status: str, allowed_auto: set[str], token: str | None)
             )
 
 
+def validate_strategy_config_params(cfg: StrategyConfig) -> None:
+    """Fail-closed validation of plugin-specific `cfg.params` schema across registry & hot-reload (CC-20261123-001)."""
+    pid = str(cfg.plugin_id or "funding_carry").strip().lower()
+    if pid == "funding_carry":
+        from alphaloop.harness.backtester import validate_funding_carry_params
+
+        validate_funding_carry_params(cfg.params)
+    elif pid == "trend_cta":
+        from alphaloop.plugins.trend_cta_plugin import validate_trend_cta_params
+
+        validate_trend_cta_params(cfg.params)
+    elif cfg.params is not None and not isinstance(cfg.params, dict):
+        raise ValueError(f"StrategyConfig.params must be a dict, got {type(cfg.params).__name__}")
+
+
 class HotConfigStore:
     """Versioned strategy registry + atomic POSIX rename(2) runtime config bus."""
 
@@ -101,6 +116,7 @@ class HotConfigStore:
         """Persist a new strategy config version (append-only) and atomically publish active runtime file."""
         validate_strategy_id(cfg.strategy_id)
         validate_human_token(cfg.status, self.ALLOWED_AUTO_STATUSES, human_approval_token)
+        validate_strategy_config_params(cfg)
 
         payload = cfg.to_dict()
         cfg_sha = sha256_obj(payload)
@@ -198,6 +214,7 @@ class HotConfigStore:
                 raise ValueError(f"Version {strategy_id}@{target_version} not found")
             cfg = StrategyConfig.from_dict(json.loads(row["config_json"]))
             validate_human_token(cfg.status, self.ALLOWED_AUTO_STATUSES, human_approval_token)
+            validate_strategy_config_params(cfg)
 
             now = utc_now_ms()
             with transaction(self.conn):

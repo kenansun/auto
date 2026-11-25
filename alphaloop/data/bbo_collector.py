@@ -10,10 +10,12 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import math
 import random
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
 from alphaloop.core.models import BBOTick
@@ -25,6 +27,105 @@ DEFAULT_BBO_SYMBOLS = [
     "BTC", "ETH", "SOL", "VVV", "WLD", "NEAR", "ENA", "ZEC", "UNI", "HYPE",
 ]
 
+TS_SOURCE_VENUE = "VENUE_EXCHANGE"
+TS_SOURCE_RECV_LOCAL = "RECV_LOCAL_ONLY"
+MIN_VALID_EPOCH_MS = 1_577_836_800_000  # 2020-01-01T00:00:00Z (STD-46 DQ-U03)
+MAX_VALID_EPOCH_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z (STD-46 DQ-U03)
+
+
+@dataclass
+class TimestampedBBOTick(BBOTick):
+    """BBOTick subclass explicitly separating exchange venue timestamp from local receive timestamp."""
+
+    venue_ts_ms: int | None = None
+    recv_ts_ms: int = 0
+    ts_source: str = TS_SOURCE_RECV_LOCAL
+
+
+def _parse_finite_float(raw: Any) -> float | None:
+    """Parse a finite float, rejecting None, bool, non-numeric values, NaN, +/-Inf, and Overflow."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(val):
+        return None
+    return 0.0 if val == 0.0 else val
+
+
+def _parse_optional_nonneg_qty(raw: Any) -> float | None:
+    """Parse an optional non-negative finite quantity; missing/blank maps to 0.0, invalid returns None."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return 0.0
+    val = _parse_finite_float(raw)
+    if val is None or val < 0.0:
+        return None
+    return 0.0 if val == 0.0 else val
+
+
+def _parse_venue_ts_ms(raw: Any) -> int | None:
+    """Parse a UTC epoch ms timestamp within [2020-01-01, 2100-01-01]; absent/invalid returns None."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if MIN_VALID_EPOCH_MS <= raw <= MAX_VALID_EPOCH_MS else None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            ts_int = int(text)
+        except ValueError:
+            fv = _parse_finite_float(text)
+            if fv is None or not (MIN_VALID_EPOCH_MS <= fv <= MAX_VALID_EPOCH_MS):
+                return None
+            ts_int = int(fv)
+            return ts_int if MIN_VALID_EPOCH_MS <= ts_int <= MAX_VALID_EPOCH_MS else None
+        return ts_int if MIN_VALID_EPOCH_MS <= ts_int <= MAX_VALID_EPOCH_MS else None
+    fv = _parse_finite_float(raw)
+    if fv is None or not (MIN_VALID_EPOCH_MS <= fv <= MAX_VALID_EPOCH_MS):
+        return None
+    ts_int = int(fv)
+    return ts_int if MIN_VALID_EPOCH_MS <= ts_int <= MAX_VALID_EPOCH_MS else None
+
+
+def _reject_nonstandard_json(constant: str) -> Any:
+    """Reject non-RFC-8259 bare NaN/Infinity/-Infinity JSON tokens (STD-46 DQ-U02)."""
+    raise ValueError(f"Non-standard JSON constant forbidden: {constant!r}")
+
+
+def _is_valid_bbo_quote(
+    bid: float | None,
+    ask: float | None,
+    bid_qty: float | None,
+    ask_qty: float | None,
+    lat_ms: float | None,
+) -> bool:
+    """Validate finite positive non-crossed BBO prices, non-negative quantities/latency, and overflow safety."""
+    if (
+        bid is None
+        or ask is None
+        or bid_qty is None
+        or ask_qty is None
+        or lat_ms is None
+    ):
+        return False
+    if not (
+        math.isfinite(bid)
+        and math.isfinite(ask)
+        and math.isfinite(bid_qty)
+        and math.isfinite(ask_qty)
+        and math.isfinite(lat_ms)
+    ):
+        return False
+    if not (bid > 0.0 and ask > 0.0 and ask >= bid and bid_qty >= 0.0 and ask_qty >= 0.0 and lat_ms >= 0.0):
+        return False
+    mid = (bid + ask) * 0.5
+    spread = ask - bid
+    return math.isfinite(mid) and mid > 0.0 and math.isfinite(spread)
+
 
 def _http_json(
     url: str,
@@ -33,7 +134,7 @@ def _http_json(
     max_retries: int = 3,
 ) -> tuple[Any, float]:
     """Perform HTTP GET/POST with exponential backoff + jitter and return (json, latency_ms)."""
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    data = json.dumps(payload, allow_nan=False).encode("utf-8") if payload is not None else None
     headers = {"User-Agent": "AlphaLoop-BBO/2.0", "Accept": "application/json"}
     if data is not None:
         headers["Content-Type"] = "application/json"
@@ -46,7 +147,7 @@ def _http_json(
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8")
             latency_ms = (time.perf_counter() - t0) * 1000.0
-            return json.loads(raw), round(latency_ms, 2)
+            return json.loads(raw, parse_constant=_reject_nonstandard_json), round(latency_ms, 2)
         except (urllib.error.URLError, urllib.error.HTTPError, http.client.HTTPException, OSError, TimeoutError, ValueError) as exc:
             last_exc = exc
             if attempt + 1 < max_retries:
@@ -65,52 +166,123 @@ class MultiVenueBBOCollector:
     def _ensure_lighter_markets(self) -> dict[str, int]:
         if self._lighter_markets is None:
             data, _ = _http_json("https://mainnet.zklighter.elliot.ai/api/v1/orderBooks")
+            if not isinstance(data, dict):
+                return {}
+            obs = data.get("order_books")
+            if not isinstance(obs, list):
+                return {}
             mapping: dict[str, int] = {}
-            for item in data.get("order_books", []):
-                if item.get("status") == "active" and item.get("market_type") == "perp":
-                    mapping[str(item.get("symbol", "")).upper()] = int(item["market_id"])
+            for item in obs:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("status") != "active" or item.get("market_type") != "perp":
+                    continue
+                sym = item.get("symbol")
+                if not isinstance(sym, str) or not sym.strip():
+                    continue
+                raw_mid = item.get("market_id")
+                if raw_mid is None or isinstance(raw_mid, bool):
+                    continue
+                if isinstance(raw_mid, int):
+                    mid_id = raw_mid
+                elif isinstance(raw_mid, str):
+                    try:
+                        mid_id = int(raw_mid.strip())
+                    except ValueError:
+                        continue
+                else:
+                    continue
+                if mid_id < 0:
+                    continue
+                mapping[sym.strip().upper()] = mid_id
             self._lighter_markets = mapping
         return self._lighter_markets
 
     def fetch_okx_swap_bbo(self) -> list[BBOTick]:
         data, lat_ms = _http_json("https://www.okx.com/api/v5/market/tickers?instType=SWAP")
+        recv_ts_ms = utc_now_ms()
+        lat_val = _parse_finite_float(lat_ms)
         want = {f"{s}-USDT-SWAP": s for s in self.symbols}
         ticks: list[BBOTick] = []
-        now = utc_now_ms()
-        for row in data.get("data", []):
-            inst = row.get("instId", "")
-            if inst not in want:
+        if not isinstance(data, dict):
+            return ticks
+        rows = data.get("data")
+        if not isinstance(rows, list):
+            return ticks
+        for row in rows:
+            if not isinstance(row, dict):
                 continue
-            try:
-                bid = float(row["bidPx"])
-                ask = float(row["askPx"])
-                bid_q = float(row.get("bidSz", 0.0) or 0.0)
-                ask_q = float(row.get("askSz", 0.0) or 0.0)
-                ts_ms = int(row.get("ts") or now)
-            except (TypeError, ValueError, KeyError):
+            inst = row.get("instId")
+            if not isinstance(inst, str) or inst not in want:
                 continue
-            if bid > 0 and ask >= bid:
-                ticks.append(BBOTick("okx", want[inst], ts_ms, bid, ask, bid_q, ask_q, lat_ms, PROVENANCE_REAL))
+            bid = _parse_finite_float(row.get("bidPx"))
+            ask = _parse_finite_float(row.get("askPx"))
+            bid_q = _parse_optional_nonneg_qty(row.get("bidSz"))
+            ask_q = _parse_optional_nonneg_qty(row.get("askSz"))
+            if not _is_valid_bbo_quote(bid, ask, bid_q, ask_q, lat_val):
+                continue
+            venue_ts_ms = _parse_venue_ts_ms(row.get("ts"))
+            ts_source = TS_SOURCE_VENUE if venue_ts_ms is not None else TS_SOURCE_RECV_LOCAL
+            ts_ms = venue_ts_ms if venue_ts_ms is not None else recv_ts_ms
+            ticks.append(
+                TimestampedBBOTick(
+                    "okx",
+                    want[inst],
+                    ts_ms,
+                    float(bid),
+                    float(ask),
+                    float(bid_q),
+                    float(ask_q),
+                    float(lat_val),
+                    PROVENANCE_REAL,
+                    venue_ts_ms=venue_ts_ms,
+                    recv_ts_ms=recv_ts_ms,
+                    ts_source=ts_source,
+                )
+            )
         return ticks
 
     def fetch_gate_futures_bbo(self) -> list[BBOTick]:
         data, lat_ms = _http_json("https://api.gateio.ws/api/v4/futures/usdt/tickers")
+        recv_ts_ms = utc_now_ms()
+        lat_val = _parse_finite_float(lat_ms)
         want = {f"{s}_USDT": s for s in self.symbols}
         ticks: list[BBOTick] = []
-        ts_ms = utc_now_ms()
+        if not isinstance(data, list):
+            return ticks
         for row in data:
-            contract = row.get("contract", "")
-            if contract not in want:
+            if not isinstance(row, dict):
                 continue
-            try:
-                bid = float(row["highest_bid"])
-                ask = float(row["lowest_ask"])
-                bid_q = float(row.get("highest_size", 0.0) or 0.0)
-                ask_q = float(row.get("lowest_size", 0.0) or 0.0)
-            except (TypeError, ValueError, KeyError):
+            contract = row.get("contract")
+            if not isinstance(contract, str) or contract not in want:
                 continue
-            if bid > 0 and ask >= bid:
-                ticks.append(BBOTick("gate", want[contract], ts_ms, bid, ask, bid_q, ask_q, lat_ms, PROVENANCE_REAL))
+            bid = _parse_finite_float(row.get("highest_bid"))
+            ask = _parse_finite_float(row.get("lowest_ask"))
+            bid_q = _parse_optional_nonneg_qty(row.get("highest_size"))
+            ask_q = _parse_optional_nonneg_qty(row.get("lowest_size"))
+            if not _is_valid_bbo_quote(bid, ask, bid_q, ask_q, lat_val):
+                continue
+            venue_ts_ms = _parse_venue_ts_ms(row.get("ts_ms"))
+            if venue_ts_ms is None:
+                venue_ts_ms = _parse_venue_ts_ms(row.get("time_ms"))
+            ts_source = TS_SOURCE_VENUE if venue_ts_ms is not None else TS_SOURCE_RECV_LOCAL
+            ts_ms = venue_ts_ms if venue_ts_ms is not None else recv_ts_ms
+            ticks.append(
+                TimestampedBBOTick(
+                    "gate",
+                    want[contract],
+                    ts_ms,
+                    float(bid),
+                    float(ask),
+                    float(bid_q),
+                    float(ask_q),
+                    float(lat_val),
+                    PROVENANCE_REAL,
+                    venue_ts_ms=venue_ts_ms,
+                    recv_ts_ms=recv_ts_ms,
+                    ts_source=ts_source,
+                )
+            )
         return ticks
 
     def fetch_hyperliquid_bbo(self) -> list[BBOTick]:
@@ -118,16 +290,49 @@ class MultiVenueBBOCollector:
         for sym in self.symbols:
             try:
                 data, lat_ms = _http_json("https://api.hyperliquid.xyz/info", payload={"type": "l2Book", "coin": sym})
-                levels = data.get("levels") or []
-                if len(levels) < 2 or not levels[0] or not levels[1]:
+                recv_ts_ms = utc_now_ms()
+                lat_val = _parse_finite_float(lat_ms)
+                if not isinstance(data, dict):
                     continue
-                bid = float(levels[0][0]["px"])
-                bid_q = float(levels[0][0]["sz"])
-                ask = float(levels[1][0]["px"])
-                ask_q = float(levels[1][0]["sz"])
-                ts_ms = int(data.get("time") or utc_now_ms())
-                if bid > 0 and ask >= bid:
-                    ticks.append(BBOTick("hyperliquid", sym, ts_ms, bid, ask, bid_q, ask_q, lat_ms, PROVENANCE_REAL))
+                levels = data.get("levels")
+                if (
+                    not isinstance(levels, list)
+                    or len(levels) < 2
+                    or not isinstance(levels[0], list)
+                    or not isinstance(levels[1], list)
+                    or not levels[0]
+                    or not levels[1]
+                ):
+                    continue
+                top_bid = levels[0][0]
+                top_ask = levels[1][0]
+                if not isinstance(top_bid, dict) or not isinstance(top_ask, dict):
+                    continue
+                bid = _parse_finite_float(top_bid.get("px"))
+                bid_q = _parse_finite_float(top_bid.get("sz"))
+                ask = _parse_finite_float(top_ask.get("px"))
+                ask_q = _parse_finite_float(top_ask.get("sz"))
+                if not _is_valid_bbo_quote(bid, ask, bid_q, ask_q, lat_val):
+                    continue
+                venue_ts_ms = _parse_venue_ts_ms(data.get("time"))
+                ts_source = TS_SOURCE_VENUE if venue_ts_ms is not None else TS_SOURCE_RECV_LOCAL
+                ts_ms = venue_ts_ms if venue_ts_ms is not None else recv_ts_ms
+                ticks.append(
+                    TimestampedBBOTick(
+                        "hyperliquid",
+                        sym,
+                        ts_ms,
+                        float(bid),
+                        float(ask),
+                        float(bid_q),
+                        float(ask_q),
+                        float(lat_val),
+                        PROVENANCE_REAL,
+                        venue_ts_ms=venue_ts_ms,
+                        recv_ts_ms=recv_ts_ms,
+                        ts_source=ts_source,
+                    )
+                )
             except (RuntimeError, KeyError, ValueError, TypeError) as exc:
                 logger.warning("HL BBO skip %s: %s", sym, exc)
         return ticks
@@ -142,20 +347,68 @@ class MultiVenueBBOCollector:
             try:
                 url = f"https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders?market_id={mid_id}&limit=3"
                 data, lat_ms = _http_json(url)
+                recv_ts_ms = utc_now_ms()
+                lat_val = _parse_finite_float(lat_ms)
+                if not isinstance(data, dict):
+                    continue
                 asks = data.get("asks") or []
                 bids = data.get("bids") or []
-                if not asks or not bids:
+                if not isinstance(asks, list) or not isinstance(bids, list) or not asks or not bids:
                     continue
-                # Pick strictly best bid (max) and best ask (min) across returned top levels
-                best_bid_row = max(bids, key=lambda x: float(x["price"]))
-                best_ask_row = min(asks, key=lambda x: float(x["price"]))
-                bid = float(best_bid_row["price"])
-                ask = float(best_ask_row["price"])
-                bid_q = float(best_bid_row.get("remaining_base_amount", 0.0) or 0.0)
-                ask_q = float(best_ask_row.get("remaining_base_amount", 0.0) or 0.0)
-                ts_ms = utc_now_ms()
-                if bid > 0 and ask >= bid:
-                    ticks.append(BBOTick("lighter", sym, ts_ms, bid, ask, bid_q, ask_q, lat_ms, PROVENANCE_REAL))
+                # Validate EVERY returned level before picking max bid / min ask so NaN/Inf cannot bypass max()/min()
+                parsed_bids: list[tuple[float, dict[str, Any]]] = []
+                for lvl in bids:
+                    if not isinstance(lvl, dict) or "price" not in lvl:
+                        parsed_bids = []
+                        break
+                    px = _parse_finite_float(lvl.get("price"))
+                    if px is None or px <= 0.0:
+                        parsed_bids = []
+                        break
+                    parsed_bids.append((px, lvl))
+                if not parsed_bids:
+                    continue
+
+                parsed_asks: list[tuple[float, dict[str, Any]]] = []
+                for lvl in asks:
+                    if not isinstance(lvl, dict) or "price" not in lvl:
+                        parsed_asks = []
+                        break
+                    px = _parse_finite_float(lvl.get("price"))
+                    if px is None or px <= 0.0:
+                        parsed_asks = []
+                        break
+                    parsed_asks.append((px, lvl))
+                if not parsed_asks:
+                    continue
+
+                bid, best_bid_row = max(parsed_bids, key=lambda item: item[0])
+                ask, best_ask_row = min(parsed_asks, key=lambda item: item[0])
+                bid_q = _parse_optional_nonneg_qty(best_bid_row.get("remaining_base_amount"))
+                ask_q = _parse_optional_nonneg_qty(best_ask_row.get("remaining_base_amount"))
+                if not _is_valid_bbo_quote(bid, ask, bid_q, ask_q, lat_val):
+                    continue
+                venue_ts_ms = _parse_venue_ts_ms(data.get("ts_ms"))
+                if venue_ts_ms is None:
+                    venue_ts_ms = _parse_venue_ts_ms(data.get("timestamp_ms"))
+                ts_source = TS_SOURCE_VENUE if venue_ts_ms is not None else TS_SOURCE_RECV_LOCAL
+                ts_ms = venue_ts_ms if venue_ts_ms is not None else recv_ts_ms
+                ticks.append(
+                    TimestampedBBOTick(
+                        "lighter",
+                        sym,
+                        ts_ms,
+                        float(bid),
+                        float(ask),
+                        float(bid_q),
+                        float(ask_q),
+                        float(lat_val),
+                        PROVENANCE_REAL,
+                        venue_ts_ms=venue_ts_ms,
+                        recv_ts_ms=recv_ts_ms,
+                        ts_source=ts_source,
+                    )
+                )
             except (RuntimeError, KeyError, ValueError, TypeError) as exc:
                 logger.warning("Lighter BBO skip %s: %s", sym, exc)
         return ticks

@@ -71,6 +71,54 @@ def connect_wal(db_path: str | Path, timeout_sec: float = 30.0) -> LockedConnect
     return conn
 
 
+def connect_readonly(
+    db_path: str | Path,
+    timeout_sec: float = 30.0,
+    *,
+    immutable: bool = False,
+) -> LockedConnection:
+    """Open a thread-safe strictly read-only SQLite URI connection with busy_timeout.
+
+    When `immutable=True` OR the target file is read-only (`0444` snapshot) without an active
+    `-wal` sidecar, opens with `immutable=1` so SQLite never attempts to create `-shm` files
+    inside a read-only snapshot directory (RB-D05).
+    """
+    import os
+    import urllib.parse
+
+    resolved = Path(db_path).resolve()
+    wal_sidecar = Path(str(resolved) + "-wal")
+    use_immutable = bool(immutable) or ((not os.access(resolved, os.W_OK)) and (not wal_sidecar.exists()))
+    quoted = urllib.parse.quote(str(resolved), safe="/:")
+    uri = f"file:{quoted}?mode=ro" + ("&immutable=1" if use_immutable else "")
+    conn = sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=timeout_sec,
+        isolation_level=None,
+        check_same_thread=False,
+        factory=LockedConnection,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON;")
+    conn.execute(f"PRAGMA busy_timeout={int(timeout_sec * 1000)};")
+    return conn
+
+
+def connect_memory(timeout_sec: float = 30.0) -> LockedConnection:
+    """Open an isolated thread-safe in-memory SQLite connection (zero disk writes)."""
+    conn = sqlite3.connect(
+        ":memory:",
+        timeout=timeout_sec,
+        isolation_level=None,
+        check_same_thread=False,
+        factory=LockedConnection,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """Thread-safe atomic write transaction using BEGIN IMMEDIATE with rollback logging."""

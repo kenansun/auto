@@ -64,7 +64,7 @@ BBO_UNIVERSE = [
 def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
     """Atomically persist JSON via temp file + fsync + os.replace (prevents partial reads by Web Console)."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    raw = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
     try:
         with os.fdopen(fd, "wb") as fh:

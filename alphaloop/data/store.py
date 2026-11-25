@@ -398,6 +398,41 @@ class MarketDataStore:
             for r in rows
         ]
 
+    def load_latest_bbo_tick(
+        self,
+        venue: str,
+        symbol: str,
+        min_ts_ms: int | None = None,
+        max_ts_ms: int | None = None,
+    ) -> BBOTick | None:
+        """Return only the single newest BBO tick for (venue, symbol) via LIMIT 1 (avoids full range scan)."""
+        sql = (
+            "SELECT venue, symbol, ts_ms, bid, ask, bid_qty, ask_qty, latency_ms, provenance "
+            "FROM bbo_ticks WHERE venue=? AND symbol=?"
+        )
+        params: list[Any] = [venue, symbol]
+        if min_ts_ms is not None:
+            sql += " AND ts_ms >= ?"
+            params.append(min_ts_ms)
+        if max_ts_ms is not None:
+            sql += " AND ts_ms <= ?"
+            params.append(max_ts_ms)
+        sql += " ORDER BY ts_ms DESC, rowid DESC LIMIT 1"
+        r = self.conn.fetch_one(sql, params)
+        if r is None:
+            return None
+        return BBOTick(
+            venue=r["venue"],
+            symbol=r["symbol"],
+            ts_ms=r["ts_ms"],
+            bid=r["bid"],
+            ask=r["ask"],
+            bid_qty=r["bid_qty"],
+            ask_qty=r["ask_qty"],
+            latency_ms=r["latency_ms"],
+            provenance=r["provenance"],
+        )
+
     def list_dq_certificates(self, limit: int = 30) -> list[dict[str, Any]]:
         rows = self.conn.fetch_all(
             "SELECT report_json FROM dq_certificates ORDER BY created_ts_ms DESC LIMIT ?",

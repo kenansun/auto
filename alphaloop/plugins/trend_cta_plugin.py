@@ -48,6 +48,69 @@ TREND_CTA_BOUNDS: dict[str, tuple[float, float]] = {
 
 ALLOWED_TIMEFRAMES_H = (4, 12, 24)
 
+KNOWN_TREND_CTA_PARAM_KEYS: frozenset[str] = frozenset({
+    "timeframe_hours",
+    "entry_n",
+    "exit_n",
+    "atr_n",
+    "atr_mult",
+    "ema_filter_n",
+    "risk_per_trade_pct",
+    "max_symbol_leverage",
+    "cooldown_hours",
+    "ref_venue",
+})
+
+
+def validate_trend_cta_params(params: dict[str, Any] | None) -> None:
+    """Fail-closed validation blocking unknown/dead param keys and invalid value types (CC-20261123-001 A1)."""
+    if params is None:
+        return
+    if not isinstance(params, dict):
+        raise ValueError(f"trend_cta params must be a dict, got {type(params).__name__}")
+    unknown = sorted(str(k) for k in params.keys() if k not in KNOWN_TREND_CTA_PARAM_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown/unconsumed trend_cta params keys: {unknown}. "
+            f"Allowed keys: {sorted(KNOWN_TREND_CTA_PARAM_KEYS)}"
+        )
+    for k, v in params.items():
+        if k == "ref_venue":
+            if not isinstance(v, str):
+                raise ValueError(f"trend_cta param 'ref_venue' must be str, got {type(v).__name__} ({v!r})")
+        else:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+                raise ValueError(
+                    f"trend_cta param '{k}' must be finite numeric, got {type(v).__name__} ({v!r})"
+                )
+
+
+def parse_cta_params(cfg: StrategyConfig) -> dict[str, Any]:
+    """Single-source CTA parameter parser shared identically by evaluate(), on_event(), and Shadow warmup."""
+    p = cfg.params or {}
+    tf_h = _p_int(p, "timeframe_hours", 12)
+    if tf_h not in ALLOWED_TIMEFRAMES_H:
+        tf_h = 12
+    tf_ms = tf_h * HOUR_MS
+    entry_n = max(5, _p_int(p, "entry_n", 30))
+    exit_n = max(3, min(entry_n - 1, _p_int(p, "exit_n", 12)))
+    atr_n = max(5, _p_int(p, "atr_n", 14))
+    atr_mult = max(1.5, _p_float(p, "atr_mult", 3.0))
+    ema_n = max(0, _p_int(p, "ema_filter_n", 0))
+    cooldown_h = max(0, _p_int(p, "cooldown_hours", 24))
+    warmup_bars = max(entry_n, exit_n, atr_n, ema_n) + 1
+    return {
+        "tf_h": tf_h,
+        "tf_ms": tf_ms,
+        "entry_n": entry_n,
+        "exit_n": exit_n,
+        "atr_n": atr_n,
+        "atr_mult": atr_mult,
+        "ema_n": ema_n,
+        "cooldown_h": cooldown_h,
+        "warmup_bars": warmup_bars,
+    }
+
 
 @dataclass
 class _ResampledBar:
@@ -93,6 +156,133 @@ def _p_int(params: dict[str, Any], key: str, default: int) -> int:
         return default
     fv = float(raw)
     return int(round(fv)) if math.isfinite(fv) else default
+
+
+def compute_true_range(high: float, low: float, prev_close: float | None) -> float:
+    """Standard Wilder True Range including overnight/inter-bar price gaps."""
+    hl = max(0.0, float(high) - float(low))
+    if prev_close is None or prev_close <= 0.0:
+        return hl
+    return max(hl, abs(float(high) - float(prev_close)), abs(float(low) - float(prev_close)))
+
+
+def compute_causal_atr_and_ema(
+    bars_hlc: list[tuple[float, float, float]],
+    atr_n: int,
+    ema_n: int,
+) -> tuple[list[float], list[float]]:
+    """Compute strictly causal SMA(TrueRange, atr_n) and EMA(close, ema_n) identically for batch & stream."""
+    an = max(1, int(atr_n))
+    en = max(0, int(ema_n))
+    trs: list[float] = []
+    atrs: list[float] = []
+    emas: list[float] = []
+    alpha = (2.0 / (en + 1.0)) if en > 0 else 0.0
+    ema_val = 0.0
+    for i, (hi, lo, cl) in enumerate(bars_hlc):
+        pc = bars_hlc[i - 1][2] if i > 0 else None
+        tr = compute_true_range(hi, lo, pc)
+        if i == 0:
+            ema_val = cl
+        else:
+            ema_val = (alpha * cl + (1.0 - alpha) * ema_val) if en > 0 else cl
+        trs.append(tr)
+        if i + 1 >= an:
+            atrs.append(sum(trs[i + 1 - an : i + 1]) / float(an))
+        else:
+            atrs.append(sum(trs) / float(len(trs)))
+        emas.append(ema_val)
+    return atrs, emas
+
+
+def compute_cta_entry_notional(
+    cfg: StrategyConfig,
+    *,
+    entry_px: float,
+    atr_prev: float,
+    cur_gross_notional: float,
+) -> tuple[float, float]:
+    """Single-kernel inverse-volatility ATR risk sizing. Returns (notional_usd, slot_margin)."""
+    params = cfg.params or {}
+    atr_mult = max(1.5, _p_float(params, "atr_mult", 3.0))
+    risk_pct = max(0.0025, min(0.03, _p_float(params, "risk_per_trade_pct", 1.0) / 100.0))
+    max_sym_lev = max(0.5, min(float(cfg.leverage), _p_float(params, "max_symbol_leverage", 1.5)))
+    eff_weight = min(float(cfg.per_position_weight), 1.0 / max(1, int(cfg.max_positions)))
+    slot_cap = float(cfg.capital_usd) * eff_weight
+    if entry_px <= 0.0 or not math.isfinite(entry_px) or not math.isfinite(atr_prev):
+        return 0.0, slot_cap
+    stop_dist_pct = max(0.01, (atr_mult * max(0.0, atr_prev)) / entry_px)
+    risk_notional = (float(cfg.capital_usd) * risk_pct) / stop_dist_pct
+    sym_cap_notional = slot_cap * max_sym_lev
+    rem_gross = max(0.0, float(cfg.capital_usd) * float(cfg.leverage) - float(cur_gross_notional))
+    notional = min(risk_notional, sym_cap_notional, rem_gross)
+    if notional < 10.0:
+        return 0.0, slot_cap
+    return notional, slot_cap
+
+
+def evaluate_cta_intrabar_risk(
+    *,
+    direction: str,
+    entry_px: float,
+    entry_notional: float,
+    slot_margin: float,
+    active_stop: float,
+    bar_high: float,
+    bar_low: float,
+) -> str | None:
+    """Single-kernel intrabar risk guard: MARGIN_LIQUIDATION (>=0.90) checked BEFORE CHANDELIER_STOP."""
+    if entry_px <= 0.0:
+        return None
+    adverse_frac = (
+        max(0.0, 1.0 - (bar_low / entry_px))
+        if direction == "LONG"
+        else max(0.0, (bar_high / entry_px) - 1.0)
+    )
+    leg_lev = float(entry_notional) / max(1e-6, float(slot_margin))
+    if adverse_frac * leg_lev >= 0.90:
+        return "MARGIN_LIQUIDATION"
+    if active_stop > 0.0 and math.isfinite(active_stop):
+        stopped = (bar_low <= active_stop) if direction == "LONG" else (bar_high >= active_stop)
+        if stopped:
+            return "CHANDELIER_STOP"
+    return None
+
+
+def evaluate_cta_bar_signal(
+    *,
+    close: float,
+    prev_hi: float,
+    prev_lo: float,
+    prev_ex_hi: float,
+    prev_ex_lo: float,
+    atr_cur: float,
+    ema_cur: float,
+    ema_n: int,
+    allow_short: bool,
+    open_direction: str | None,
+) -> tuple[str, float] | None:
+    """Single-kernel end-of-bar Donchian + EMA trend-filter signal evaluator."""
+    ema_ok_long = (ema_n == 0) or (close > ema_cur)
+    ema_ok_short = (ema_n == 0) or (close < ema_cur)
+    denom = max(1e-9, float(atr_cur))
+    if open_direction == "LONG":
+        if allow_short and close < prev_lo and ema_ok_short:
+            return "OPEN_SHORT", (prev_lo - close) / denom
+        if close < prev_ex_lo:
+            return "EXIT", 0.0
+        return None
+    if open_direction == "SHORT":
+        if close > prev_hi and ema_ok_long:
+            return "OPEN_LONG", (close - prev_hi) / denom
+        if close > prev_ex_hi:
+            return "EXIT", 0.0
+        return None
+    if close > prev_hi and ema_ok_long:
+        return "OPEN_LONG", (close - prev_hi) / denom
+    if allow_short and close < prev_lo and ema_ok_short:
+        return "OPEN_SHORT", (prev_lo - close) / denom
+    return None
 
 
 def resample_ohlcv_1h(bars_1h: list[PriceBar], tf_hours: int) -> list[_ResampledBar]:
@@ -141,6 +331,14 @@ class TrendCTAPlugin(BaseStrategyPlugin):
     }
 
     def default_config(self, symbols: list[str] | None = None, **overrides: Any) -> StrategyConfig:
+        valid_fields = set(StrategyConfig.__dataclass_fields__.keys())
+        unknown_overrides = sorted(k for k in overrides.keys() if k not in valid_fields)
+        if unknown_overrides:
+            raise ValueError(
+                f"Unknown StrategyConfig override keys for trend_cta: {unknown_overrides}"
+            )
+        if "params" in overrides:
+            validate_trend_cta_params(overrides["params"])
         base = StrategyConfig(
             strategy_id="trend_cta_default",
             version="v1.0",
@@ -188,7 +386,9 @@ class TrendCTAPlugin(BaseStrategyPlugin):
                 merged.update(overrides["params"])
                 overrides = {**overrides, "params": merged}
             d.update(overrides)
-            return StrategyConfig.from_dict(d)
+            cfg = StrategyConfig.from_dict(d)
+            validate_trend_cta_params(cfg.params)
+            return cfg
         return base
 
     def mutable_param_bounds(self) -> dict[str, tuple[float, float]]:
@@ -233,6 +433,9 @@ class TrendCTAPlugin(BaseStrategyPlugin):
         exit_n = max(5, min(entry_n - 3, _p_int(params, "exit_n", 12)))
         params["entry_n"] = entry_n
         params["exit_n"] = exit_n
+        # Strip any unknown/dead keys defensively and enforce strict param schema
+        params = {k: v for k, v in params.items() if k in KNOWN_TREND_CTA_PARAM_KEYS}
+        validate_trend_cta_params(params)
         # Invariant 2: per_position_weight cannot exceed 1 / max_positions
         d["per_position_weight"] = round(min(float(d["per_position_weight"]), 1.0 / max(1, int(d["max_positions"]))), 4)
         d["params"] = params
@@ -246,25 +449,28 @@ class TrendCTAPlugin(BaseStrategyPlugin):
         end_ms: int | None = None,
         extra_slippage_bps_per_leg: float = 0.0,
         execution_mode_override: str | None = None,
+        warmup_start_ms: int | None = None,
     ) -> BacktestResult:
-        params = cfg.params or {}
-        tf_h = _p_int(params, "timeframe_hours", 12)
-        if tf_h not in ALLOWED_TIMEFRAMES_H:
-            tf_h = 12
-        tf_ms = tf_h * HOUR_MS
-        entry_n = max(10, _p_int(params, "entry_n", 30))
-        exit_n = max(5, min(entry_n - 2, _p_int(params, "exit_n", 12)))
-        atr_n = max(7, _p_int(params, "atr_n", 14))
-        atr_mult = max(1.5, _p_float(params, "atr_mult", 3.0))
-        ema_n = max(0, _p_int(params, "ema_filter_n", 0))
-        risk_pct = max(0.0025, min(0.03, _p_float(params, "risk_per_trade_pct", 1.0) / 100.0))
-        max_sym_lev = max(0.5, min(cfg.leverage, _p_float(params, "max_symbol_leverage", 1.5)))
-        cooldown_h = max(0, _p_int(params, "cooldown_hours", 24))
+        validate_trend_cta_params(cfg.params)
+        cp = parse_cta_params(cfg)
+        tf_h = cp["tf_h"]
+        tf_ms = cp["tf_ms"]
+        entry_n = cp["entry_n"]
+        exit_n = cp["exit_n"]
+        atr_n = cp["atr_n"]
+        atr_mult = cp["atr_mult"]
+        ema_n = cp["ema_n"]
+        cooldown_h = cp["cooldown_h"]
+        warmup_bars = cp["warmup_bars"]
         allow_short = bool(cfg.allow_bidirectional)
+
+        use_prewarm = warmup_start_ms is not None and start_ms is not None and int(warmup_start_ms) < int(start_ms)
+        load_start_ms = int(warmup_start_ms) if use_prewarm else start_ms
+        eval_start_bucket = ((int(start_ms) // tf_ms) * tf_ms) if use_prewarm else None
 
         symbols = list(cfg.symbols)
         venue = cfg.venue_a
-        ds_sha, prov, row_count = store.fingerprint_slice([venue], symbols, start_ms, end_ms)
+        ds_sha, prov, row_count = store.fingerprint_slice([venue], symbols, load_start_ms, end_ms)
 
         exec_mode = execution_mode_override or cfg.execution_mode
         taker_bps = max(float(cfg.fee_a_bps), TAKER_FEE_BPS.get(venue, 5.0))
@@ -293,7 +499,7 @@ class TrendCTAPlugin(BaseStrategyPlugin):
         all_buckets_set: set[int] = set()
 
         for sym in symbols:
-            c_1h = store.load_candles(venue, sym, start_ms, end_ms)
+            c_1h = store.load_candles(venue, sym, load_start_ms, end_ms)
             hourly_open_by_sym[sym] = {c.ts_ms: c.open for c in c_1h}
             rbars = resample_ohlcv_1h(c_1h, tf_h)
             ordered_bars_by_sym[sym] = rbars
@@ -301,44 +507,26 @@ class TrendCTAPlugin(BaseStrategyPlugin):
             bar_idx_by_sym[sym] = {b.ts_ms: i for i, b in enumerate(rbars)}
             all_buckets_set.update(b.ts_ms for b in rbars)
 
-            fbars = store.load_funding(venue, sym, start_ms, end_ms)
+            fbars = store.load_funding(venue, sym, load_start_ms, end_ms)
             f_sorted = sorted((f.ts_ms, f.funding_rate) for f in fbars)
             funding_by_sym[sym] = f_sorted
             funding_ts_by_sym[sym] = [x[0] for x in f_sorted]
 
-        if not all_buckets_set or row_count == 0:
+        if not all_buckets_set or row_count == 0 or (eval_start_bucket is not None and max(all_buckets_set) < eval_start_bucket):
             return self._empty_result(cfg, start_ms or 0, end_ms or 0, prov, ds_sha)
 
-        # Precompute strictly causal ATR and EMA arrays per symbol
+        # Precompute strictly causal ATR and EMA arrays per symbol via shared single-kernel helper
         atr_arr: dict[str, list[float]] = {}
         ema_arr: dict[str, list[float]] = {}
         for sym in symbols:
             rbars = ordered_bars_by_sym[sym]
-            trs: list[float] = []
-            atrs: list[float] = []
-            emas: list[float] = []
-            alpha = (2.0 / (ema_n + 1.0)) if ema_n > 0 else 0.0
-            ema_val = 0.0
-            for i, b in enumerate(rbars):
-                if i == 0:
-                    tr = b.high - b.low
-                    ema_val = b.close
-                else:
-                    pc = rbars[i - 1].close
-                    tr = max(b.high - b.low, abs(b.high - pc), abs(b.low - pc))
-                    ema_val = (alpha * b.close + (1.0 - alpha) * ema_val) if ema_n > 0 else b.close
-                trs.append(tr)
-                if i + 1 >= atr_n:
-                    atrs.append(sum(trs[i + 1 - atr_n : i + 1]) / float(atr_n))
-                else:
-                    atrs.append(sum(trs) / float(len(trs)))
-                emas.append(ema_val)
+            atrs, emas = compute_causal_atr_and_ema(
+                [(b.high, b.low, b.close) for b in rbars], atr_n, ema_n
+            )
             atr_arr[sym] = atrs
             ema_arr[sym] = emas
 
         timeline = sorted(all_buckets_set)
-        eff_weight = min(cfg.per_position_weight, 1.0 / max(1, cfg.max_positions))
-        slot_cap = cfg.capital_usd * eff_weight
 
         open_pos: dict[str, _CTAOpenPosition] = {}
         pending_actions: dict[str, tuple[str, float]] = {}  # sym -> (action, strength)
@@ -349,7 +537,6 @@ class TrendCTAPlugin(BaseStrategyPlugin):
         realized_pnl_usd = 0.0
         trade_seq = 0
         liquidation_count = 0
-        warmup_bars = max(entry_n, exit_n, atr_n, ema_n) + 1
 
         def _funding_in_range(sym: str, ts_lo_excl: int, ts_hi_incl: int, direction: str, qty: float, fallback_px: float, adverse_only: bool = False) -> float:
             total = 0.0
@@ -410,6 +597,12 @@ class TrendCTAPlugin(BaseStrategyPlugin):
 
         last_seen_close: dict[str, float] = {}
         for bts in timeline:
+            if eval_start_bucket is not None and bts < eval_start_bucket:
+                for sym in symbols:
+                    bar_w = resampled_by_sym[sym].get(bts)
+                    if bar_w is not None:
+                        last_seen_close[sym] = bar_w.close
+                continue
             # --- PHASE 1: Execute pending T+1 open exits/reversals & entries at bar.open ---
             # 1a) Exits / reversals first; preserve unexecuted EXIT/reversal if symbol's bucket was missing (Red-Team #7)
             retained_pending: dict[str, tuple[str, float]] = {}
@@ -448,7 +641,6 @@ class TrendCTAPlugin(BaseStrategyPlugin):
             entry_cands.sort(key=lambda x: (-x[0], x[1]))
 
             cur_gross = sum(p.entry_notional for p in open_pos.values())
-            max_gross = cfg.capital_usd * cfg.leverage
             for _, sym, direction in entry_cands:
                 if sym in open_pos or len(open_pos) >= cfg.max_positions:
                     continue
@@ -460,11 +652,12 @@ class TrendCTAPlugin(BaseStrategyPlugin):
                     continue
                 # ATR known strictly BEFORE bar k opens (k - 1)
                 atr_prev = atr_arr[sym][k - 1]
-                stop_dist_pct = max(0.01, (atr_mult * atr_prev) / bar.open)
-                risk_notional = (cfg.capital_usd * risk_pct) / stop_dist_pct
-                sym_cap_notional = slot_cap * max_sym_lev
-                rem_gross = max(0.0, max_gross - cur_gross)
-                notional = min(risk_notional, sym_cap_notional, rem_gross)
+                notional, slot_cap = compute_cta_entry_notional(
+                    cfg,
+                    entry_px=bar.open,
+                    atr_prev=atr_prev,
+                    cur_gross_notional=cur_gross,
+                )
                 if notional < 10.0:
                     continue
 
@@ -505,9 +698,17 @@ class TrendCTAPlugin(BaseStrategyPlugin):
                 if -adverse_frac * 10000.0 < pos.max_adverse_bps:
                     pos.max_adverse_bps = -adverse_frac * 10000.0
 
-                leg_lev = pos.entry_notional / max(1e-6, pos.slot_margin)
+                risk_evt = evaluate_cta_intrabar_risk(
+                    direction=pos.direction,
+                    entry_px=pos.entry_px,
+                    entry_notional=pos.entry_notional,
+                    slot_margin=pos.slot_margin,
+                    active_stop=pos.active_stop,
+                    bar_high=bar.high,
+                    bar_low=bar.low,
+                )
                 # 2a) Liquidation check FIRST
-                if adverse_frac * leg_lev >= 0.90:
+                if risk_evt == "MARGIN_LIQUIDATION":
                     liquidation_count += 1
                     open_pos.pop(sym)
                     pos.gross_funding_usd += _funding_in_range(
@@ -520,8 +721,7 @@ class TrendCTAPlugin(BaseStrategyPlugin):
                     continue
 
                 # 2b) Strictly causal Chandelier stop check (active_stop computed ONLY through k-1!)
-                stopped = (bar.low <= pos.active_stop) if pos.direction == "LONG" else (bar.high >= pos.active_stop)
-                if stopped:
+                if risk_evt == "CHANDELIER_STOP":
                     open_pos.pop(sym)
                     # Conservative gap fill & REA-001 same-bar entry+stop worst-case exit
                     fill_px = min(bar.open, pos.active_stop) if pos.direction == "LONG" else max(bar.open, pos.active_stop)
@@ -566,30 +766,20 @@ class TrendCTAPlugin(BaseStrategyPlugin):
                 ex_lo = min(rbars[j].low for j in range(k - exit_n, k))
                 ex_hi = max(rbars[j].high for j in range(k - exit_n, k))
 
-                ema_ok_long = (ema_n == 0) or (bar.close > ema_arr[sym][k])
-                ema_ok_short = (ema_n == 0) or (bar.close < ema_arr[sym][k])
-
-                if sym in open_pos:
-                    pos = open_pos[sym]
-                    if pos.direction == "LONG":
-                        if allow_short and bar.close < don_lo and ema_ok_short:
-                            strength = (don_lo - bar.close) / max(1e-9, atr_cur)
-                            pending_actions[sym] = ("OPEN_SHORT", strength)
-                        elif bar.close < ex_lo:
-                            pending_actions[sym] = ("EXIT", 0.0)
-                    else:
-                        if bar.close > don_hi and ema_ok_long:
-                            strength = (bar.close - don_hi) / max(1e-9, atr_cur)
-                            pending_actions[sym] = ("OPEN_LONG", strength)
-                        elif bar.close > ex_hi:
-                            pending_actions[sym] = ("EXIT", 0.0)
-                else:
-                    if bar.close > don_hi and ema_ok_long:
-                        strength = (bar.close - don_hi) / max(1e-9, atr_cur)
-                        pending_actions[sym] = ("OPEN_LONG", strength)
-                    elif allow_short and bar.close < don_lo and ema_ok_short:
-                        strength = (don_lo - bar.close) / max(1e-9, atr_cur)
-                        pending_actions[sym] = ("OPEN_SHORT", strength)
+                sig = evaluate_cta_bar_signal(
+                    close=bar.close,
+                    prev_hi=don_hi,
+                    prev_lo=don_lo,
+                    prev_ex_hi=ex_hi,
+                    prev_ex_lo=ex_lo,
+                    atr_cur=atr_cur,
+                    ema_cur=ema_arr[sym][k],
+                    ema_n=ema_n,
+                    allow_short=allow_short,
+                    open_direction=open_pos[sym].direction if sym in open_pos else None,
+                )
+                if sig is not None:
+                    pending_actions[sym] = sig
 
             # Continuous mark-to-market equity snapshot at bar close (bts + tf_ms)
             unr = 0.0
@@ -614,9 +804,10 @@ class TrendCTAPlugin(BaseStrategyPlugin):
         if equity_curve:
             equity_curve[-1] = (final_ts, cfg.capital_usd + realized_pnl_usd)
 
+        report_start_ms = max(timeline[0], eval_start_bucket) if eval_start_bucket is not None else timeline[0]
         metrics = self._compute_metrics(
             cfg=cfg,
-            start_ms=timeline[0],
+            start_ms=report_start_ms,
             end_ms=final_ts,
             trades=trades,
             equity_curve=equity_curve,
@@ -908,129 +1099,276 @@ class TrendCTAPlugin(BaseStrategyPlugin):
         state: dict[str, Any],
         cfg: StrategyConfig,
     ) -> list[OrderIntent]:
-        """Pure event step for replayable MicroRunSession & ExecutionBridge.
+        """Single-kernel streaming step matching TrendCTAPlugin.evaluate() math identically.
 
-        Aggregates raw BBO ticks into `timeframe_hours` UTC OHLC buckets before evaluating
-        Donchian breakouts (preventing 20s tick noise), while checking prior-bar Chandelier
-        ATR trailing stops immediately on every tick.
+        Enforces:
+        - Strict param validation (no dead/unconsumed keys).
+        - True Range (gap-aware) + SMA(ATR) + incremental EMA trend filter (`ema_filter_n`).
+        - Inverse-volatility ATR risk sizing (`compute_cta_entry_notional`) & gross leverage cap.
+        - Intrabar `MARGIN_LIQUIDATION` (>=0.90) before `CHANDELIER_STOP` (`evaluate_cta_intrabar_risk`)
+          plus `cooldown_hours` after stops/liquidations.
+        - Strictly causal T+1 open execution (Phase 1 open -> Phase 2 intrabar risk -> Phase 3 bar close).
         """
+        validate_trend_cta_params(cfg.params)
         intents: list[OrderIntent] = []
         sym = event.symbol
         if sym not in cfg.symbols or event.venue != cfg.venue_a:
             return intents
 
-        p = cfg.params or {}
-        tf_h = _p_int(p, "timeframe_hours", 12)
-        tf_ms = (tf_h if tf_h in ALLOWED_TIMEFRAMES_H else 12) * HOUR_MS
-        en = max(5, _p_int(p, "entry_n", 30))
-        ex = max(3, min(en - 1, _p_int(p, "exit_n", 12)))
-        atr_n = max(5, _p_int(p, "atr_n", 14))
-        atr_mult = max(1.5, _p_float(p, "atr_mult", 3.0))
+        cp = parse_cta_params(cfg)
+        tf_ms = cp["tf_ms"]
+        en = cp["entry_n"]
+        ex = cp["exit_n"]
+        atr_n = cp["atr_n"]
+        atr_mult = cp["atr_mult"]
+        ema_n = cp["ema_n"]
+        cooldown_h = cp["cooldown_h"]
+        warmup_bars = cp["warmup_bars"]
+        hist_cap = max(en, ex, atr_n) + 5
+        alpha = (2.0 / (ema_n + 1.0)) if ema_n > 0 else 0.0
 
         hist: dict[str, list[tuple[float, float, float]]] = state.setdefault("ohlc_hist", {})
-        active_bucket: dict[str, dict[str, float]] = state.setdefault("active_bucket", {})
+        tr_hist: dict[str, list[float]] = state.setdefault("tr_hist", {})
+        ema_state: dict[str, float] = state.setdefault("ema_state", {})
+        bars_seen: dict[str, int] = state.setdefault("bars_seen", {})
+        active_bucket: dict[str, dict[str, Any]] = state.setdefault("active_bucket", {})
         open_pos: dict[str, dict[str, Any]] = state.setdefault("open_pos", {})
+        pending_actions: dict[str, list[Any]] = state.setdefault("pending_actions", {})
+        cooldown_until: dict[str, int] = state.setdefault("cooldown_until", {})
 
-        closed_bar: tuple[float, float, float] | None = None
-        live_px = 0.0
+        series = hist.setdefault(sym, [])
+        tr_s = tr_hist.setdefault(sym, [])
+        # Lazily hydrate TR/EMA/count if ohlc_hist was pre-populated by warmup or external state
+        if sym not in bars_seen:
+            bars_seen[sym] = len(series)
+            if series:
+                trs_init: list[float] = []
+                for idx_i, (b_hi, b_lo, _b_cl) in enumerate(series):
+                    pc_i = series[idx_i - 1][2] if idx_i > 0 else None
+                    trs_init.append(compute_true_range(b_hi, b_lo, pc_i))
+                tr_s[:] = trs_init[-(atr_n + 5) :]
+                if sym not in ema_state:
+                    _, emas_init = compute_causal_atr_and_ema(series, atr_n, ema_n)
+                    ema_state[sym] = emas_init[-1]
 
+        def _current_atr() -> float:
+            if not tr_s:
+                return 0.0
+            window = tr_s[-atr_n:]
+            return sum(window) / float(len(window))
+
+        def _execute_pending(
+            open_px: float,
+            open_ts: int,
+            atr_prev: float,
+            cur_k: int,
+            cooldown_check_ts: int | None = None,
+        ) -> None:
+            pending = pending_actions.get(sym)
+            if not pending:
+                return
+            act = str(pending[0])
+            strength = float(pending[1]) if len(pending) > 1 else 0.0
+            if sym in open_pos and (
+                act == "EXIT"
+                or (act == "OPEN_LONG" and open_pos[sym]["direction"] == "SHORT")
+                or (act == "OPEN_SHORT" and open_pos[sym]["direction"] == "LONG")
+            ):
+                pos = open_pos.pop(sym)
+                intents.append(
+                    OrderIntent(
+                        cfg.strategy_id,
+                        sym,
+                        "CLOSE",
+                        float(pos["notional"]),
+                        0.0,
+                        "DONCHIAN_EXIT" if act == "EXIT" else "DONCHIAN_REVERSE",
+                        open_ts,
+                    )
+                )
+                if act == "EXIT":
+                    pending_actions.pop(sym, None)
+                    return
+
+            pending_actions.pop(sym, None)
+            if act not in ("OPEN_LONG", "OPEN_SHORT"):
+                return
+            direction = "LONG" if act == "OPEN_LONG" else "SHORT"
+            cd_ts = open_ts if cooldown_check_ts is None else int(cooldown_check_ts)
+            if (
+                sym in open_pos
+                or len(open_pos) >= int(cfg.max_positions)
+                or cd_ts < int(cooldown_until.get(sym, 0))
+                or cur_k < warmup_bars
+                or open_px <= 0.0
+                or not math.isfinite(open_px)
+            ):
+                return
+            cur_gross = sum(float(p_item["notional"]) for p_item in open_pos.values())
+            notional, slot_cap = compute_cta_entry_notional(
+                cfg,
+                entry_px=open_px,
+                atr_prev=atr_prev,
+                cur_gross_notional=cur_gross,
+            )
+            if notional < 10.0:
+                return
+            init_stop = (open_px - atr_mult * atr_prev) if direction == "LONG" else (open_px + atr_mult * atr_prev)
+            open_pos[sym] = {
+                "direction": direction,
+                "notional": notional,
+                "slot_margin": slot_cap,
+                "entry_px": open_px,
+                "entry_ts_ms": open_ts,
+                "peak": open_px,
+                "trough": open_px,
+                "stop_px": init_stop,
+            }
+            intents.append(
+                OrderIntent(
+                    cfg.strategy_id,
+                    sym,
+                    act,
+                    notional,
+                    round(strength, 4),
+                    "DONCHIAN_LONG_BREAKOUT" if direction == "LONG" else "DONCHIAN_SHORT_BREAKOUT",
+                    open_ts,
+                )
+            )
+
+        def _check_intrabar(
+            bar_high: float,
+            bar_low: float,
+            exit_ts: int,
+            cooldown_anchor_ts: int | None = None,
+        ) -> bool:
+            if sym not in open_pos:
+                return False
+            pos = open_pos[sym]
+            eff_w = min(float(cfg.per_position_weight), 1.0 / max(1, int(cfg.max_positions)))
+            slot_m = float(pos.get("slot_margin", float(cfg.capital_usd) * eff_w))
+            risk_evt = evaluate_cta_intrabar_risk(
+                direction=str(pos["direction"]),
+                entry_px=float(pos["entry_px"]),
+                entry_notional=float(pos["notional"]),
+                slot_margin=slot_m,
+                active_stop=float(pos.get("stop_px", 0.0)),
+                bar_high=bar_high,
+                bar_low=bar_low,
+            )
+            if risk_evt in ("MARGIN_LIQUIDATION", "CHANDELIER_STOP"):
+                intents.append(
+                    OrderIntent(cfg.strategy_id, sym, "CLOSE", float(pos["notional"]), 0.0, risk_evt, exit_ts)
+                )
+                open_pos.pop(sym, None)
+                anchor_ts = exit_ts if cooldown_anchor_ts is None else int(cooldown_anchor_ts)
+                cooldown_until[sym] = anchor_ts + cooldown_h * HOUR_MS
+                return True
+            return False
+
+        def _close_bar_phase3(hi: float, lo: float, cl: float) -> float:
+            k_cur = int(bars_seen.get(sym, 0))
+            prev_close = series[-1][2] if series else None
+            tr_k = compute_true_range(hi, lo, prev_close)
+            tr_s.append(tr_k)
+            if len(tr_s) > atr_n + 5:
+                del tr_s[: len(tr_s) - (atr_n + 5)]
+            atr_cur = _current_atr()
+            if k_cur == 0 or sym not in ema_state:
+                ema_cur = cl
+            else:
+                ema_cur = (alpha * cl + (1.0 - alpha) * float(ema_state[sym])) if ema_n > 0 else cl
+            ema_state[sym] = ema_cur
+
+            if k_cur >= warmup_bars and len(series) >= max(en, ex):
+                if sym in open_pos:
+                    pos = open_pos[sym]
+                    if pos["direction"] == "LONG":
+                        pos["peak"] = max(float(pos.get("peak", cl)), hi)
+                        pos["stop_px"] = max(float(pos.get("stop_px", 0.0)), pos["peak"] - atr_mult * atr_cur)
+                    else:
+                        pos["trough"] = min(float(pos.get("trough", cl)), lo)
+                        pos["stop_px"] = min(float(pos.get("stop_px", float("inf"))), pos["trough"] + atr_mult * atr_cur)
+
+                prev_hi = max(x[0] for x in series[-en:])
+                prev_lo = min(x[1] for x in series[-en:])
+                prev_ex_lo = min(x[1] for x in series[-ex:])
+                prev_ex_hi = max(x[0] for x in series[-ex:])
+                sig = evaluate_cta_bar_signal(
+                    close=cl,
+                    prev_hi=prev_hi,
+                    prev_lo=prev_lo,
+                    prev_ex_hi=prev_ex_hi,
+                    prev_ex_lo=prev_ex_lo,
+                    atr_cur=atr_cur,
+                    ema_cur=ema_cur,
+                    ema_n=ema_n,
+                    allow_short=bool(cfg.allow_bidirectional),
+                    open_direction=str(open_pos[sym]["direction"]) if sym in open_pos else None,
+                )
+                if sig is not None:
+                    pending_actions[sym] = [sig[0], sig[1]]
+
+            series.append((hi, lo, cl))
+            if len(series) > hist_cap:
+                del series[: len(series) - hist_cap]
+            bars_seen[sym] = k_cur + 1
+            return atr_cur
+
+        ts_ms = int(event.ts_ms)
         if event.kind == "CANDLE":
             hi = float(event.payload.get("high", 0.0))
             lo = float(event.payload.get("low", 0.0))
             cl = float(event.payload.get("close", 0.0))
-            if cl <= 0:
+            op = float(event.payload.get("open", cl))
+            if op <= 0.0 or not math.isfinite(op):
+                op = cl
+            if cl <= 0.0 or hi < lo or lo <= 0.0 or not (math.isfinite(hi) and math.isfinite(lo) and math.isfinite(cl)):
                 return intents
-            live_px = cl
-            closed_bar = (hi, lo, cl)
-        elif event.kind == "BBO":
+            bar_end_ts = int(event.payload.get("end_ts_ms", ts_ms + tf_ms))
+            k_cur = int(bars_seen.get(sym, 0))
+            atr_prev = _current_atr()
+            # Phase 1: Execute T+1 open exits/reversals & entries
+            _execute_pending(op, ts_ms, atr_prev, k_cur)
+            # Phase 2: Intrabar liquidation & prior-bar Chandelier stop
+            _check_intrabar(hi, lo, bar_end_ts)
+            # Phase 3: End-of-bar stop ratchet + schedule T+1 open signal
+            _close_bar_phase3(hi, lo, cl)
+            return intents
+
+        if event.kind == "BBO":
             bid = float(event.payload.get("bid", 0.0))
             ask = float(event.payload.get("ask", 0.0))
-            if bid <= 0 or ask < bid:
+            if bid <= 0.0 or ask < bid or not (math.isfinite(bid) and math.isfinite(ask)):
                 return intents
             mid = (bid + ask) * 0.5
-            live_px = mid
-            # Check active Chandelier stop immediately on live tick (computed from prior closed bars!)
-            if sym in open_pos:
-                pos = open_pos[sym]
-                stop_px = pos.get("stop_px", 0.0)
-                if stop_px > 0.0:
-                    hit = (bid <= stop_px) if pos["direction"] == "LONG" else (ask >= stop_px)
-                    if hit:
-                        intents.append(OrderIntent(cfg.strategy_id, sym, "CLOSE", pos["notional"], 0.0, "CHANDELIER_STOP", event.ts_ms))
-                        open_pos.pop(sym, None)
-                        return intents
-
-            bts = (int(event.ts_ms) // tf_ms) * tf_ms
+            bts = (ts_ms // tf_ms) * tf_ms
             cur = active_bucket.get(sym)
             if cur is None:
-                active_bucket[sym] = {"bts": float(bts), "high": ask, "low": bid, "close": mid}
+                _check_intrabar(ask, bid, ts_ms, cooldown_anchor_ts=bts + tf_ms)
+                # Mark mid-bucket unseeded starts (>= 1h into bucket) as partial so stub bars don't pollute ohlc_hist
+                is_partial = (ts_ms - bts) >= HOUR_MS
+                active_bucket[sym] = {"bts": float(bts), "high": ask, "low": bid, "close": mid, "partial": is_partial}
+                return intents
+            if bts < int(cur["bts"]):
                 return intents
             if bts == int(cur["bts"]):
-                cur["high"] = max(cur["high"], ask)
-                cur["low"] = min(cur["low"], bid)
+                _check_intrabar(ask, bid, ts_ms, cooldown_anchor_ts=bts + tf_ms)
+                cur["high"] = max(float(cur["high"]), ask)
+                cur["low"] = min(float(cur["low"]), bid)
                 cur["close"] = mid
                 return intents
-            # New timeframe bucket started -> close prior bucket and evaluate Donchian
-            closed_bar = (cur["high"], cur["low"], cur["close"])
-            active_bucket[sym] = {"bts": float(bts), "high": ask, "low": bid, "close": mid}
-        else:
+            # New timeframe bucket started: close prior bucket ONLY if complete (not a partial cold-start stub),
+            # then Phase 1 executes at new bucket open (cooldown tested vs bts), then Phase 2 intrabar check!
+            if bool(cur.get("partial", False)):
+                atr_closed = _current_atr()
+            else:
+                atr_closed = _close_bar_phase3(float(cur["high"]), float(cur["low"]), float(cur["close"]))
+            active_bucket[sym] = {"bts": float(bts), "high": ask, "low": bid, "close": mid, "partial": False}
+            _execute_pending(mid, ts_ms, atr_closed, int(bars_seen.get(sym, 0)), cooldown_check_ts=bts)
+            _check_intrabar(ask, bid, ts_ms, cooldown_anchor_ts=bts + tf_ms)
             return intents
 
-        if closed_bar is None:
-            return intents
-
-        hi, lo, cl = closed_bar
-        series = hist.setdefault(sym, [])
-        if len(series) >= en:
-            prev_hi = max(x[0] for x in series[-en:])
-            prev_lo = min(x[1] for x in series[-en:])
-            prev_ex_lo = min(x[1] for x in series[-ex:])
-            prev_ex_hi = max(x[0] for x in series[-ex:])
-            # Simple prior ATR from closed bars
-            atr_slice = series[-atr_n:]
-            tr_vals = [b[0] - b[1] for b in atr_slice]
-            atr_val = max(cl * 0.005, (sum(tr_vals) / len(tr_vals)) if tr_vals else cl * 0.01)
-            slot_notional = cfg.capital_usd * min(cfg.per_position_weight, 1.0 / max(1, cfg.max_positions))
-
-            if sym in open_pos:
-                pos = open_pos[sym]
-                if pos["direction"] == "LONG":
-                    if cl < prev_ex_lo:
-                        intents.append(OrderIntent(cfg.strategy_id, sym, "CLOSE", pos["notional"], 0.0, "DONCHIAN_EXIT", event.ts_ms))
-                        open_pos.pop(sym, None)
-                    else:
-                        pos["peak"] = max(pos.get("peak", live_px), hi)
-                        pos["stop_px"] = max(pos.get("stop_px", 0.0), pos["peak"] - atr_mult * atr_val)
-                else:
-                    if cl > prev_ex_hi:
-                        intents.append(OrderIntent(cfg.strategy_id, sym, "CLOSE", pos["notional"], 0.0, "DONCHIAN_EXIT", event.ts_ms))
-                        open_pos.pop(sym, None)
-                    else:
-                        pos["trough"] = min(pos.get("trough", live_px), lo)
-                        pos["stop_px"] = min(pos.get("stop_px", float("inf")), pos["trough"] + atr_mult * atr_val)
-            elif len(open_pos) < cfg.max_positions:
-                if cl > prev_hi:
-                    open_pos[sym] = {
-                        "direction": "LONG",
-                        "notional": slot_notional,
-                        "entry_px": live_px,
-                        "peak": live_px,
-                        "stop_px": live_px - atr_mult * atr_val,
-                    }
-                    intents.append(OrderIntent(cfg.strategy_id, sym, "OPEN_LONG", slot_notional, ((cl / prev_hi) - 1.0) * 10000.0, "DONCHIAN_LONG_BREAKOUT", event.ts_ms))
-                elif cfg.allow_bidirectional and cl < prev_lo:
-                    open_pos[sym] = {
-                        "direction": "SHORT",
-                        "notional": slot_notional,
-                        "entry_px": live_px,
-                        "trough": live_px,
-                        "stop_px": live_px + atr_mult * atr_val,
-                    }
-                    intents.append(OrderIntent(cfg.strategy_id, sym, "OPEN_SHORT", slot_notional, ((prev_lo / cl) - 1.0) * 10000.0, "DONCHIAN_SHORT_BREAKOUT", event.ts_ms))
-
-        series.append((hi, lo, cl))
-        if len(series) > max(en, atr_n) + 5:
-            del series[: len(series) - (max(en, atr_n) + 5)]
         return intents
 
     def min_economic_kill_horizon_hours(self, cfg: StrategyConfig) -> float:

@@ -5,11 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=1800
 User=alphaloop
 Group=alphaloop
 WorkingDirectory=/opt/alphaloop
 EnvironmentFile=-/opt/alphaloop/.env
-ExecStart=/usr/bin/python3 -u /opt/alphaloop/scripts/run_nightly_factory.py --data-dir /opt/alphaloop/data --days 3
+ExecStart=/usr/bin/python3 -u /opt/alphaloop/scripts/run_nightly_factory.py --data-dir /opt/alphaloop/data --days 3 --seed-balanced --lock /opt/alphaloop/data/state/alphaloop_nightly.lock
 MemoryMax=768M
 NoNewPrivileges=true
 PrivateTmp=true
