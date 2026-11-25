@@ -334,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.out:
         _atomic_write_json(Path(args.out), result)
-    print(json.dumps(result, indent=2, sort_keys=True))
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
     return 0
 
 

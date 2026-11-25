@@ -224,7 +224,7 @@ def run_platform_v3_research(
             },
         }
         out_json = data_dir / "platform_v3_report.json"
-        out_json.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        out_json.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
         return report
     finally:
         lake.close()

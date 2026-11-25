@@ -52,7 +52,7 @@ def _pull_csv_with_header(
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+    raw = json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False).encode("utf-8")
     fd, tmp_name = tempfile.mkstemp(prefix=".dq.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as fh:

@@ -40,7 +40,7 @@ UNIVERSE = [
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    raw = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
     fd, tmp_name = tempfile.mkstemp(prefix=".research.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as fh:

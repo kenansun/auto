@@ -183,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         try:
             summary = daemon.run_once(collect_live=args.collect_live)
-            print(json.dumps(summary, indent=2, sort_keys=True))
+            print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
             return 0
         finally:
             daemon.close()
