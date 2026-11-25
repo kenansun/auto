@@ -38,6 +38,7 @@ from alphaloop.core.provenance import sha256_obj, utc_now_ms
 from alphaloop.daemon.watchdog_hook import AlertNotifier, WatchdogHook
 from alphaloop.data.bbo_collector import MultiVenueBBOCollector
 from alphaloop.data.store import MarketDataStore
+from alphaloop.execution import bridge as _bridge_mod
 from alphaloop.execution.bridge import (
     ALLOWED_SHADOW_STATUSES,
     LIVE_EXECUTION_ENABLED,
@@ -65,10 +66,68 @@ SHADOW_LIVE_EXECUTION_ENABLED: Final[bool] = False
 PARITY_DEPTH_ACTIVE: Final[str] = "ACTIVE_EXECUTION"
 PARITY_DEPTH_VACUOUS: Final[str] = "VACUOUS_ZERO_PLANS"
 TAKER_FEE_BPS_DEFAULT: Final[float] = 4.5
+_MAX_VALID_EPOCH_MS: Final[int] = 4_102_444_800_000
 
 
 def _is_finite(val: Any) -> bool:
     return (not isinstance(val, bool)) and isinstance(val, (int, float)) and math.isfinite(float(val))
+
+
+def _is_valid_bbo_tick(tick: Any) -> bool:
+    """Validate a BBOTick strictly before SQLite upsert or cache update (STD-46 DQ-U02/U03)."""
+    if tick is None:
+        return False
+    venue = getattr(tick, "venue", None)
+    symbol = getattr(tick, "symbol", None)
+    if not isinstance(venue, str) or not venue.strip() or not isinstance(symbol, str) or not symbol.strip():
+        return False
+    ts_ms = getattr(tick, "ts_ms", None)
+    if isinstance(ts_ms, bool) or not isinstance(ts_ms, int) or ts_ms <= 0 or ts_ms > _MAX_VALID_EPOCH_MS:
+        return False
+    bid_raw = getattr(tick, "bid", None)
+    ask_raw = getattr(tick, "ask", None)
+    bid_qty_raw = getattr(tick, "bid_qty", None)
+    ask_qty_raw = getattr(tick, "ask_qty", None)
+    lat_raw = getattr(tick, "latency_ms", None)
+    for raw in (bid_raw, ask_raw, bid_qty_raw, ask_qty_raw, lat_raw):
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return False
+    bid = float(bid_raw)
+    ask = float(ask_raw)
+    bid_qty = float(bid_qty_raw)
+    ask_qty = float(ask_qty_raw)
+    latency_ms = float(lat_raw)
+    if not (
+        math.isfinite(bid)
+        and math.isfinite(ask)
+        and math.isfinite(bid_qty)
+        and math.isfinite(ask_qty)
+        and math.isfinite(latency_ms)
+    ):
+        return False
+    if not (bid > 0.0 and ask >= bid and bid_qty >= 0.0 and ask_qty >= 0.0 and latency_ms >= 0.0):
+        return False
+    mid = (bid + ask) * 0.5
+    spread = ask - bid
+    return math.isfinite(mid) and mid > 0.0 and math.isfinite(spread)
+
+
+def _is_valid_ohlc_candle(candle: Any) -> bool:
+    """Return True iff candle has finite positive OHLC satisfying high >= max(o, c) >= min(o, c) >= low."""
+    ts_raw = getattr(candle, "ts_ms", None)
+    if isinstance(ts_raw, bool) or not isinstance(ts_raw, int) or ts_raw < 0:
+        return False
+    o_raw = getattr(candle, "open", None)
+    h_raw = getattr(candle, "high", None)
+    l_raw = getattr(candle, "low", None)
+    c_raw = getattr(candle, "close", None)
+    if not (_is_finite(o_raw) and _is_finite(h_raw) and _is_finite(l_raw) and _is_finite(c_raw)):
+        return False
+    o = float(o_raw)
+    h = float(h_raw)
+    lo = float(l_raw)
+    cl = float(c_raw)
+    return o > 0.0 and h > 0.0 and lo > 0.0 and cl > 0.0 and h >= lo and h >= max(o, cl) and lo <= min(o, cl)
 
 
 def _is_dual_venue(cfg: StrategyConfig) -> bool:
@@ -520,9 +579,11 @@ class ShadowParityAuditor:
         window_start_ms: int,
     ) -> dict[str, Any]:
         """Return structured pre-window warmup diagnostics for funding_carry and trend_cta parity backtests."""
+        if isinstance(window_start_ms, bool) or not isinstance(window_start_ms, int) or window_start_ms < 0:
+            raise ValueError("window_start_ms must be a non-negative integer")
         pid = str(cfg.plugin_id or "funding_carry").strip().lower()
         if pid == "funding_carry":
-            return validate_prewindow_funding_warmup(self.market_store, cfg, int(window_start_ms))
+            return validate_prewindow_funding_warmup(self.market_store, cfg, window_start_ms)
 
         if pid == "trend_cta":
             cp = parse_cta_params(cfg)
@@ -530,8 +591,8 @@ class ShadowParityAuditor:
             tf_ms = cp["tf_ms"]
             req_bars = int(cp["warmup_bars"])
             need_bars = max(req_bars, cp["ema_n"] * 3 if cp["ema_n"] > 0 else 0) + 10
-            warmup_start = max(0, int(window_start_ms) - need_bars * tf_ms)
-            eval_start_bucket = (int(window_start_ms) // tf_ms) * tf_ms
+            warmup_start = max(0, window_start_ms - need_bars * tf_ms)
+            eval_start_bucket = (window_start_ms // tf_ms) * tf_ms
             symbols = list(cfg.symbols or [])
             per_symbol: dict[str, dict[str, Any]] = {}
             warmed_symbols: list[str] = []
@@ -541,7 +602,9 @@ class ShadowParityAuditor:
                 c1h = self.market_store.load_candles(cfg.venue_a, sym, start_ms=warmup_start, end_ms=eval_start_bucket)
                 bcounts: dict[int, int] = {}
                 for c in c1h:
-                    b = (int(c.ts_ms) // tf_ms) * tf_ms
+                    if not _is_valid_ohlc_candle(c):
+                        continue
+                    b = (c.ts_ms // tf_ms) * tf_ms
                     if b < eval_start_bucket:
                         bcounts[b] = bcounts.get(b, 0) + 1
                 completed_n = sum(1 for cnt in bcounts.values() if cnt >= tf_h)
@@ -606,7 +669,7 @@ class ShadowParityAuditor:
         window_start_ms: int,
     ) -> tuple[int | None, bool, str]:
         """Return (warmup_start_ms, has_sufficient_history, reason) for apples-to-apples parity backtest."""
-        res = self.validate_prewindow_warmup(cfg, int(window_start_ms))
+        res = self.validate_prewindow_warmup(cfg, window_start_ms)
         return res["warmup_start_ms"], bool(res["sufficient"]), str(res["reason"])
 
     def evaluate_strategy(
@@ -628,6 +691,13 @@ class ShadowParityAuditor:
         drift_check_min_hours: float = 24.0,
     ) -> ShadowParityRecord:
         """Compare live Shadow equity & realized spread against causally pre-warmed same-window backtest."""
+        for field_name, field_val in (
+            ("plans_created", plans_created),
+            ("plans_blocked", plans_blocked),
+            ("open_positions", open_positions),
+        ):
+            if isinstance(field_val, bool) or not isinstance(field_val, int):
+                raise ValueError(f"{field_name} must be an integer (not bool), got {field_val!r}")
         cap = float(cfg.capital_usd)
         if not (_is_finite(cap) and cap > 0 and _is_finite(shadow_equity_usd)):
             raise ValueError("Invalid capital or non-finite shadow equity")
@@ -759,7 +829,12 @@ class ShadowPortfolioDaemon:
         drift_check_min_hours: float = 24.0,
         bbo_symbols: list[str] | None = None,
     ) -> None:
-        if LIVE_EXECUTION_ENABLED or DAEMON_LIVE_EXECUTION_ENABLED or SHADOW_LIVE_EXECUTION_ENABLED:
+        if (
+            LIVE_EXECUTION_ENABLED
+            or _bridge_mod.LIVE_EXECUTION_ENABLED
+            or DAEMON_LIVE_EXECUTION_ENABLED
+            or SHADOW_LIVE_EXECUTION_ENABLED
+        ):
             raise RuntimeError("ShadowPortfolioDaemon refuses non-shadow execution mode")
 
         self.data_dir = Path(data_dir)
@@ -1059,7 +1134,7 @@ class ShadowPortfolioDaemon:
                 latest_tick = self.store.load_latest_bbo_tick(
                     venue, sym, min_ts_ms=start_ms, max_ts_ms=now_ms + 30_000
                 )
-                if latest_tick is not None:
+                if latest_tick is not None and _is_valid_bbo_tick(latest_tick):
                     merged[(venue, sym)] = latest_tick
         # Merge cache strictly by max ts_ms & prune expired cache entries (Red-Team HIGH #8)
         stale_cutoff = int(now_ms - self.max_bbo_stale_sec * 1000.0)
@@ -1273,7 +1348,12 @@ class ShadowPortfolioDaemon:
         parity_report_path: Path | None = None,
     ) -> dict[str, Any]:
         """Execute one deterministic SHADOW_DRY_RUN cycle and update parity scorecard."""
-        if LIVE_EXECUTION_ENABLED or DAEMON_LIVE_EXECUTION_ENABLED or SHADOW_LIVE_EXECUTION_ENABLED:
+        if (
+            LIVE_EXECUTION_ENABLED
+            or _bridge_mod.LIVE_EXECUTION_ENABLED
+            or DAEMON_LIVE_EXECUTION_ENABLED
+            or SHADOW_LIVE_EXECUTION_ENABLED
+        ):
             raise RuntimeError("ShadowPortfolioDaemon forbids live execution")
 
         with self._lock:
@@ -1341,25 +1421,29 @@ class ShadowPortfolioDaemon:
                 self._collector.symbols = sorted_syms_needed
 
             # 3) Gather live BBO ticks (injected, live-collected, or latest stored)
+            incoming_ticks: list[BBOTick] = list(live_ticks) if live_ticks else []
             if collect_live:
                 collected, _errs = self._collector.capture_round()
                 if collected:
-                    self.store.upsert_bbo_ticks(collected)
-                    live_ticks = list(live_ticks or []) + collected
+                    incoming_ticks.extend(collected)
 
-            if live_ticks:
-                self.store.upsert_bbo_ticks(live_ticks)
-                for t in live_ticks:
-                    if (
-                        not isinstance(t.bid, bool)
-                        and not isinstance(t.ask, bool)
-                        and isinstance(t.bid, (int, float))
-                        and isinstance(t.ask, (int, float))
-                        and math.isfinite(float(t.bid))
-                        and math.isfinite(float(t.ask))
-                        and t.bid > 0
-                        and t.ask >= t.bid
-                    ):
+            if incoming_ticks:
+                valid_live_ticks: list[BBOTick] = []
+                rejected_bbo = 0
+                for t in incoming_ticks:
+                    if _is_valid_bbo_tick(t):
+                        valid_live_ticks.append(t)
+                    else:
+                        rejected_bbo += 1
+                if rejected_bbo:
+                    logger.warning(
+                        "Rejected %d invalid/non-finite/crossed BBO ticks before DB write (trace=%s)",
+                        rejected_bbo,
+                        trace_id,
+                    )
+                if valid_live_ticks:
+                    self.store.upsert_bbo_ticks(valid_live_ticks)
+                    for t in valid_live_ticks:
                         prev_c = self._latest_bbo_cache.get((t.venue, t.symbol))
                         if prev_c is None or t.ts_ms >= prev_c.ts_ms:
                             self._latest_bbo_cache[(t.venue, t.symbol)] = t
