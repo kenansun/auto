@@ -29,6 +29,8 @@ DEFAULT_BBO_SYMBOLS = [
 
 TS_SOURCE_VENUE = "VENUE_EXCHANGE"
 TS_SOURCE_RECV_LOCAL = "RECV_LOCAL_ONLY"
+MIN_VALID_EPOCH_MS = 1_577_836_800_000  # 2020-01-01T00:00:00Z (STD-46 DQ-U03)
+MAX_VALID_EPOCH_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z (STD-46 DQ-U03)
 
 
 @dataclass
@@ -50,7 +52,7 @@ def _parse_finite_float(raw: Any) -> float | None:
         return None
     if not math.isfinite(val):
         return None
-    return val
+    return 0.0 if val == 0.0 else val
 
 
 def _parse_optional_nonneg_qty(raw: Any) -> float | None:
@@ -60,15 +62,15 @@ def _parse_optional_nonneg_qty(raw: Any) -> float | None:
     val = _parse_finite_float(raw)
     if val is None or val < 0.0:
         return None
-    return val
+    return 0.0 if val == 0.0 else val
 
 
 def _parse_venue_ts_ms(raw: Any) -> int | None:
-    """Parse a positive integer exchange timestamp in ms; absent/invalid returns None (never local clock)."""
+    """Parse a UTC epoch ms timestamp within [2020-01-01, 2100-01-01]; absent/invalid returns None."""
     if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, int):
-        return raw if raw > 0 else None
+        return raw if MIN_VALID_EPOCH_MS <= raw <= MAX_VALID_EPOCH_MS else None
     if isinstance(raw, str):
         text = raw.strip()
         if not text:
@@ -77,14 +79,21 @@ def _parse_venue_ts_ms(raw: Any) -> int | None:
             ts_int = int(text)
         except ValueError:
             fv = _parse_finite_float(text)
-            if fv is None or fv <= 0.0:
+            if fv is None or not (MIN_VALID_EPOCH_MS <= fv <= MAX_VALID_EPOCH_MS):
                 return None
-            return int(fv)
-        return ts_int if ts_int > 0 else None
+            ts_int = int(fv)
+            return ts_int if MIN_VALID_EPOCH_MS <= ts_int <= MAX_VALID_EPOCH_MS else None
+        return ts_int if MIN_VALID_EPOCH_MS <= ts_int <= MAX_VALID_EPOCH_MS else None
     fv = _parse_finite_float(raw)
-    if fv is None or fv <= 0.0:
+    if fv is None or not (MIN_VALID_EPOCH_MS <= fv <= MAX_VALID_EPOCH_MS):
         return None
-    return int(fv)
+    ts_int = int(fv)
+    return ts_int if MIN_VALID_EPOCH_MS <= ts_int <= MAX_VALID_EPOCH_MS else None
+
+
+def _reject_nonstandard_json(constant: str) -> Any:
+    """Reject non-RFC-8259 bare NaN/Infinity/-Infinity JSON tokens (STD-46 DQ-U02)."""
+    raise ValueError(f"Non-standard JSON constant forbidden: {constant!r}")
 
 
 def _is_valid_bbo_quote(
@@ -138,7 +147,7 @@ def _http_json(
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8")
             latency_ms = (time.perf_counter() - t0) * 1000.0
-            return json.loads(raw), round(latency_ms, 2)
+            return json.loads(raw, parse_constant=_reject_nonstandard_json), round(latency_ms, 2)
         except (urllib.error.URLError, urllib.error.HTTPError, http.client.HTTPException, OSError, TimeoutError, ValueError) as exc:
             last_exc = exc
             if attempt + 1 < max_retries:
@@ -157,11 +166,35 @@ class MultiVenueBBOCollector:
     def _ensure_lighter_markets(self) -> dict[str, int]:
         if self._lighter_markets is None:
             data, _ = _http_json("https://mainnet.zklighter.elliot.ai/api/v1/orderBooks")
+            if not isinstance(data, dict):
+                return {}
+            obs = data.get("order_books")
+            if not isinstance(obs, list):
+                return {}
             mapping: dict[str, int] = {}
-            if isinstance(data, dict):
-                for item in data.get("order_books", []):
-                    if isinstance(item, dict) and item.get("status") == "active" and item.get("market_type") == "perp":
-                        mapping[str(item.get("symbol", "")).upper()] = int(item["market_id"])
+            for item in obs:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("status") != "active" or item.get("market_type") != "perp":
+                    continue
+                sym = item.get("symbol")
+                if not isinstance(sym, str) or not sym.strip():
+                    continue
+                raw_mid = item.get("market_id")
+                if raw_mid is None or isinstance(raw_mid, bool):
+                    continue
+                if isinstance(raw_mid, int):
+                    mid_id = raw_mid
+                elif isinstance(raw_mid, str):
+                    try:
+                        mid_id = int(raw_mid.strip())
+                    except ValueError:
+                        continue
+                else:
+                    continue
+                if mid_id < 0:
+                    continue
+                mapping[sym.strip().upper()] = mid_id
             self._lighter_markets = mapping
         return self._lighter_markets
 
@@ -173,11 +206,14 @@ class MultiVenueBBOCollector:
         ticks: list[BBOTick] = []
         if not isinstance(data, dict):
             return ticks
-        for row in data.get("data", []):
+        rows = data.get("data")
+        if not isinstance(rows, list):
+            return ticks
+        for row in rows:
             if not isinstance(row, dict):
                 continue
-            inst = row.get("instId", "")
-            if inst not in want:
+            inst = row.get("instId")
+            if not isinstance(inst, str) or inst not in want:
                 continue
             bid = _parse_finite_float(row.get("bidPx"))
             ask = _parse_finite_float(row.get("askPx"))
@@ -217,8 +253,8 @@ class MultiVenueBBOCollector:
         for row in data:
             if not isinstance(row, dict):
                 continue
-            contract = row.get("contract", "")
-            if contract not in want:
+            contract = row.get("contract")
+            if not isinstance(contract, str) or contract not in want:
                 continue
             bid = _parse_finite_float(row.get("highest_bid"))
             ask = _parse_finite_float(row.get("lowest_ask"))
@@ -226,8 +262,9 @@ class MultiVenueBBOCollector:
             ask_q = _parse_optional_nonneg_qty(row.get("lowest_size"))
             if not _is_valid_bbo_quote(bid, ask, bid_q, ask_q, lat_val):
                 continue
-            raw_vts = row.get("ts_ms") if "ts_ms" in row else row.get("time_ms")
-            venue_ts_ms = _parse_venue_ts_ms(raw_vts)
+            venue_ts_ms = _parse_venue_ts_ms(row.get("ts_ms"))
+            if venue_ts_ms is None:
+                venue_ts_ms = _parse_venue_ts_ms(row.get("time_ms"))
             ts_source = TS_SOURCE_VENUE if venue_ts_ms is not None else TS_SOURCE_RECV_LOCAL
             ts_ms = venue_ts_ms if venue_ts_ms is not None else recv_ts_ms
             ticks.append(
@@ -257,8 +294,15 @@ class MultiVenueBBOCollector:
                 lat_val = _parse_finite_float(lat_ms)
                 if not isinstance(data, dict):
                     continue
-                levels = data.get("levels") or []
-                if not isinstance(levels, list) or len(levels) < 2 or not levels[0] or not levels[1]:
+                levels = data.get("levels")
+                if (
+                    not isinstance(levels, list)
+                    or len(levels) < 2
+                    or not isinstance(levels[0], list)
+                    or not isinstance(levels[1], list)
+                    or not levels[0]
+                    or not levels[1]
+                ):
                     continue
                 top_bid = levels[0][0]
                 top_ask = levels[1][0]
@@ -344,8 +388,9 @@ class MultiVenueBBOCollector:
                 ask_q = _parse_optional_nonneg_qty(best_ask_row.get("remaining_base_amount"))
                 if not _is_valid_bbo_quote(bid, ask, bid_q, ask_q, lat_val):
                     continue
-                raw_vts = data.get("ts_ms") if "ts_ms" in data else data.get("timestamp_ms")
-                venue_ts_ms = _parse_venue_ts_ms(raw_vts)
+                venue_ts_ms = _parse_venue_ts_ms(data.get("ts_ms"))
+                if venue_ts_ms is None:
+                    venue_ts_ms = _parse_venue_ts_ms(data.get("timestamp_ms"))
                 ts_source = TS_SOURCE_VENUE if venue_ts_ms is not None else TS_SOURCE_RECV_LOCAL
                 ts_ms = venue_ts_ms if venue_ts_ms is not None else recv_ts_ms
                 ticks.append(
