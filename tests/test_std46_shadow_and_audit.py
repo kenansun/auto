@@ -2007,6 +2007,123 @@ class TestTier5AutoAdversarialHardening(unittest.TestCase):
             finally:
                 mon.close()
 
+    def test_gap_c2r2_01_static_ablation_forbids_incompatible_units_and_sharpe_families(self) -> None:
+        # 1. raw_sharpe vs excess_sharpe MUST raise ValueError (no apples-to-oranges Sharpe bypass)
+        with self.assertRaises(ValueError):
+            evaluate_static_ablation(
+                {"cagr_pct": 4.37, "raw_sharpe": 0.85, "maxdd_pct": 6.88, "calmar": 0.63},
+                {"cagr_pct": 4.60, "excess_sharpe": 0.60, "maxdd_pct": 6.34, "calmar": 0.72},
+            )
+        # 2. cagr_pct vs decimal cagr MUST raise ValueError
+        with self.assertRaises(ValueError):
+            evaluate_static_ablation(
+                {"cagr_pct": 4.37, "excess_sharpe": 0.55, "maxdd_pct": 6.88, "calmar": 0.63},
+                {"cagr": 0.046, "excess_sharpe": 0.60, "maxdd_pct": 6.34, "calmar": 0.72},
+            )
+        # 3. maxdd_pct vs decimal max_dd MUST raise ValueError
+        with self.assertRaises(ValueError):
+            evaluate_static_ablation(
+                {"cagr_pct": 4.37, "excess_sharpe": 0.55, "maxdd_pct": 6.88, "calmar": 0.63},
+                {"cagr_pct": 4.60, "excess_sharpe": 0.60, "max_dd": 0.0634, "calmar": 0.72},
+            )
+        # 4. build_std46_audit_report must NOT launder cagr_pct vs cagr past SCHQ --mode report
+        with self.assertRaises(ValueError):
+            build_std46_audit_report(
+                report_name="v3_launder_attempt",
+                strategies=[
+                    {
+                        "strategy_id": "S_MIX",
+                        "status": "PROMOTE",
+                        "cagr_pct": 4.37,
+                        "ann_vol_pct": 5.14,
+                        "rf_pct": 4.5,
+                        "maxdd_pct": 6.88,
+                        "calmar": 0.63,
+                        "static_metrics": {"cagr": 0.046, "excess_sharpe": 0.60, "maxdd_pct": 6.34, "calmar": 0.72},
+                    }
+                ],
+            )
+        # 5. Valid same-family aliases still work cleanly (max_dd_pct vs maxdd_pct, sharpe vs sharpe_ratio, calmar vs calmar_ratio)
+        res_same = evaluate_static_ablation(
+            {"cagr_pct": 4.37, "sharpe": 0.85, "max_dd_pct": 6.88, "calmar": 0.63},
+            {"cagr_pct": 4.60, "sharpe_ratio": 0.88, "maxdd_pct": 6.34, "calmar_ratio": 0.72},
+        )
+        self.assertTrue(res_same["dominated_by_static"])
+        self.assertEqual(res_same["verdict_cap"], "STATIC_ALLOCATION_DOMINATED")
+
+        # 6. Decimal cagr/max_dd family preserved without misleading *_pct re-labeling
+        res_dec = evaluate_static_ablation(
+            {"cagr": 0.0437, "excess_sharpe": 0.55, "max_dd": 0.0688, "calmar": 0.63},
+            {"cagr": 0.0460, "excess_sharpe": 0.60, "maxdd": 0.0634, "calmar": 0.72},
+        )
+        self.assertTrue(res_dec["dominated_by_static"])
+        self.assertIn("cagr", res_dec["strategy_metrics"])
+        self.assertNotIn("cagr_pct", res_dec["strategy_metrics"])
+        self.assertIn("excess_sharpe", res_dec["strategy_metrics"])
+
+    def test_gap_c2r2_02_passed_8_of_8_contradicts_explicit_total_and_schq_parity(self) -> None:
+        # Contradictory passed_8_of_8=True vs total_gates/gates_total != 8 MUST fail closed
+        for bad_sleeve in (
+            {"sleeve_id": "S_TOT10", "passed_8_of_8": True, "total_gates": 10, "currency": "USD"},
+            {"sleeve_id": "S_GT10", "passed_8_of_8": True, "gates_total": 10, "currency": "USD"},
+            {"sleeve_id": "S_TOT6", "passed_8_of_8": True, "total_gates": 6, "currency": "USD"},
+        ):
+            res = audit_composite_portfolio([bad_sleeve], {"USD"}, fx_hedged=False)
+            self.assertFalse(res["eligible_for_production"], msg=f"Must reject {bad_sleeve}")
+            self.assertEqual(res["classification"], "DIAGNOSTIC_HYPOTHETICAL_ONLY")
+            self.assertEqual(res["failing_sleeves"], [bad_sleeve["sleeve_id"]])
+
+        # Valid 10/10 with passed_8_of_8=True and valid 8/8 with passed_8_of_8=True MUST still pass
+        for good_sleeve in (
+            {"sleeve_id": "S_10_10", "gates_passed": 10, "gates_total": 10, "passed_8_of_8": True, "currency": "USD"},
+            {"sleeve_id": "S_8_8", "passed_8_of_8": True, "gates_total": 8, "currency": "USD"},
+        ):
+            res_ok = audit_composite_portfolio([good_sleeve], {"USD"}, fx_hedged=False)
+            self.assertTrue(res_ok["eligible_for_production"], msg=f"Must accept {good_sleeve}")
+            self.assertEqual(res_ok["classification"], "PRODUCTION_ELIGIBLE")
+
+        # Cross-repo parity: auto build_std46_audit_report output for contradictory sleeve passes SCHQ --mode report
+        # cleanly as DIAGNOSTIC_HYPOTHETICAL_ONLY (no fake gates_passed=8/gates_total=8 contradiction)
+        rep = build_std46_audit_report(
+            report_name="gap_c2r2_02_parity",
+            composites=[
+                {
+                    "portfolio_id": "C_CONTRA",
+                    "currencies": ["USD"],
+                    "fx_hedged": False,
+                    "cagr_pct": 12.0,
+                    "ann_vol_pct": 10.0,
+                    "sleeves": [{"sleeve_id": "S1", "passed_8_of_8": True, "total_gates": 10, "currency": "USD"}],
+                },
+                {
+                    "portfolio_id": "C_10_OF_10",
+                    "currencies": ["USD"],
+                    "fx_hedged": False,
+                    "cagr_pct": 12.0,
+                    "ann_vol_pct": 10.0,
+                    "sleeves": [
+                        {"sleeve_id": "S2", "gates_passed": 10, "gates_total": 10, "passed_8_of_8": True, "currency": "USD"}
+                    ],
+                },
+            ],
+        )
+        self.assertEqual(rep["composites"][0]["classification"], "DIAGNOSTIC_HYPOTHETICAL_ONLY")
+        self.assertEqual(rep["composites"][0]["status"], "DIAGNOSTIC_HYPOTHETICAL_ONLY")
+        self.assertNotIn("gates_passed", rep["composites"][0]["sleeves"][0])
+        self.assertEqual(rep["composites"][1]["classification"], "PRODUCTION_ELIGIBLE")
+
+        if _SCHQ_GATE_SCRIPT.exists():
+            with tempfile.TemporaryDirectory(prefix="std46_c2r2_02_") as td:
+                rp = Path(td) / "parity_c2r2_02.json"
+                rp.write_text(json.dumps(rep, indent=2, allow_nan=False), encoding="utf-8")
+                proc = subprocess.run(
+                    [sys.executable, "-B", str(_SCHQ_GATE_SCRIPT), "--mode", "report", str(rp), "--json"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 0, msg=f"SCHQ --mode report failed: {proc.stdout}\n{proc.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()

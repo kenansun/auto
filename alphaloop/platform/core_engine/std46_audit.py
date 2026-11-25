@@ -35,17 +35,22 @@ _DISQUALIFYING_SLEEVE_STATUSES: Final[frozenset[str]] = frozenset(
     }
 )
 
-_CAGR_KEYS: Final[tuple[str, ...]] = ("cagr_pct", "cagr")
-_SR_KEYS: Final[tuple[str, ...]] = ("excess_sharpe", "sharpe", "sharpe_ratio", "raw_sharpe")
-_MAXDD_KEYS: Final[tuple[str, ...]] = (
-    "max_dd_pct",
-    "maxdd_pct",
-    "max_drawdown_pct",
-    "max_dd",
-    "maxdd",
-    "max_drawdown",
+_CAGR_KEY_GROUPS: Final[tuple[tuple[str, ...], ...]] = (
+    ("cagr_pct",),
+    ("cagr",),
 )
-_CALMAR_KEYS: Final[tuple[str, ...]] = ("calmar", "calmar_ratio")
+_SR_KEY_GROUPS: Final[tuple[tuple[str, ...], ...]] = (
+    ("excess_sharpe",),
+    ("sharpe", "sharpe_ratio"),
+    ("raw_sharpe",),
+)
+_MAXDD_KEY_GROUPS: Final[tuple[tuple[str, ...], ...]] = (
+    ("max_dd_pct", "maxdd_pct", "max_drawdown_pct"),
+    ("max_dd", "maxdd", "max_drawdown"),
+)
+_CALMAR_KEY_GROUPS: Final[tuple[tuple[str, ...], ...]] = (
+    ("calmar", "calmar_ratio"),
+)
 
 _VACUOUS_FORBIDDEN_CLAIMS: Final[frozenset[str]] = frozenset(
     {
@@ -101,35 +106,52 @@ def _require_finite_float(val: Any, name: str) -> float:
 def _extract_pair_metric(
     strategy_metrics: dict[str, Any],
     static_metrics: dict[str, Any],
-    keys: tuple[str, ...],
+    key_groups: tuple[tuple[str, ...], ...],
     metric_label: str,
-) -> tuple[float, float]:
-    """Extract a metric pair using common-key priority first (apples-to-apples), fail-closed if missing."""
-    for key in keys:
-        if (
-            key in strategy_metrics
-            and key in static_metrics
-            and strategy_metrics[key] is not None
-            and static_metrics[key] is not None
-        ):
+) -> tuple[float, float, str]:
+    """Extract a metric pair strictly within the same unit/definition family (apples-to-apples).
+
+    Returns `(strategy_val, static_val, canonical_family_key)` where `canonical_family_key` is
+    `group[0]` of the matched family. Raises `ValueError` on missing values or apples-to-oranges
+    cross-family mismatches (e.g., `cagr_pct` vs `cagr`, `raw_sharpe` vs `excess_sharpe`,
+    `maxdd_pct` vs `max_dd`).
+    """
+    for group in key_groups:
+        for key in group:
+            if (
+                key in strategy_metrics
+                and key in static_metrics
+                and strategy_metrics[key] is not None
+                and static_metrics[key] is not None
+            ):
+                return (
+                    _require_finite_float(strategy_metrics[key], f"strategy_metrics.{key}"),
+                    _require_finite_float(static_metrics[key], f"static_metrics.{key}"),
+                    group[0],
+                )
+        s_key = next((k for k in group if k in strategy_metrics and strategy_metrics[k] is not None), None)
+        b_key = next((k for k in group if k in static_metrics and static_metrics[k] is not None), None)
+        if s_key is not None and b_key is not None:
             return (
-                _require_finite_float(strategy_metrics[key], f"strategy_metrics.{key}"),
-                _require_finite_float(static_metrics[key], f"static_metrics.{key}"),
+                _require_finite_float(strategy_metrics[s_key], f"strategy_metrics.{s_key}"),
+                _require_finite_float(static_metrics[b_key], f"static_metrics.{b_key}"),
+                group[0],
             )
 
-    s_key = next((k for k in keys if k in strategy_metrics and strategy_metrics[k] is not None), None)
-    b_key = next((k for k in keys if k in static_metrics and static_metrics[k] is not None), None)
-    if s_key is None:
+    all_keys = tuple(k for g in key_groups for k in g)
+    s_any = next((k for k in all_keys if k in strategy_metrics and strategy_metrics[k] is not None), None)
+    b_any = next((k for k in all_keys if k in static_metrics and static_metrics[k] is not None), None)
+    if s_any is None:
         raise ValueError(
-            f"strategy_metrics missing required {metric_label} metric (accepted keys: {', '.join(keys)})"
+            f"strategy_metrics missing required {metric_label} metric (accepted keys: {', '.join(all_keys)})"
         )
-    if b_key is None:
+    if b_any is None:
         raise ValueError(
-            f"static_metrics missing required {metric_label} metric (accepted keys: {', '.join(keys)})"
+            f"static_metrics missing required {metric_label} metric (accepted keys: {', '.join(all_keys)})"
         )
-    return (
-        _require_finite_float(strategy_metrics[s_key], f"strategy_metrics.{s_key}"),
-        _require_finite_float(static_metrics[b_key], f"static_metrics.{b_key}"),
+    raise ValueError(
+        f"Incompatible {metric_label} comparison: strategy_metrics.{s_any} vs static_metrics.{b_any} "
+        "(must use matching unit/definition family)"
     )
 
 
@@ -249,6 +271,15 @@ def _inspect_sleeve_gates(sleeve: dict[str, Any]) -> tuple[bool, str, int | None
                 failures.append(
                     f"contradictory gate ratio {gp_ok}/{gt_ok} vs explicit total {effective_shared_total}"
                 )
+    elif (
+        sleeve.get("passed_8_of_8") is True
+        and effective_shared_total is not None
+        and not passing_ratios
+        and effective_shared_total != 8
+    ):
+        failures.append(
+            f"contradictory passed_8_of_8=True vs explicit total {effective_shared_total}"
+        )
 
     if not found_any:
         return False, "missing 8/8 gate evidence", None, 8
@@ -299,10 +330,14 @@ def _canonicalize_sleeve_for_report(sleeve: dict[str, Any]) -> dict[str, Any]:
             if norm_st in _DISQUALIFYING_SLEEVE_STATUSES:
                 disq_token = norm_st if norm_st in _VER04_BAD_SLEEVE_TOKENS else "FAIL"
                 break
-    if disq_token is None and sl.get("dominated_by_static") is True:
-        disq_token = VERDICT_CAP_DOMINATED
-    elif disq_token is None and sl.get("eligible_for_production") is False:
-        disq_token = "FAIL"
+    if disq_token is None and "dominated_by_static" in sl and sl["dominated_by_static"] is not None:
+        if not isinstance(sl["dominated_by_static"], bool):
+            disq_token = "FAIL"
+        elif sl["dominated_by_static"] is True:
+            disq_token = VERDICT_CAP_DOMINATED
+    if disq_token is None and "eligible_for_production" in sl and sl["eligible_for_production"] is not None:
+        if not isinstance(sl["eligible_for_production"], bool) or sl["eligible_for_production"] is False:
+            disq_token = "FAIL"
 
     if disq_token is not None:
         cur_v = str(sl.get("verdict") or "").strip().upper()
@@ -376,10 +411,10 @@ def evaluate_static_ablation(
     if not isinstance(static_metrics, dict):
         raise ValueError(f"static_metrics must be a dict, got {type(static_metrics).__name__}")
 
-    s_cagr, b_cagr = _extract_pair_metric(strategy_metrics, static_metrics, _CAGR_KEYS, "CAGR")
-    s_sr, b_sr = _extract_pair_metric(strategy_metrics, static_metrics, _SR_KEYS, "Sharpe")
-    s_dd, b_dd = _extract_pair_metric(strategy_metrics, static_metrics, _MAXDD_KEYS, "MaxDD")
-    s_cal, b_cal = _extract_pair_metric(strategy_metrics, static_metrics, _CALMAR_KEYS, "Calmar")
+    s_cagr, b_cagr, cagr_key = _extract_pair_metric(strategy_metrics, static_metrics, _CAGR_KEY_GROUPS, "CAGR")
+    s_sr, b_sr, sr_key = _extract_pair_metric(strategy_metrics, static_metrics, _SR_KEY_GROUPS, "Sharpe")
+    s_dd, b_dd, dd_key = _extract_pair_metric(strategy_metrics, static_metrics, _MAXDD_KEY_GROUPS, "MaxDD")
+    s_cal, b_cal, _cal_key = _extract_pair_metric(strategy_metrics, static_metrics, _CALMAR_KEY_GROUPS, "Calmar")
 
     delta_cagr = s_cagr - b_cagr
     delta_sr = s_sr - b_sr
@@ -405,25 +440,28 @@ def evaluate_static_ablation(
         "max_dd_pct": float(delta_max_dd),
         "maxdd_pct": float(delta_max_dd),
     }
+    dd_alias = "maxdd_pct" if dd_key == "max_dd_pct" else "maxdd"
+    strat_out: dict[str, float] = {
+        cagr_key: float(s_cagr),
+        sr_key: float(s_sr),
+        dd_key: float(s_dd),
+        dd_alias: float(s_dd),
+        "calmar": float(s_cal),
+    }
+    static_out: dict[str, float] = {
+        cagr_key: float(b_cagr),
+        sr_key: float(b_sr),
+        dd_key: float(b_dd),
+        dd_alias: float(b_dd),
+        "calmar": float(b_cal),
+    }
     return {
         "dominated_by_static": bool(dominated),
         "verdict_cap": verdict_cap,
         "deltas": deltas,
         "delta_vs_static": dict(deltas),
-        "strategy_metrics": {
-            "cagr_pct": float(s_cagr),
-            "sharpe": float(s_sr),
-            "max_dd_pct": float(s_dd),
-            "maxdd_pct": float(s_dd),
-            "calmar": float(s_cal),
-        },
-        "static_metrics": {
-            "cagr_pct": float(b_cagr),
-            "sharpe": float(b_sr),
-            "max_dd_pct": float(b_dd),
-            "maxdd_pct": float(b_dd),
-            "calmar": float(b_cal),
-        },
+        "strategy_metrics": strat_out,
+        "static_metrics": static_out,
     }
 
 
