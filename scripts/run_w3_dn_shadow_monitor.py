@@ -57,6 +57,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional atomic 0644 readiness JSON updated after every tick for continuous monitoring",
     )
+    p.add_argument(
+        "--prewarm",
+        action="store_true",
+        help="Fetch read-only public historical 12h bars to pre-warm kernel before live ticks",
+    )
+    p.add_argument(
+        "--prewarm-bars",
+        type=int,
+        default=12,
+        help="Number of historical 12h bars for --prewarm (default: 12)",
+    )
     p.add_argument("--report-out", type=Path, default=None, help="Optional JSON output path for final readiness report")
     return p.parse_args(argv)
 
@@ -69,11 +80,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     coins = tuple(c.strip().upper() for c in str(args.coins).split(",") if c.strip())
     obs_coins = tuple(c.strip().upper() for c in str(args.observe_only_coins).split(",") if c.strip())
+    prewarm_bars = max(0, int(args.prewarm_bars))
     cfg = ShadowMonitorConfig(
         state_dir=args.state_dir,
         coins=coins or DEFAULT_W3_DN_SHADOW_COINS,
         observe_only_coins=obs_coins,
         capital_usd=float(args.capital_usd),
+        enable_prewarm=bool(args.prewarm),
+        prewarm_bars=prewarm_bars,
         p16_heartbeat_url=str(args.p16_heartbeat_url or ""),
         p16_heartbeat_path=args.p16_heartbeat_path,
         readiness_report_path=args.live_readiness_path,
@@ -96,6 +110,26 @@ def main(argv: list[str] | None = None) -> int:
 
     tick_results: list[dict[str, object]] = []
     with W3DNShadowMonitor(cfg, provider=provider) as mon:
+        if (
+            bool(args.prewarm)
+            and prewarm_bars > 0
+            and not mon._has_live_execution_started()
+            and mon._prewarmed_bars == 0
+            and hasattr(provider, "fetch_historical_prewarm_bars")
+        ):
+            try:
+                hist_frames = provider.fetch_historical_prewarm_bars(
+                    cfg.coins,
+                    bars=prewarm_bars,
+                    bucket_sec=int(cfg.kernel_bar_interval_sec),
+                )
+                pw_res = mon.prewarm_from_bars(hist_frames, max_bars=prewarm_bars)
+                print(
+                    json.dumps({"event": "W3DN_CLI_PREWARM", **pw_res}, sort_keys=True, allow_nan=False),
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"WARN: W3DN_CLI_PREWARM failed (continuing live ticks): {exc}", file=sys.stderr, flush=True)
         n_ticks = int(args.ticks)
         idx = 0
         while not stop_requested:

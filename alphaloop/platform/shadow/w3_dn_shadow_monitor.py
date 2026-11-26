@@ -682,6 +682,231 @@ class PublicRestWaterfallQuoteProvider:
             )
         return out
 
+    def fetch_historical_prewarm_bars(
+        self,
+        coins: Sequence[str],
+        *,
+        bars: int = 12,
+        bucket_sec: int = 43_200,
+    ) -> list[tuple[int, dict[str, CanonicalBar]]]:
+        """Fetch strictly read-only public historical bars (Binance Spot + HL Perp/Funding) for pre-warming."""
+        if SHADOW_LIVE_EXECUTION_ENABLED:
+            raise RuntimeError(f"{PlatformErrorCode.LIVE_SWITCH_BLOCKED.value}: live execution forbidden")
+        if isinstance(bars, bool) or not isinstance(bars, int) or bars <= 0:
+            raise ValueError("bars must be a positive integer")
+        if isinstance(bucket_sec, bool) or not isinstance(bucket_sec, int) or bucket_sec != 43_200:
+            raise ValueError("bucket_sec must equal 43200 (12h) for historical prewarm")
+
+        bucket_ms = bucket_sec * 1000
+        tf_h = bucket_sec / 3600.0
+        now_ms = utc_now_ms()
+        fetch_bars = max(int(bars) + 3, 15)
+        start_ms = now_ms - fetch_bars * bucket_ms
+
+        per_coin_spot: dict[str, dict[int, tuple[int, float, float, float, float, float]]] = {}
+        per_coin_perp: dict[str, dict[int, tuple[int, int, float, float, float, float, float]]] = {}
+        per_coin_funding: dict[str, list[tuple[int, float]]] = {}
+
+        for raw_coin in coins:
+            coin = str(raw_coin).strip().upper()
+            if not coin:
+                continue
+
+            # 1. Binance Spot 12h klines (Waterfall: data-api.binance.vision -> api.binance.com)
+            spot_buckets: dict[int, tuple[int, float, float, float, float, float]] = {}
+            sym = f"{coin}USDT"
+            for base in self.spot_bases:
+                url = f"{base}/api/v3/klines?symbol={sym}&interval=12h&limit={fetch_bars}"
+                try:
+                    raw_klines = self.client.fetch_json(
+                        url,
+                        method="GET",
+                        timeout_sec=self.timeout_sec,
+                        max_retries=2,
+                        min_interval_sec=0.15,
+                    )
+                    if not isinstance(raw_klines, list):
+                        continue
+                    parsed_any = False
+                    for k in raw_klines:
+                        if not isinstance(k, (list, tuple)) or len(k) < 7:
+                            continue
+                        if any(isinstance(k[idx], bool) for idx in (0, 1, 2, 3, 4, 5, 6)):
+                            continue
+                        try:
+                            open_ms = int(float(k[0]))
+                            o_p = float(k[1])
+                            h_p = float(k[2])
+                            l_p = float(k[3])
+                            c_p = float(k[4])
+                            vol_base = float(k[5])
+                            close_ms = int(float(k[6]))
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                        if not (
+                            _MIN_VALID_EPOCH_MS <= open_ms <= close_ms <= now_ms
+                            and math.isfinite(o_p) and o_p > 0.0
+                            and math.isfinite(h_p) and h_p > 0.0
+                            and math.isfinite(l_p) and l_p > 0.0
+                            and math.isfinite(c_p) and c_p > 0.0
+                            and math.isfinite(vol_base) and vol_base >= 0.0
+                            and h_p >= l_p
+                        ):
+                            continue
+                        b_idx = int(close_ms // bucket_ms)
+                        spot_buckets[b_idx] = (close_ms, o_p, h_p, l_p, c_p, vol_base * c_p)
+                        parsed_any = True
+                    if parsed_any:
+                        break
+                except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError, OverflowError) as exc:
+                    logger.warning("Prewarm spot klines fetch failed from %s for %s: %s", base, sym, exc)
+                    continue
+            per_coin_spot[coin] = spot_buckets
+
+            # 2. Hyperliquid 12h candleSnapshot
+            perp_buckets: dict[int, tuple[int, int, float, float, float, float, float]] = {}
+            try:
+                raw_candles = self.client.fetch_json(
+                    self.hl_info_url,
+                    method="POST",
+                    json_payload={
+                        "type": "candleSnapshot",
+                        "req": {"coin": coin, "interval": "12h", "startTime": start_ms, "endTime": now_ms},
+                    },
+                    timeout_sec=self.timeout_sec,
+                    max_retries=2,
+                    min_interval_sec=0.25,
+                )
+                if isinstance(raw_candles, list):
+                    for item in raw_candles:
+                        if not isinstance(item, dict):
+                            continue
+                        raw_t, raw_T = item.get("t"), item.get("T")
+                        raw_o, raw_h, raw_l, raw_c = item.get("o"), item.get("h"), item.get("l"), item.get("c")
+                        raw_v = item.get("v", 0.0)
+                        if any(v is None or isinstance(v, bool) for v in (raw_t, raw_T, raw_o, raw_h, raw_l, raw_c, raw_v)):
+                            continue
+                        try:
+                            open_ms = int(float(raw_t))
+                            close_ms = int(float(raw_T))
+                            o_p = float(raw_o)
+                            h_p = float(raw_h)
+                            l_p = float(raw_l)
+                            c_p = float(raw_c)
+                            vol_base = float(raw_v)
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                        if not (
+                            _MIN_VALID_EPOCH_MS <= open_ms <= close_ms <= now_ms
+                            and math.isfinite(o_p) and o_p > 0.0
+                            and math.isfinite(h_p) and h_p > 0.0
+                            and math.isfinite(l_p) and l_p > 0.0
+                            and math.isfinite(c_p) and c_p > 0.0
+                            and math.isfinite(vol_base) and vol_base >= 0.0
+                            and h_p >= l_p
+                        ):
+                            continue
+                        b_idx = int(close_ms // bucket_ms)
+                        perp_buckets[b_idx] = (open_ms, close_ms, o_p, h_p, l_p, c_p, vol_base * c_p)
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError, OverflowError) as exc:
+                logger.warning("Prewarm HL candleSnapshot fetch failed for %s: %s", coin, exc)
+            per_coin_perp[coin] = perp_buckets
+
+            # 3. Hyperliquid 1h historical fundingHistory
+            funding_pts: list[tuple[int, float]] = []
+            try:
+                raw_funding = self.client.fetch_json(
+                    self.hl_info_url,
+                    method="POST",
+                    json_payload={"type": "fundingHistory", "coin": coin, "startTime": start_ms, "endTime": now_ms},
+                    timeout_sec=self.timeout_sec,
+                    max_retries=2,
+                    min_interval_sec=0.25,
+                )
+                if isinstance(raw_funding, list):
+                    for item in raw_funding:
+                        if not isinstance(item, dict):
+                            continue
+                        raw_ft, raw_fr = item.get("time"), item.get("fundingRate")
+                        if raw_ft is None or raw_fr is None or isinstance(raw_ft, bool) or isinstance(raw_fr, bool):
+                            continue
+                        try:
+                            ft_ms = int(float(raw_ft))
+                            fr_val = float(raw_fr)
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                        if _MIN_VALID_EPOCH_MS <= ft_ms <= now_ms and math.isfinite(fr_val):
+                            funding_pts.append((ft_ms, fr_val))
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, TypeError, OverflowError) as exc:
+                logger.warning("Prewarm HL fundingHistory fetch failed for %s: %s", coin, exc)
+            per_coin_funding[coin] = funding_pts
+
+        all_buckets: set[int] = set()
+        for coin in per_coin_spot:
+            all_buckets.update(per_coin_spot[coin].keys() & per_coin_perp[coin].keys())
+
+        frames: list[tuple[int, dict[str, CanonicalBar]]] = []
+        for b_idx in sorted(all_buckets)[-bars:]:
+            bars_map: dict[str, CanonicalBar] = {}
+            frame_ts: int | None = None
+            for raw_coin in coins:
+                coin = str(raw_coin).strip().upper()
+                sp = per_coin_spot.get(coin, {}).get(b_idx)
+                pp = per_coin_perp.get(coin, {}).get(b_idx)
+                if sp is None or pp is None:
+                    continue
+                s_close_ms, s_o, s_h, s_l, s_c, s_vol = sp
+                p_open_ms, p_close_ms, p_o, p_h, p_l, p_c, p_vol = pp
+                pair_ts = max(s_close_ms, p_close_ms)
+                frame_ts = pair_ts if frame_ts is None else max(frame_ts, pair_ts)
+
+                carry_sum = 0.0
+                for ft_ms, fr_val in per_coin_funding.get(coin, ()):
+                    if p_open_ms < ft_ms <= (p_close_ms + 60_000):
+                        carry_sum += fr_val
+
+                s_sym = spot_leg_symbol(coin)
+                p_sym = perp_leg_symbol(coin)
+                bars_map[s_sym] = CanonicalBar(
+                    asset_class=ASSET_CLASS_CRYPTO_SPOT,
+                    venue="binance_spot",
+                    symbol=s_sym,
+                    timeframe_h=tf_h,
+                    timeframe_sec=bucket_sec,
+                    ts_event_ms=s_close_ms,
+                    ts_avail_ms=s_close_ms,
+                    open=s_o,
+                    high=s_h,
+                    low=s_l,
+                    close=s_c,
+                    volume_usd=s_vol,
+                    carry_rate_period=0.0,
+                    carry_interval_h=tf_h,
+                    spread_bps=0.0,
+                    provenance=PROVENANCE_REAL,
+                )
+                bars_map[p_sym] = CanonicalBar(
+                    asset_class=ASSET_CLASS_CRYPTO_PERP,
+                    venue="hyperliquid",
+                    symbol=p_sym,
+                    timeframe_h=tf_h,
+                    timeframe_sec=bucket_sec,
+                    ts_event_ms=p_close_ms,
+                    ts_avail_ms=p_close_ms,
+                    open=p_o,
+                    high=p_h,
+                    low=p_l,
+                    close=p_c,
+                    volume_usd=p_vol,
+                    carry_rate_period=carry_sum,
+                    carry_interval_h=tf_h,
+                    spread_bps=0.0,
+                    provenance=PROVENANCE_REAL,
+                )
+            if bars_map and frame_ts is not None:
+                frames.append((frame_ts, bars_map))
+        return frames
+
 
 class P8MDGatewayFileQuoteProvider:
     """STD-32 P8 MD-Gateway consumer with O(1) EOF seek, empty-file safety, and strict ts_ms (RB-09)."""
@@ -853,6 +1078,20 @@ class P8MDGatewayFileQuoteProvider:
                 provenance=PROVENANCE_REAL,
             )
         return out
+
+    def fetch_historical_prewarm_bars(
+        self,
+        coins: Sequence[str],
+        *,
+        bars: int = 12,
+        bucket_sec: int = 43_200,
+    ) -> list[tuple[int, dict[str, CanonicalBar]]]:
+        """Delegate read-only historical prewarm bar fetch to the public waterfall provider."""
+        return self.perp_provider.fetch_historical_prewarm_bars(
+            coins,
+            bars=bars,
+            bucket_sec=bucket_sec,
+        )
 
 
 class ReplayQuoteProvider:
